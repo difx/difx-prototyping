@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=8         # for the parallel build
 #SBATCH --gres=gpu:1
 #SBATCH --mem=16G
+#SBATCH --tmp=8G                  # job-local disk ($JOBFS) for nvcc's intermediate files
 #SBATCH --time=1:00:00            # estimate: build 2-4 min, then a few minutes per profiled kernel
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
@@ -56,6 +57,13 @@ echo "Node $(hostname), job ${SLURM_JOB_ID:-manual}, difx-prototyping $(git log 
 echo "Environment from $DIFX_SETUP; $("$NCU" --version | tail -1)"
 nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap --format=csv,noheader
 echo "Building for sm_$SM ..."
+# nvcc writes ~360 MB of intermediate files to $TMPDIR for each fused FFT length, eight at
+# once with -j8: more than a node's /tmp may have free.  Use the job's own disk (OzSTAR: $JOBFS,
+# from --tmp above) when there is one.
+[ -n "${JOBFS:-}" ] && export TMPDIR="$JOBFS"
+tmpfree=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR==2 {print int($4/1048576)}')
+echo "Temporary files in ${TMPDIR:-/tmp} (${tmpfree:-?} GB free)"
+[ "${tmpfree:-0}" -ge 3 ] || echo "WARNING: the build may need ~3 GB of temporary space: set TMPDIR, or build on a login node first"
 # Jobs started together (fusebench-ozstar.sbatch and ncu-ozstar.sbatch) build in the same
 # build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
 # filesystem does not support locks, warn and build without one.
