@@ -19,13 +19,24 @@ import sys
 import numpy as np
 
 
+SHAPES = {   # taper shape, as a function of x in (0, 1) across the taper
+    "tukey": lambda x: 0.5 * (1 - np.cos(np.pi * x)),                    # raised cosine
+    "sine": lambda x: np.sin(0.5 * np.pi * x),                           # power-complementary
+    "vorbis": lambda x: np.sin(0.5 * np.pi * 0.5 * (1 - np.cos(np.pi * x))),   # power-complementary
+}                                                                        # and smooth at both ends
+
+
 def window(n, taper, shape):
-    """Tapers of round(taper * n) samples each end, flat between: raised cosine (Tukey) or sine."""
+    """Tapers of round(taper * n) samples each end, flat between, of the given SHAPES shape.
+
+    Overlapping neighbours by the taper length, the raised-cosine (Tukey) tapers add to one in
+    amplitude, the sine and Vorbis tapers (sin(pi/2 * raised cosine)) in power: w^2 + w'^2 = 1.
+    """
     w = np.ones(n)
     taps = int(round(taper * n))
     if taps:
         x = (np.arange(taps) + 0.5) / taps
-        t = 0.5 * (1 - np.cos(np.pi * x)) if shape == "tukey" else np.sin(0.5 * np.pi * x)
+        t = SHAPES[shape](x)
         w[:taps] = t
         w[n - taps:] = t[::-1]
     return w
@@ -47,13 +58,17 @@ def response(n, taper, overlap, shape, nwin=400):
     return n / hop, snr, core.min(), core.max(), coh, leak
 
 
+# (name, taper, fraction of an FFT length consecutive windows share, shape); with the share
+# equal to the taper, the tapers of neighbouring windows lie on top of each other
 DESIGNS = [
     ("rectangular, no overlap", 0.0, 0.0, "tukey"),
-    ("Tukey 12.5% tapers, 25% overlap", 0.125, 0.25, "tukey"),
-    ("Tukey 12.5% tapers, 12.5% overlap", 0.125, 0.125, "tukey"),
-    ("sine 12.5% tapers, 12.5% overlap", 0.125, 0.125, "sine"),
-    ("Tukey 25% tapers, 25% overlap", 0.25, 0.25, "tukey"),
-    ("sine 25% tapers, 25% overlap", 0.25, 0.25, "sine"),
+    ("Tukey 12.5%, tapers overlap", 0.125, 0.125, "tukey"),
+    ("sine 12.5%, tapers overlap", 0.125, 0.125, "sine"),
+    ("Vorbis 12.5%, tapers overlap", 0.125, 0.125, "vorbis"),
+    ("Tukey 25%, tapers overlap", 0.25, 0.25, "tukey"),
+    ("sine 25%, tapers overlap", 0.25, 0.25, "sine"),
+    ("Vorbis 25%, tapers overlap", 0.25, 0.25, "vorbis"),
+    ("Tukey 12.5%, hop 0.75", 0.125, 0.25, "tukey"),
     ("Hann, 50% overlap", 0.5, 0.5, "tukey"),
 ]
 

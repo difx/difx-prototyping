@@ -1,4 +1,5 @@
 build-sm*/
+build-sm*.log
 fusebench
 results-local/
 build.log

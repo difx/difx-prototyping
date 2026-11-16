@@ -22,9 +22,11 @@ Directions this follows (gpudifx, 2026-11-16):
   spectrum's phase slope and offset are computed once in double, and each channel's phase in
   64-bit fixed point.
 - **FP16 out of decode and fringe rotation** (`--input fp16`). The FFT takes FP16 in and gives
-  FP32 out.
+  FP32 out (see "FP16 in, FP32 out" below).
 - **A windowed overlap-add front end** (`--wola`): Tukey window with 12.5% / 75% / 12.5%
-  taper / flat / taper and 25% overlap. See "Window design" below.
+  taper / flat / taper, each window overlapping each neighbour over its taper (25% of each
+  window is overlapped, 12.5% at each end; consecutive windows start 87.5% of an FFT length
+  apart). Sine and Vorbis tapers are options too. See "Window design" below.
 
 ## Build and run
 
@@ -41,7 +43,11 @@ make -j8 MATHDX=<mathdx dir> SM=80                                   # A100
 ./fusebench --nchan 128 --nwin 10000 --input fp16 --wola --fpb sweep  # one case
 ./run-bench.sh                                                       # the standard set below
 python3 window_response.py 256                                       # window design numbers
+python3 plot_windows.py                                              # the plots in plots/
 ```
+
+On OzSTAR: `fusebench-ozstar.sbatch` builds for the GPU the job gets and runs `run-bench.sh`.
+Its header says how to get MathDx onto the cluster and which paths to set.
 
 The fused kernel is compiled once per FFT length (`SIZES` in the Makefile, default 64 to
 16384). That takes about a minute with `-j8`. `fusebench` exits non-zero if a check fails.
@@ -54,7 +60,10 @@ The main options:
 - `--input fp32|fp16`;
 - `--layout window|series`: one buffer per FFT window (mpifxcorr's layout), or one continuous
   series per antenna and band, which overlapping windows need;
-- the window: `--taper F --overlap F --window tukey|sine`, or `--wola`;
+- the window: `--taper F` (taper length at each end, as a fraction of the FFT length),
+  `--overlap F` (the fraction of an FFT length consecutive windows share; the hop is 1 - F),
+  `--window tukey|sine|vorbis` (taper shape), or `--wola` (`--taper 0.125 --overlap 0.125`,
+  Tukey);
 - `--rotator`, `--autocorr`, `--fpb N|sweep` (FFTs per block of the fused kernel, default
   cuFFTDx's suggestion), `--batched` (one launch for all antennas), `--invalid F` (flag a
   fraction of the windows).
@@ -95,38 +104,49 @@ mpifxcorr plus its integer delay shift). Fringe rotation must then be a continuo
 time, not a phase line fitted per window, because a sample in an overlap belongs to two
 windows.
 
+## FP16 in, FP32 out
+
+cuFFTDx has no mixed-precision FFT. Its `Precision<>` is one type (`__half`, `float` or
+`double`) for the whole transform, and `Precision<__half>` computes in FP16 and returns FP16.
+It does not need one, though. With block execution the FFT works on values in registers, and
+the loads from and stores to global memory are the caller's own code. The fused kernel loads
+FP16, converts to FP32 in registers, does an FP32 FFT, and stores FP32. The memory saving is
+all in the load, and the FFT itself is not the bottleneck. An FP16 FFT would compute at FP16
+precision (unit roundoff 5e-4, with rounding error growing with the number of FFT stages) and
+return FP16, for no speed gain in a kernel that is memory-bound.
+
 ## Results: RTX 2070 SUPER, 2026-11-16
 
 CUDA 13.2, cuFFT 12.2, cuFFTDx 1.5.0. 10 antennas, 8 bands, real data, 64 MHz bands, no
 autocorrelations. Median of 20 subints, ms per subint for all 10 antennas. Fused times are for
 the best FFTs-per-block setting, with cuFFTDx's suggested setting in brackets where it differs.
 "vs mpifxcorr" is relative to the first row: FP32 input, cuFFT, then mpifxcorr's rotation
-kernel.
+kernel. WOLA is `--wola` (hop 0.875 FFT lengths); "WOLA, hop 0.75" is the same window with
+consecutive windows sharing 25% (`--wola --overlap 0.25`), for comparison.
 
 **128 channels** (256-point FFT), 20 ms subint (10000 FFT lengths):
 
 | FFT input | windows | unfused: prep + cuFFT + rotation | unfused | fused | fused vs unfused | fused vs mpifxcorr |
 |---|---|---|---|---|---|---|
-| FP32, mpifxcorr's FP64 rotation | 10000 | 0 + 8.47 + 8.98 | 17.45 | 6.38 | 2.74 | **2.7** |
+| FP32, mpifxcorr's FP64 rotation | 10000 | 0 + 8.46 + 9.03 | 17.45 | 6.38 | 2.74 | **2.7** |
 | FP32 | 10000 | 0 + 8.46 + 4.41 | 12.87 | 6.38 | 2.02 | **2.7** |
-| FP16 | 10000 | 6.50 + 8.46 + 4.41 | 19.36 | 4.57 (4.69) | 4.24 | **3.8** |
-| FP32, WOLA 25% | 13333 | 9.98 + 11.28 + 5.87 | 27.12 | 8.38 (8.65) | 3.24 | **2.1** |
-| FP16, WOLA 25% | 13333 | 8.30 + 11.28 + 5.87 | 25.45 | 6.38 (6.94) | 3.99 | **2.7** |
-| FP16, WOLA 12.5% overlap | 11428 | 7.40 + 9.67 + 5.03 | 22.09 | (6.12) | 3.61 | **2.9** |
+| FP16 | 10000 | 6.50 + 8.46 + 4.41 | 19.37 | 4.56 (4.70) | 4.24 | **3.8** |
+| FP32, WOLA | 11428 | 9.09 + 9.67 + 5.03 | 23.79 | 7.33 (7.58) | 3.25 | **2.4** |
+| FP16, WOLA | 11428 | 7.40 + 9.66 + 5.03 | 22.09 | 5.77 (6.12) | 3.83 | **3.0** |
+| FP16, WOLA, hop 0.75 | 13333 | 8.30 + 11.27 + 5.87 | 25.43 | (6.94) | 3.67 | **2.5** |
 
 **1024 channels** (2048-point FFT), 16 ms subint (1000 FFT lengths):
 
 | FFT input | windows | unfused: prep + cuFFT + rotation | unfused | fused | fused vs unfused | fused vs mpifxcorr |
 |---|---|---|---|---|---|---|
-| FP32, mpifxcorr's FP64 rotation | 1000 | 0 + 6.78 + 7.17 | 13.95 | 5.01 | 2.78 | **2.8** |
+| FP32, mpifxcorr's FP64 rotation | 1000 | 0 + 6.78 + 7.22 | 14.00 | 5.01 | 2.79 | **2.8** |
 | FP32 | 1000 | 0 + 6.78 + 3.41 | 10.19 | 5.01 | 2.03 | **2.8** |
 | FP16 | 1000 | 5.20 + 6.78 + 3.41 | 15.39 | 3.53 | 4.36 | **4.0** |
-| FP32, WOLA 25% | 1333 | 7.97 + 9.03 + 4.54 | 21.54 | 7.08 | 3.04 | **2.0** |
-| FP16, WOLA 25% | 1333 | 6.56 + 9.03 + 4.54 | 20.12 | 5.08 (5.27) | 3.96 | **2.7** |
-| FP16, WOLA 12.5% overlap | 1142 | 5.85 + 7.74 + 3.89 | 17.47 | (4.79) | 3.65 | **2.9** |
+| FP32, WOLA | 1142 | 7.26 + 7.74 + 3.89 | 18.89 | 6.23 | 3.03 | **2.2** |
+| FP16, WOLA | 1142 | 5.84 + 7.74 + 3.89 | 17.47 | 4.72 (4.79) | 3.70 | **3.0** |
+| FP16, WOLA, hop 0.75 | 1333 | 6.56 + 9.03 + 4.54 | 20.12 | (5.26) | 3.82 | **2.7** |
 
-(The fused-vs-unfused figures for the 12.5% overlap rows use the suggested setting, the only
-one timed.)
+(The hop 0.75 rows were timed at the suggested setting only.)
 
 ### What the numbers say
 
@@ -141,52 +161,88 @@ one timed.)
    bytes. The FP32 output is unchanged. Unfused, FP16 is slower than FP32, because cuFFT needs
    FP32 input and converting it is a full extra pass. A cuFFT load callback could avoid that
    pass; it is not tried here.
-3. **WOLA with 25% overlap costs 40-45% over the fused kernel without it**: 1.33x more windows,
-   plus the series reads and the weights. Fused, with FP16 input, it is still 2.7x faster than
-   mpifxcorr's FFT + rotation without any windowing. Unfused, it would cost 1.4-1.6x
-   mpifxcorr's time. With 12.5% overlap it is about 10% cheaper than with 25%.
+3. **WOLA costs 26-34% over the fused kernel without it**: 1.143x more windows, plus the series
+   reads and the weights. Fused with FP16 input it is still 3.0x faster than mpifxcorr's FFT +
+   rotation without any windowing. Unfused, it would cost 1.25-1.4x mpifxcorr's time.
+   Overlapping by 25% of an FFT length between consecutive windows (hop 0.75) costs 10-13%
+   more than overlapping just the tapers.
 4. **FFTs per block matter.** One per block is bad for small FFTs (256 points). Above 16 KB of
-   shared memory per block, the larger settings lose. cuFFTDx's suggestion is within 10% of the
-   best everywhere here.
+   shared memory per block, the larger settings lose. cuFFTDx's suggestion is within about 6% of
+   the best everywhere here.
 
 ### Window design
 
-`window_response.py` gives these for a 256-point FFT (continuum sensitivity relative to
+All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
+consecutive windows start 0.875 FFT lengths apart). Three taper shapes, with x running from 0
+to 1 across the taper:
+
+- **Tukey**, the raised cosine 0.5 (1 - cos πx). This is the `--wola` default.
+- **Sine**, sin(πx/2).
+- **Vorbis**, sin(π/2 · raised cosine). This is the taper of the window used in Ogg Vorbis.
+
+![Three taper shapes](plots/tapers.png)
+
+Where two windows overlap, the cross-power weights each sample by the sum of the squares of the
+two tapers.
+- **Tukey tapers add up to one in amplitude, not in power**, so that weight dips to 0.5 in the
+  middle of each overlap. This costs continuum sensitivity: 0.6% at 12.5% tapers, 1.4% at 25%.
+  Shorter tapers lose less, but no Tukey width loses nothing, because the loss comes from the
+  shape.
+- **Sine and Vorbis tapers add up to one in power**, so every sample has weight 1 and there is
+  no loss at any taper length.
+- **The Vorbis taper is also smooth at both ends**, like the Tukey taper, so its far sidelobes
+  fall off as fast as Tukey's. The sine taper's sidelobes fall off more slowly.
+
+![Tapered FFT windows](plots/windows.png)
+
+![Sensitivity and leakage against taper length](plots/tradeoffs.png)
+
+Longer tapers cut the leakage further and cost more FFTs, 1 / (1 - taper). At 12.5% the near
+leakage (beyond 5 channels) is much the same for all three shapes, -23 to -27 dB, and the far
+leakage (beyond 20 channels) is -59 to -60 dB for Tukey and Vorbis, against -47 dB for sine.
+Between about 18% and 25%, Tukey's near leakage drops faster than the others' (-44 dB at 25%,
+against -34 dB for sine and Vorbis), but Tukey then loses 1.4% of sensitivity.
+
+![A channel's response to a narrow line](plots/response.png)
+
+![Continuum sensitivity against residual delay](plots/sensitivity.png)
+
+Window shape alone sets how much correlation survives a residual delay; overlap sets the
+sensitivity at zero delay. With 12.5% tapers each shape beats rectangular windows over a range
+of residual delays (256-point FFT): Tukey from 2 to 43 samples, Vorbis from 1 to 52, sine from
+1 to 69. The sine taper keeps the most correlation.
+
+`window_response.py` gives these numbers for a 256-point FFT (continuum sensitivity relative to
 rectangular windows without overlap; white noise; all channels). The spectral figures do not
 depend on the FFT length.
 
 | design | FFTs | sensitivity, delay 0 / 4 / 16 samples | leakage beyond 5 / 20 channels |
 |---|---|---|---|
 | rectangular, no overlap (mpifxcorr now) | 1.000 | 1.000 / 0.984 / 0.938 | -16.9 / -23.0 dB |
-| Tukey 12.5% tapers, 25% overlap (`--wola`) | 1.333 | 0.972 / 0.969 / 0.934 | -25.0 / -60.4 dB |
-| Tukey 12.5% tapers, 12.5% overlap | 1.143 | 0.994 / 0.991 / 0.955 | -25.0 / -60.4 dB |
-| sine 12.5% tapers, 12.5% overlap | 1.143 | 1.000 / 0.997 / 0.965 | -26.6 / -47.2 dB |
-| Tukey 25% tapers, 25% overlap | 1.333 | 0.986 / 0.984 / 0.960 | -44.2 / -71.2 dB |
-| sine 25% tapers, 25% overlap | 1.333 | 1.000 / 0.998 / 0.977 | -34.4 / -52.8 dB |
+| Tukey 12.5% (`--wola`) | 1.143 | 0.994 / 0.991 / 0.955 | -25.0 / -60.4 dB |
+| sine 12.5% | 1.143 | 1.000 / 0.997 / 0.965 | -26.6 / -47.2 dB |
+| Vorbis 12.5% | 1.143 | 1.000 / 0.997 / 0.957 | -23.4 / -59.2 dB |
+| Tukey 25% | 1.333 | 0.986 / 0.984 / 0.960 | -44.2 / -71.2 dB |
+| sine 25% | 1.333 | 1.000 / 0.998 / 0.977 | -34.4 / -52.8 dB |
+| Vorbis 25% | 1.333 | 1.000 / 0.998 / 0.970 | -34.2 / -70.7 dB |
+| Tukey 12.5%, hop 0.75 | 1.333 | 0.972 / 0.969 / 0.934 | -25.0 / -60.4 dB |
 | Hann, 50% overlap | 2.000 | 0.973 / 0.972 / 0.949 | -53.5 / -83.7 dB |
 
-- **The spectral improvement comes from the window shape, and it is large.** Leakage beyond 20
-  channels drops from -23 dB to -60 dB with the 12.5% Tukey tapers.
-- **Overlapping by more than the taper length costs sensitivity and gains nothing else.**
-  Window shape alone sets resolution, leakage and the loss at a residual delay; overlap does
-  not change any of them. Overlap sets how evenly the samples are weighted. With 12.5% tapers
-  and 25% overlap, the samples in the flat parts of the overlaps are counted twice, so the
-  weights run from 1 to 2. That costs 2.9% of continuum sensitivity, and it makes this design
-  *less* sensitive than rectangular windows at every residual delay in the table. The same
-  window with 12.5% overlap costs 0.6%, with 14% fewer FFTs.
-- **Overlap equal to the taper length, with tapers whose squares sum to one across the
-  overlap (sine tapers), loses no sensitivity at all.** These are better than rectangular
-  windows at every residual delay. The price is slower far-out sidelobe decay than the Tukey
-  (raised-cosine) tapers. At 25%, sine tapers give -34 / -53 dB for 1.333x FFTs; Tukey 25%
-  tapers give -44 / -71 dB for 1.4% of sensitivity.
+The "hop 0.75" row places Tukey 12.5% tapers 0.75 FFT lengths apart, so the flat parts of the
+overlaps are counted twice (weights 1 to 2). It costs more and does worse on every measure here.
 
-All of these are options of `fusebench` (`--taper`, `--overlap`, `--window`), so any of them can
-be timed. The cost depends only on the number of windows.
+**Choosing.** For no loss of continuum sensitivity at any taper length, use the Vorbis taper.
+It keeps the Tukey taper's far-sidelobe suppression. At 12.5% it costs 1.143x the FFTs
+(`--wola --window vorbis`). Going to 25% improves the near leakage by about 11 dB and the far
+leakage by about 11 dB, for 17% more windows: 10-13% more fused-kernel time on the 2070 (the
+"hop 0.75" rows in the results above have the same window count). The window is a table of
+weights, so the shape costs nothing; only the taper length (the number of windows) does.
+All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|sine|vorbis`).
 
 ### Not yet measured
 
-- **The A100.** FP64 runs at half rate there and memory bandwidth is 3.5x higher. Build with
-  `SM=80` and run `run-bench.sh`.
+- **The A100** (`fusebench-ozstar.sbatch`). FP64 runs at half rate there and memory bandwidth
+  is 3.5x higher.
 - Complex data (`--complex`) and other channel counts.
 - Decode and fringe rotation inside the fused kernel (the next pre-FFT stage).
 - The effect inside mpifxcorr, where the FFT and rotation overlap with transfers and the XMAC.

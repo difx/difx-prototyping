@@ -98,13 +98,19 @@ static bool* devCopyBool(const std::vector<char>& v) {
     return p;
 }
 
-// Tapered window: tapers of round(taper * n) samples at each end, flat between; raised-cosine
-// tapers (Tukey) or sine tapers (whose squares sum to 1 across an overlap of the taper length).
-static std::vector<float> taperedWindow(int n, double taper, bool sine) {
+// Tapered window: tapers of round(taper * n) samples at each end, flat between. Shapes, x in
+// (0, 1) across the taper: tukey 0.5 (1 - cos(pi x)); sine sin(pi x / 2); vorbis
+// sin(pi/2 * 0.5 (1 - cos(pi x))). Overlapping neighbours by the taper length, Tukey tapers add to
+// one in amplitude, sine and Vorbis tapers in power (no loss of sensitivity); Vorbis tapers are
+// also smooth at both ends, so their sidelobes fall off nearly as fast as Tukey's.
+enum class Taper { TUKEY, SINE, VORBIS };
+static std::vector<float> taperedWindow(int n, double taper, Taper shape) {
     std::vector<float> w(n, 1.0f);
     const int L = (int)std::lround(taper * n);
     for (int i = 0; i < L; i++) {
-        const float v = (float)(sine ? sin(0.5 * M_PI * (i + 0.5) / L) : 0.5 * (1.0 - cos(M_PI * (i + 0.5) / L)));
+        const double x = (i + 0.5) / L, rc = 0.5 * (1.0 - cos(M_PI * x));
+        const float v = (float)(shape == Taper::TUKEY ? rc : shape == Taper::SINE ? sin(0.5 * M_PI * x)
+                                                                                  : sin(0.5 * M_PI * rc));
         w[i] = v;
         w[n - 1 - i] = v;
     }
@@ -205,9 +211,14 @@ static void usage() {
 "                  (one continuous series per antenna and band)\n"
 "  --taper F       window on the FFT input with tapers of F of the FFT length at each end,\n"
 "                  default 0 (no window)\n"
-"  --window W      taper shape: tukey (default, raised cosine) | sine\n"
-"  --overlap F     windows overlap by F of the FFT length, default 0 (needs --layout series)\n"
-"  --wola          short for --layout series --taper 0.125 --overlap 0.25\n"
+"  --window W      taper shape: tukey (default, raised cosine) | sine | vorbis (sin(pi/2 x\n"
+"                  raised cosine): with --overlap equal to --taper, sine and vorbis tapers lose\n"
+"                  no sensitivity\n"
+"  --overlap F     consecutive windows share F of the FFT length (the hop is 1 - F FFT lengths),\n"
+"                  default 0; needs --layout series. With F equal to the taper, the tapers of\n"
+"                  neighbouring windows lie on top of each other\n"
+"  --wola          short for --layout series --taper 0.125 --overlap 0.125: Tukey window\n"
+"                  12.5%% / 75%% / 12.5%%, each window overlapping each neighbour over its taper\n"
 "Rotation and autocorrelations:\n"
 "  --rotator R     unfused pipeline: fixed (default, as the fused kernel) | double (mpifxcorr's\n"
 "                  kernel verbatim, FP64 per element)\n"
@@ -229,7 +240,8 @@ static void usage() {
 int main(int argc, char** argv) {
     Geometry g{10, 8, 10000, 0, 128};
     bool complexData = false, batched = false, singlePol = false, sweep = false, crossPolPass = false;
-    bool half = false, series = false, sine = false;
+    bool half = false, series = false;
+    Taper shape = Taper::TUKEY;
     double bw = 64.0, invalidFrac = 0.0, taper = 0.0, overlap = 0.0;
     AutoMode amode = AutoMode::NONE;
     Rotator rotator = Rotator::FIXED;
@@ -257,9 +269,9 @@ int main(int argc, char** argv) {
         else if (a == "--input") half = choose({"fp32", "fp16"}) == 1;
         else if (a == "--layout") series = choose({"window", "series"}) == 1;
         else if (a == "--taper") taper = std::stod(next());
-        else if (a == "--window") sine = choose({"tukey", "sine"}) == 1;
+        else if (a == "--window") shape = (Taper)choose({"tukey", "sine", "vorbis"});
         else if (a == "--overlap") overlap = std::stod(next());
-        else if (a == "--wola") { series = true; taper = 0.125; overlap = 0.25; }
+        else if (a == "--wola") { series = true; taper = 0.125; overlap = 0.125; }
         else if (a == "--rotator") rotator = choose({"double", "fixed"}) == 0 ? Rotator::DOUBLE : Rotator::FIXED;
         else if (a == "--autocorr") amode = (AutoMode)choose({"none", "band", "full"});
         else if (a == "--singlepol") singlePol = true;
@@ -327,9 +339,10 @@ int main(int argc, char** argv) {
     printf("%d antennas x %d bands, %s data, FFT length %d, %d channels kept; %.0f MHz bands -> subint %.3f ms\n",
            g.nant, g.nband, complexData ? "complex" : "real", g.fftchannels, g.nchan, bw, subintMs);
     printf("FFT input: %s, %s layout, ", half ? "FP16" : "FP32", series ? "series" : "per-window");
-    if (taper > 0) printf("%s window (%.1f%% tapers), ", sine ? "sine-taper" : "Tukey", 100 * taper);
+    const char* shapeName[] = {"Tukey", "sine-taper", "Vorbis-taper"};
+    if (taper > 0) printf("%s window (%.1f%% tapers), ", shapeName[(int)shape], 100 * taper);
     else printf("no window, ");
-    printf("%d windows per antenna (hop %d = %.1f%% overlap)\n", g.nwin, hop,
+    printf("%d windows per antenna (hop %d: consecutive windows share %.1f%%)\n", g.nwin, hop,
            100.0 * (g.fftchannels - hop) / g.fftchannels);
     printf("unfused rotator: %s; fused rotator: fixed; autocorrelations: %s%s; %s\n",
            rotator == Rotator::DOUBLE ? "double (mpifxcorr)" : "fixed", amodeName[(int)amode],
@@ -363,7 +376,7 @@ int main(int argc, char** argv) {
     pre.series = series;
     pre.hop = hop;
     pre.seriesLen = seriesLen;
-    pre.window = taper > 0 ? devCopy(taperedWindow(g.fftchannels, taper, sine)) : nullptr;
+    pre.window = taper > 0 ? devCopy(taperedWindow(g.fftchannels, taper, shape)) : nullptr;
     if (half) {
         __half2* in = devAlloc<__half2>(ninput);
         fill_noise<<<4096, 256>>>(in, ninput, seed);

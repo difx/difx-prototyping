@@ -10,8 +10,9 @@
 # No autocorrelations (they are to move to the XMAC). For each shape:
 #   mpifxcorr      FP32 input, mpifxcorr's FP64-phase rotation kernel in the unfused pipeline
 #   fp32, fp16     FFT input precision, fixed-point phases in both pipelines
-#   wola-*         Tukey window, 12.5% tapers, 25% overlap (series layout), FP32 and FP16 input,
-#                  and the same window with 12.5% overlap
+#   wola-*         --wola: Tukey window 12.5% / 75% / 12.5%, each window overlapping each
+#                  neighbour over its taper (hop 0.875 FFT lengths), FP32 and FP16 input; and,
+#                  for comparison, the same window with hop 0.75 (consecutive windows share 25%)
 # all FFTs-per-block variants of the fused kernel.  Logs go to results-local/<host>-<stamp>/,
 # with summary.txt the lines worth reading.
 
@@ -46,7 +47,7 @@ for shape in "c128:--nchan 128 --nwin 10000" "c1024:--nchan 1024 --nwin 1000"; d
     run "$tag-fp16"            "${opts[@]}" --input fp16 --fpb sweep
     run "$tag-wola-fp32"       "${opts[@]}" --wola --fpb sweep
     run "$tag-wola-fp16"       "${opts[@]}" --wola --input fp16 --fpb sweep
-    run "$tag-wola-fp16-ov125" "${opts[@]}" --wola --overlap 0.125 --input fp16
+    run "$tag-wola-fp16-hop75" "${opts[@]}" --wola --overlap 0.25 --input fp16
 done
 echo "Results in $OUT (summary.txt)"
 [ $fail = 0 ] || { echo "SOME RUNS FAILED: see the logs" >&2; exit 1; }
