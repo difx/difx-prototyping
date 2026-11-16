@@ -56,8 +56,10 @@ python3 window_response.py 256                                       # window de
 python3 plot_windows.py                                              # the plots in plots/
 ```
 
-On OzSTAR: `fusebench-ozstar.sbatch` builds for the GPU the job gets and runs `run-bench.sh`.
-Its header says how to get MathDx onto the cluster and which paths to set.
+On OzSTAR: run `make mathdx` on a login node, then `sbatch fusebench-ozstar.sbatch` from
+`fft-fusion`. The job sources your gpudifx setup (`DIFX_SETUP`, default
+`$HOME/setup_difx.claude`: module loads, then `setup.bash`), builds for the GPU it gets and runs
+`run-bench.sh`. Its header has the details.
 
 The fused kernel is compiled once per FFT length (`SIZES` in the Makefile, default 64 to
 16384). That takes about a minute with `-j8`. `fusebench` exits non-zero if a check fails.
