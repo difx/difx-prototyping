@@ -6,9 +6,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8         # for the parallel build
 #SBATCH --gres=gpu:1
-#SBATCH --mem=16G
+#SBATCH --mem=32G                 # the build: up to ~4 GB per ptxas (N=8192 and up), eight at once
 #SBATCH --tmp=8G                  # job-local disk ($JOBFS) for nvcc's intermediate files
-#SBATCH --time=1:00:00            # estimate: build 2-4 min, then a few minutes per profiled kernel
+#SBATCH --time=1:00:00            # estimate: build ~25 min on a gina node if not already built, profiles ~3 min
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #

@@ -6,9 +6,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8         # for the parallel build (the fused kernel is compiled per FFT length)
 #SBATCH --gres=gpu:1
-#SBATCH --mem=8G
+#SBATCH --mem=32G                 # the build: up to ~4 GB per ptxas (N=8192 and up), eight at once
 #SBATCH --tmp=8G                  # job-local disk ($JOBFS) for nvcc's intermediate files
-#SBATCH --time=0:45:00            # estimate: build 5-10 min, run-bench.sh + run-nchan.sh 3-6 min (5 on an RTX 2070)
+#SBATCH --time=1:00:00            # estimate: build ~25 min on a gina node (8 min on a desktop), run-bench.sh + run-nchan.sh ~5 min
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #
