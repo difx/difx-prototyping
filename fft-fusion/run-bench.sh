@@ -18,8 +18,10 @@
 #                  FP64 phases; fixed-point with --wola, which gpudifx's decode cannot do); the
 #                  fused kernel does everything, with direct and with tiled decode; the 2-kernel
 #                  lines are decode + fringe into an FP16 or FP32 buffer, then the fused FFT
-#   *-chunk<W>     the packed-data pipelines one antenna and W windows at a time, the 2-kernel
-#                  buffer reused for every chunk so that it can stay in L2 (--chunk)
+#   *-chunk<W>     the packed-data pipelines W windows at a time, each antenna on its own
+#                  stream, each antenna's part of the 2-kernel buffer reused for every chunk
+#                  (--chunk): all antennas' chunks in flight at once, 84, 21, 10.5, 5.2 and
+#                  2.6 MB in FP16 for both shapes, so that they can stay in L2
 # all FFTs-per-block and elements-per-thread variants of the fused kernel, and (wola-fp16,
 # packed-wola) the register caps (--regcap).  Logs go to results-local/<host>-<stamp>/, with
 # summary.txt the lines worth reading.  The channel-count sweep is run-nchan.sh.
@@ -47,9 +49,12 @@ run() {   # run <name> <fusebench options...>
     } | tee -a "$OUT/summary.txt"
 }
 
-for shape in "c128:--nchan 128 --nwin 10000" "c1024:--nchan 1024 --nwin 1000"; do
+# shape: name, fusebench options, chunk sizes in windows
+for shape in "c128:--nchan 128 --nwin 10000:1024 256 128 64 32" "c1024:--nchan 1024 --nwin 1000:128 32 16 8 4"; do
     tag=${shape%%:*}
-    read -r -a opts <<< "${shape#*:}"
+    rest=${shape#*:}
+    read -r -a opts <<< "${rest%%:*}"
+    read -r -a chunks <<< "${rest#*:}"
     run "$tag-mpifxcorr"       "${opts[@]}" --rotator double
     run "$tag-fp32"            "${opts[@]}" --fpb sweep --ept sweep
     run "$tag-fp16"            "${opts[@]}" --input fp16 --fpb sweep --ept sweep
@@ -60,7 +65,7 @@ for shape in "c128:--nchan 128 --nwin 10000" "c1024:--nchan 1024 --nwin 1000"; d
     run "$tag-packed-tiled"    "${opts[@]}" --input packed --decode tiled --fpb sweep --ept sweep
     run "$tag-packed-wola"     "${opts[@]}" --input packed --wola --fpb sweep --ept sweep --regcap sweep
     run "$tag-packed-wola-ept-half" "${opts[@]}" --input packed --wola --ept half
-    for w in 4096 2048 1024 512 256; do
+    for w in "${chunks[@]}"; do
         run "$tag-packed-wola-chunk$w" "${opts[@]}" --input packed --wola --ept half --chunk $w --check 4
     done
 done

@@ -37,23 +37,9 @@ using FFTn = decltype(FFTBase() + ElementsPerThread<E>() + FFTsPerBlock<FPB>());
 // With CROSSPOL the cross-pol autocorrelations are formed here too: bands 2f and 2f+1 of a window
 // are spectra y and y+1 of the same block (band fastest, even nband, even FFTs per block), and
 // thread (x, y) and (x, y+1) hold the same channels, so they swap values through shared memory.
-// REGCAP: 0, or a number of threads per SM to make room for: __launch_bounds__ then asks for at
-// least REGCAP / block threads blocks per SM, which caps the registers per thread.  The request
-// is clamped to what an SM holds (sm_80, sm_90: 2048 threads in 32 blocks; sm_75: 1024 in 16;
-// others: taken as 1536 in 16), so where the SM holds fewer threads than REGCAP (sm_75) the cap
-// asks for no more than the SM's own limit.
-constexpr bool BIG_SM = FUSE_SM == 800 || FUSE_SM >= 900;
-constexpr unsigned MAX_BLOCKS_PER_SM = BIG_SM ? 32 : 16;
-constexpr unsigned MAX_THREADS_PER_SM = BIG_SM ? 2048 : FUSE_SM == 750 ? 1024 : 1536;
-constexpr unsigned minBlocks(unsigned regcap, unsigned threads) {
-    const unsigned want = regcap == 0 ? 1 : (regcap + threads - 1) / threads;
-    const unsigned fit = MAX_THREADS_PER_SM / threads < MAX_BLOCKS_PER_SM ? MAX_THREADS_PER_SM / threads : MAX_BLOCKS_PER_SM;
-    return want < fit ? want : (fit ? fit : 1);
-}
-template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
-__launch_bounds__(FFT::max_threads_per_block, minBlocks(REGCAP, FFT::max_threads_per_block))
-__global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* out,
-                               int ant0, unsigned long long nfft) {
+template<class FFT, class Pre, class Post, bool CROSSPOL>
+__device__ __forceinline__ void fusedBody(const Geometry& g, const Pre& pre, const Post& post,
+                                          cuFloatComplex* out, int ant0, unsigned long long nfft) {
     using complex_type = typename FFT::value_type;
     extern __shared__ __align__(alignof(float4)) unsigned char smem[];
     constexpr unsigned N = size_of<FFT>::value;
@@ -119,10 +105,45 @@ __global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* o
     }
 }
 
+// The kernel: __launch_bounds__ with the block size only, so the compiler chooses the registers.
+// Not __launch_bounds__(threads, 1): with an explicit minimum of one block per SM the compiler
+// used more registers (sm_80: 86-96 instead of 64-72 at cuFFTDx's elements per thread, 54-56
+// instead of 48 at half; sm_75: 92-96 instead of 64-80), which lowered occupancy and made some
+// variants up to 56% slower (README.md).
+template<class FFT, class Pre, class Post, bool CROSSPOL>
+__launch_bounds__(FFT::max_threads_per_block)
+__global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* out,
+                               int ant0, unsigned long long nfft) {
+    fusedBody<FFT, Pre, Post, CROSSPOL>(g, pre, post, out, ant0, nfft);
+}
+
+// The same with the registers capped (--regcap): REGCAP is a number of threads per SM to make
+// room for, so __launch_bounds__ asks for at least REGCAP / block threads blocks per SM.  The
+// request is clamped to what an SM holds (sm_80, sm_90: 2048 threads in 32 blocks; sm_75: 1024
+// in 16; others: taken as 1536 in 16), so where the SM holds fewer threads than REGCAP (sm_75)
+// the cap asks for no more than the SM's own limit.
+constexpr bool BIG_SM = FUSE_SM == 800 || FUSE_SM >= 900;
+constexpr unsigned MAX_BLOCKS_PER_SM = BIG_SM ? 32 : 16;
+constexpr unsigned MAX_THREADS_PER_SM = BIG_SM ? 2048 : FUSE_SM == 750 ? 1024 : 1536;
+constexpr unsigned minBlocks(unsigned regcap, unsigned threads) {
+    const unsigned want = (regcap + threads - 1) / threads;
+    const unsigned fit = MAX_THREADS_PER_SM / threads < MAX_BLOCKS_PER_SM ? MAX_THREADS_PER_SM / threads : MAX_BLOCKS_PER_SM;
+    return want < fit ? want : (fit ? fit : 1);
+}
+template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
+__launch_bounds__(FFT::max_threads_per_block, minBlocks(REGCAP, FFT::max_threads_per_block))
+__global__ void fused_fft_frac_capped(Geometry g, Pre pre, Post post, cuFloatComplex* out,
+                                      int ant0, unsigned long long nfft) {
+    fusedBody<FFT, Pre, Post, CROSSPOL>(g, pre, post, out, ant0, nfft);
+}
+
 template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
 static void launchKernel(const Geometry& g, const Pre& pre, const FracParams& p, cuFloatComplex* out,
                          int ant0, int nant, cudaStream_t st) {
-    auto kernel = fused_fft_frac<FFT, Pre, Post, CROSSPOL, REGCAP>;
+    auto kernel = [] {
+        if constexpr (REGCAP == 0) return fused_fft_frac<FFT, Pre, Post, CROSSPOL>;
+        else                       return fused_fft_frac_capped<FFT, Pre, Post, CROSSPOL, REGCAP>;
+    }();
     constexpr unsigned xsBytes = CROSSPOL ? FFT::max_threads_per_block * sizeof(cuFloatComplex) : 0;
     constexpr unsigned tileBytes = Pre::tileBytes(size_of<FFT>::value, FFT::ffts_per_block);
     constexpr unsigned smem0 = FFT::shared_memory_size > xsBytes ? FFT::shared_memory_size : xsBytes;

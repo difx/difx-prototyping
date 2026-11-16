@@ -331,9 +331,10 @@ static void usage() {
 "  --regcap R      registers capped (__launch_bounds__) to fit R threads per SM: 0 (default, no\n"
 "                  cap) | 1024 | 1536 (1, 2 and 4 FFTs per block only) | sweep (all three)\n"
 "  --batched       one launch for all antennas (one cuFFT plan; one fused kernel)\n"
-"  --chunk W       packed input: also run the end-to-end kernel and the 2-kernel pipelines one\n"
-"                  antenna and W windows at a time, the 2-kernel buffer reused for every chunk\n"
-"                  (so that it can stay in L2)\n"
+"  --chunk W       packed input: also run the end-to-end kernel and the 2-kernel pipelines W\n"
+"                  windows at a time, each antenna on its own stream (the antennas run together),\n"
+"                  each antenna's part of the 2-kernel buffer reused for every chunk, so that\n"
+"                  nant x W windows are in flight (sized to stay in L2; the size is printed)\n"
 "  --invalid F     fraction of windows flagged invalid, default 0\n"
 "  --reps N        timed repetitions, default 20 (median and minimum reported)\n"
 "  --warmup N      untimed repetitions first, default 3\n"
@@ -789,40 +790,65 @@ int main(int argc, char** argv) {
                tol, 30 * tol, ok ? "OK" : "FAIL");
     }
 
-    // ---- packed input, --chunk: the same pipelines a chunk (one antenna, W windows) at a time ----
+    // ---- packed input, --chunk: the same pipelines W windows at a time, one stream per antenna ----
+    // Antenna a's chunks run in order on stream sa[a], with its own part of the 2-kernel buffer
+    // (W windows, reused for every chunk), so the antennas' chunks run together and nant x W
+    // windows of decoded data are in flight: what an XMAC fed from L2 would need.
     struct Chunked { std::string name; int kind; };          // 0 end-to-end, 1 2 kernels FP16, 2 FP32
     std::vector<Chunked> chunked;
+    std::vector<cudaStream_t> sa;
+    std::vector<cudaEvent_t> joined;
+    cudaEvent_t forked = nullptr;
+    const size_t chunkElems = (size_t)std::min(chunk, g.nwin) * g.nband * g.fftchannels;  // per antenna
     if (chunk > 0) {
         const std::string w = std::to_string(chunk);
+        char mb[2][32];
+        for (int h = 0; h < 2; h++)                          // in flight, all antennas: FP16, FP32
+            snprintf(mb[h], sizeof mb[h], " (%.1f MB)", g.nant * chunkElems * (h ? 8.0 : 4.0) / 1e6);
         chunked = {{"end-to-end, chunks of " + w + " windows", 0},
-                   {"2 kernels -> FP16, chunks of " + w + " windows", 1},
-                   {"2 kernels -> FP32, chunks of " + w + " windows", 2}};
+                   {"2 kernels -> FP16, chunks of " + w + " windows" + mb[0], 1},
+                   {"2 kernels -> FP32, chunks of " + w + " windows" + mb[1], 2}};
+        sa.resize(g.nant);
+        joined.resize(g.nant);
+        for (int a = 0; a < g.nant; a++) {
+            CHECK_CUDA(cudaStreamCreateWithFlags(&sa[a], cudaStreamNonBlocking));
+            CHECK_CUDA(cudaEventCreateWithFlags(&joined[a], cudaEventDisableTiming));
+        }
+        CHECK_CUDA(cudaEventCreateWithFlags(&forked, cudaEventDisableTiming));
     }
     auto runChunked = [&](const Chunked& c) {
         launchFixedPhase(g, pF, st);
         launchFringePhase(g, pre.pk, st);
-        for (int a = 0; a < g.nant; a++)
-            for (int w0 = 0; w0 < g.nwin; w0 += chunk) {
+        CHECK_CUDA(cudaEventRecord(forked, st));             // the antennas' streams start after these
+        for (int a = 0; a < g.nant; a++) CHECK_CUDA(cudaStreamWaitEvent(sa[a], forked, 0));
+        for (int w0 = 0; w0 < g.nwin; w0 += chunk)
+            for (int a = 0; a < g.nant; a++) {
                 const int nw = std::min(chunk, g.nwin - w0);
                 cuFloatComplex* out = outFused + g.index(a, w0, 0, 0);
                 if (c.kind == 0) {
                     const ChunkView v = chunkView(g, pF, pre, a, w0, nw);
-                    chosen->launch(v.g, v.pre, v.p, doAuto, out, 0, 1, st);
+                    chosen->launch(v.g, v.pre, v.p, doAuto, out, 0, 1, sa[a]);
                     continue;
                 }
                 const ChunkView v = chunkView(g, pF, preDecode, a, w0, nw);
+                void* buf = c.kind == 1 ? (void*)((__half2*)twoBuf + a * chunkElems)
+                                        : (void*)((float2*)twoBuf + a * chunkElems);
                 withPre(v.pre, [&](auto stage) {
                     const unsigned tpb = std::min(g.nband * g.fftchannels / 8, 256);
-                    if (c.kind == 1) decode_to<8><<<nw, tpb, 0, st>>>(v.g, stage, (__half2*)twoBuf);
-                    else             decode_to<8><<<nw, tpb, 0, st>>>(v.g, stage, (float2*)twoBuf);
+                    if (c.kind == 1) decode_to<8><<<nw, tpb, 0, sa[a]>>>(v.g, stage, (__half2*)buf);
+                    else             decode_to<8><<<nw, tpb, 0, sa[a]>>>(v.g, stage, (float2*)buf);
                 });
                 PreVariant load{};
                 load.half = c.kind == 1;
-                load.in = twoBuf;
+                load.in = buf;
                 load.window = pre.window;
                 load.hop = g.fftchannels;
-                chosen->launch(v.g, load, v.p, doAuto, out, 0, 1, st);
+                chosen->launch(v.g, load, v.p, doAuto, out, 0, 1, sa[a]);
             }
+        for (int a = 0; a < g.nant; a++) {                   // st waits for every antenna
+            CHECK_CUDA(cudaEventRecord(joined[a], sa[a]));
+            CHECK_CUDA(cudaStreamWaitEvent(st, joined[a], 0));
+        }
         CHECK_CUDA(cudaGetLastError());
     };
     for (const auto& c : chunked) {
@@ -914,6 +940,9 @@ int main(int argc, char** argv) {
     printf("  (fused: FFTs per block, FFT elements per thread, threads and shared memory per block; * cuFFTDx's\n"
            "   suggestion; speed-up is unfused / fused. The 2-kernel lines use the variant --fpb and --ept select)\n");
 
+    for (auto s : sa) cudaStreamDestroy(s);
+    for (auto e : joined) cudaEventDestroy(e);
+    if (forked) cudaEventDestroy(forked);
     unf.destroy();
     return pass ? 0 : 1;
 }

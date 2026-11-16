@@ -316,43 +316,97 @@ kernel cannot apply a window, so the WOLA columns have no gpudifx rows.
 
 ### Channel count, chunks and register caps: RTX 2070 SUPER
 
+**A correction first.** Commit 36f5b28, which added the register caps, also changed the
+uncapped kernel's `__launch_bounds__(threads)` to `__launch_bounds__(threads, 1)`. That should
+mean the same thing, but the compiler then gave the kernel more registers (A100: 86-96 instead
+of 64-72 at cuFFTDx's elements per thread; 2070: 92-96 instead of 64-80), and some variants
+became up to 38% slower on the A100 (56% with the tiled decode). The 2070 tables of that commit
+and the A100 run of it (gina303, below) have the slower uncapped kernels. The uncapped kernel
+is now declared as before, and its registers and times are back to those of 501bc92 (within 2%
+on the 2070). In a few cases the extra registers had been faster (2070, 2 kernels FP16, WOLA:
+10.11 vs 10.44 ms at 128 channels).
+
+The 2070's times vary by about 5% from run to run with its temperature (it is a desktop card),
+so compare within a table, not across them.
+
 **Channel count** (`run-nchan.sh`): the same 20 ms of data (2,560,000 samples per antenna and
 band) for every channel count, from the packed data, best variant of each pipeline; ms per
 subint (lower is better), and the end-to-end kernel relative to 128 channels.
 
 | nchan | windows | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 | end-to-end, WOLA | 2 kernels FP16, WOLA | end-to-end vs 128 ch |
 |---|---|---|---|---|---|---|---|
-| 32 | 40000 | 6.43 | 8.95 | 12.71 | 7.52 | 10.30 | 0.96 |
-| 64 | 20000 | 7.00 | 8.73 | 11.92 | 8.10 | 10.50 | 1.05 |
-| 128 | 10000 | 6.68 | 8.39 | 11.29 | 7.68 | 10.00 | 1 |
-| 256 | 5000 | 6.66 | 7.84 | 11.53 | 7.68 | 9.07 | 1.00 |
-| 512 | 2500 | 7.48 | 7.87 | 11.63 | 8.68 | 9.40 | 1.12 |
-| 1024 | 1250 | 7.70 | 7.88 | 11.93 | 8.99 | 9.37 | 1.15 |
-| 2048 | 625 | 8.59 | 9.06 | 12.71 | 9.82 | 10.61 | 1.29 |
-| 4096 | 312 | 10.90 | 11.84 | 15.50 | 12.34 | 15.11 | 1.64 |
-| 8192 | 156 | 12.18 | 13.57 | 16.84 | 14.39 | 17.12 | 1.83 |
+| 32 | 40000 | 6.57 | 9.04 | 12.71 | 7.71 | 10.48 | 0.97 |
+| 64 | 20000 | 7.12 | 8.93 | 11.98 | 8.27 | 11.14 | 1.05 |
+| 128 | 10000 | 6.77 | 8.51 | 11.27 | 7.92 | 10.55 | 1 |
+| 256 | 5000 | 6.81 | 7.94 | 11.52 | 7.86 | 9.29 | 1.01 |
+| 512 | 2500 | 7.58 | 7.91 | 11.61 | 8.94 | 9.77 | 1.12 |
+| 1024 | 1250 | 7.95 | 7.89 | 11.88 | 9.32 | 9.90 | 1.17 |
+| 2048 | 625 | 9.07 | 8.70 | 12.65 | 10.31 | 10.40 | 1.34 |
+| 4096 | 312 | 10.45 | 12.46 | 15.94 | 12.04 | 15.67 | 1.54 |
+| 8192 | 156 | 12.19 | 13.64 | 16.87 | 14.40 | 17.18 | 1.80 |
 
 (4096 and 8192 channels: 19.97 ms of data, whole windows.) There is no case for a minimum
 channel count: 32 channels cost the same as 256. Larger FFTs cost more per unit of data, gently
-up to 1024 channels (+15%), then steeply (+29% at 2048, +64% at 4096, +83% at 8192). That is
+up to 1024 channels (+17%), then steeply (+34% at 2048, +54% at 4096, +80% at 8192). That is
 an argument for two-stage channelisation at high resolution (see the open items). The 2-kernel
-pipeline follows the same curve, 2-39% behind.
+pipeline with an FP16 buffer is 38% behind at 32 channels, level at 512-1024 and 4% ahead at
+2048, then behind again.
 
-**Chunks** (`--chunk W`): one antenna and W windows at a time, the 2-kernel buffer reused for
-every chunk, so that it can stay in L2. The 2070's L2 is 4 MB (a chunk of 256 windows at 128
-channels is 2 MB in FP16), so it shows the cost of chunking, not its benefit: 128 channels,
-WOLA, ms per subint:
+**Chunks** (`--chunk W`): W windows at a time, each antenna on its own stream so that the
+antennas' chunks run together, each antenna's part of the 2-kernel buffer reused for every
+chunk. All the antennas' chunks are in flight at once, which is what an XMAC reading the
+spectra from L2 would need; the chunk sizes give 84, 21, 10.5, 5.2 and 2.6 MB in FP16 at both
+channel counts. WOLA, half of cuFFTDx's elements per thread, ms per subint (each row from its
+own run; the whole-subint times of those runs agree within 6%):
 
-| chunk | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 |
-|---|---|---|---|
-| whole subint | 7.57 | 9.28 | 12.90 |
-| 4096 windows | 7.71 | 9.61 | 13.15 |
-| 1024 windows | 8.34 | 10.64 | 14.02 |
-| 256 windows | 9.96 | 12.79 | 14.17 |
+| chunk (windows) | in flight, FP16 | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 |
+|---|---|---|---|---|
+| 128 channels: whole subint | | 8.02 | 9.91 | 12.78 |
+| 1024 | 84 MB | 8.31 | 10.34 | 13.00 |
+| 256 | 21 MB | 8.40 | 10.96 | 13.69 |
+| 128 | 10.5 MB | 8.60 | 11.27 | 14.37 |
+| 64 | 5.2 MB | 8.85 | 11.98 | 14.81 |
+| 32 | 2.6 MB | 9.47 | 13.35 | 15.52 |
+| 1024 channels: whole subint | | 7.51 | 8.61 | 11.13 |
+| 128 | 84 MB | 7.92 | 8.42 | 10.87 |
+| 32 | 21 MB | 7.80 | 8.89 | 11.39 |
+| 16 | 10.5 MB | 7.94 | 9.14 | 11.54 |
+| 8 | 5.2 MB | 8.19 | 12.73 | 13.94 |
+| 4 | 2.6 MB | 8.54 | 18.78 | 19.51 |
+
+Running the antennas together removes most of the cost of chunking: the end-to-end kernel loses
+4-18%, against 32% for chunks of 256 windows one antenna at a time (the first version of
+`--chunk`). The only chunked 2-kernel time below its whole-subint time is at 84 MB and 1024
+channels, 20 times the 2070's 4 MB L2, so it comes from the decode and FFT kernels of
+different antennas overlapping, not from L2. Chunks small enough for the 2070's L2 (2.6 MB) are
+so small that launches dominate (1024 channels, 4 windows: 5700 launches per subint). So the
+2070 cannot show what L2 is worth; the A100 (40 MB) can.
 
 **Register caps** (`--regcap 1024|1536`): `__launch_bounds__` with a minimum of blocks per SM,
-to raise occupancy on the A100. A 2070 SM holds only 1024 threads, so on it the caps change
-nothing (58 registers either way).
+to raise occupancy on the A100. A 2070 SM holds only 1024 threads, so a cap allows at most 64
+registers there. That changes nothing at half of cuFFTDx's elements per thread (55-58
+registers either way). At cuFFTDx's setting it takes some variants from 72-80 registers to 64,
+which moves their times by -6% to +5%; none of them is the fastest variant.
+
+### Register caps and the first chunks: A100-SXM4-80GB (OzSTAR, gina303)
+
+`fusebench-ozstar.sbatch`, SLURM job 21021335, and `ncu-ozstar.sbatch`, job 21021345, commit
+36f5b28, all checks passing. The uncapped kernels of this run have the extra registers described
+above, so its uncapped and 2-kernel times and its channel-count sweep are to be repeated. The
+capped kernels were not affected: their registers are the same in the corrected build.
+
+- **Capping the registers pays on the A100.** At half of cuFFTDx's elements per thread, a cap of
+  40 registers (`--regcap 1536`) gives the fastest end-to-end kernel with WOLA: 3.03 ms at 128
+  channels (2 FFTs per block) and 2.76 ms at 1024, against 3.24 and 2.83 ms uncapped (48-56
+  registers) in job 21016518. At cuFFTDx's elements per thread, a cap of 64 registers is 0-5%
+  slower than those, and a cap of 40 much slower (5.10 ms at 128 channels). With an FP16
+  buffer (`wola-fp16`) the caps change nothing at 128 channels. Nsight Compute: at 64 registers
+  occupancy is 47-48%.
+- **One antenna at a time, chunking only costs.** Each launch of a chunk cost 6-11 µs (launch,
+  and a grid too small to fill the GPU): the end-to-end kernel took 3.30 ms for the whole
+  subint, 3.48 ms in chunks of 4096 windows and 7.39 ms in chunks of 256 (128 channels, WOLA).
+  The chunked 2-kernel pipelines were slower than the unchunked ones at every chunk size. This
+  is why `--chunk` now runs the antennas together (above); the A100 run of that is to come.
 
 ### From the packed data: A100-SXM4-80GB (OzSTAR, gina10)
 
@@ -473,9 +527,11 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **The A100 runs of the register caps, the chunks and the channel-count sweep** (in
-  `fusebench-ozstar.sbatch` and `ncu-ozstar.sbatch`). Fewer instructions per sample in the
-  decode.
+- **The A100 runs with the corrected uncapped kernel and the concurrent chunks**
+  (`fusebench-ozstar.sbatch`, `ncu-ozstar.sbatch`): the channel-count sweep, and whether chunks
+  that fit the A100's L2 bring the 2-kernel pipeline level with the end-to-end kernel. Fewer
+  instructions per sample in the decode. The register cap as part of the production kernel's
+  choice of variant (40 registers at half of cuFFTDx's elements per thread on the A100).
 - **An XMAC stage in the benchmark**, to measure what the spectra being in L2 is worth to the
   cross-multiply, and how that scales with the number of stations. Chunking all antennas a range
   of windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read
