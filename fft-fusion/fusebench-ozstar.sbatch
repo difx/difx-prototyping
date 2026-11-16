@@ -7,12 +7,13 @@
 #SBATCH --cpus-per-task=8         # for the parallel build (the fused kernel is compiled per FFT length)
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
-#SBATCH --time=0:30:00            # estimate: build 4-8 min, run-bench.sh 1-2 min (70 s on an RTX 2070)
+#SBATCH --time=0:45:00            # estimate: build 5-10 min, run-bench.sh + run-nchan.sh 3-6 min (5 on an RTX 2070)
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #
 # fusebench on one OzSTAR GPU node (an A100 on the gina nodes): builds fusebench for the GPU the
-# job got, then runs the standard set (run-bench.sh).  See README.md.
+# job got, then runs the standard set (run-bench.sh) and the channel-count sweep (run-nchan.sh).
+# See README.md.
 #
 # The build environment comes from DIFX_SETUP, a file this job sources: your gpudifx setup (module
 # loads, then gpudifx's setup.bash), which sets CUDAROOT or puts nvcc on PATH.  Default:
@@ -24,8 +25,9 @@
 #     make mathdx           # fetches MathDx (cuFFTDx) from PyPI; the GPU nodes may have no network
 #     sbatch fusebench-ozstar.sbatch
 # Submit from fft-fusion (or set BENCHDIR).  The SLURM log fusebench.<jobid>.log is written there
-# and holds the summary.  The logs of every run are in results-local/<host>-<stamp>/, which is also
-# packed into a .tgz next to it at the end: send that and the SLURM log back.
+# and holds the summary.  The logs of every run are in results-local/<host>-<stamp>/ (run-bench.sh)
+# and results-local/<host>-nchan-<stamp>/ (run-nchan.sh), each also packed into a .tgz next to it
+# at the end: send those and the SLURM log back.
 #
 # Other settings, through the environment:
 #     sbatch --export=ALL,DIFX_SETUP=<file> fusebench-ozstar.sbatch
@@ -75,13 +77,21 @@ head -1 "$blog"                   # what the Makefile chose: CUDA, MathDx
 "${CUDAROOT:+$CUDAROOT/bin/}nvcc" --version | tail -1   # the Makefile's choice: CUDAROOT, else PATH
 echo "Built in $(( $(date +%s) - t0 )) s"
 
-t0=$(date +%s)
-./run-bench.sh "${extra[@]}"
-rc=$?
-echo "run-bench.sh: exit $rc, $(( $(date +%s) - t0 )) s"
-results=$(ls -td results-local/"$(hostname -s)"-* 2>/dev/null | head -1)
-if [ -n "$results" ]; then
-    tar czf "$results.tgz" -C results-local "$(basename "$results")"
-    echo "Packed: $BENCHDIR/$results.tgz"
-fi
+# run <script>: run it, then pack the results directory it reports ("Results in <dir> ...")
+rc=0
+run() {
+    local t0=$(date +%s) log="$1.${SLURM_JOB_ID:-manual}.out"
+    "./$1" "${extra[@]}" 2>&1 | tee "$log"
+    local r=${PIPESTATUS[0]}
+    echo "$1: exit $r, $(( $(date +%s) - t0 )) s"
+    [ $r = 0 ] || rc=1
+    local results=$(sed -n 's/^Results in \([^ ]*\).*/\1/p' "$log" | tail -1)
+    if [ -n "$results" ] && [ -d "$results" ]; then
+        command mv "$log" "$results/"
+        tar czf "$results.tgz" -C results-local "$(basename "$results")"
+        echo "Packed: $BENCHDIR/$results.tgz"
+    fi
+}
+run run-bench.sh
+run run-nchan.sh
 exit $rc

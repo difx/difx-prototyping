@@ -17,6 +17,8 @@
 #include <cufftdx/cufftdx_version.hpp>
 #include "pipelines.cuh"
 
+int fusedLastRegisters = 0;
+
 std::map<int, std::vector<FusedVariant>>& fusedRegistry() {
     static std::map<int, std::vector<FusedVariant>> r;
     return r;
@@ -247,6 +249,39 @@ static Timing timeIt(F f, int warmup, int reps, cudaStream_t st) {
     return {reps % 2 ? t[reps / 2] : 0.5 * (t[reps / 2 - 1] + t[reps / 2]), t[0]};
 }
 
+// ---- chunks: one antenna, a range of windows -------------------------------------------------
+// The parameters and the packed input of antenna ant, windows [w0, w0 + nwin), as a geometry of
+// one antenna and nwin windows (offset pointers), so that a pipeline can run a subint a chunk at a
+// time, each chunk's intermediate buffer small enough to stay in L2 (--chunk).
+struct ChunkView { Geometry g; FracParams p; PreVariant pre; };
+
+static ChunkView chunkView(const Geometry& g, const FracParams& p, const PreVariant& pre, int ant, int w0, int nwin) {
+    ChunkView v{g, p, pre};
+    v.g.nant = 1;
+    v.g.nwin = nwin;
+    const size_t aw = (size_t)ant * g.nwin + w0, ab = (size_t)ant * g.nband;
+    v.p.fracSampleError += aw;
+    v.p.validSamples += aw;
+    v.p.clockOffsets += ab;
+    v.p.clockOffsetsDelta += ab;
+    v.p.fracFreqOffset += ab;
+    v.p.bandFlags += ab;
+    if (v.p.autocorr) v.p.autocorr += (size_t)ant * 2 * g.nband * g.nchan;
+    v.p.fixedPhase += aw * g.nband;
+    v.p.numBlocks = nwin;
+    if (pre.packed) {
+        PackedInput& d = v.pre.pk;
+        d.packed += (size_t)ant * d.bytesPerAnt;
+        d.validFrames += (size_t)ant * d.nframes;
+        d.sampleIndex += aw;
+        d.decodeFlags += ab;
+        d.bigA += aw * g.nband;
+        d.bigBred += aw * g.nband;
+        d.fringePhase += aw * g.nband;
+    }
+    return v;
+}
+
 // ---- options ---------------------------------------------------------------------------------
 static void usage() {
     printf(
@@ -293,7 +328,12 @@ static void usage() {
 "  --fpb N|sweep   FFTs per block: cuFFTDx's suggestion (default), N, or time all\n"
 "  --ept E         FFT elements per thread: cuFFTDx's suggestion (default) | half (of it, where\n"
 "                  supported) | N | sweep (both)\n"
+"  --regcap R      registers capped (__launch_bounds__) to fit R threads per SM: 0 (default, no\n"
+"                  cap) | 1024 | 1536 (1, 2 and 4 FFTs per block only) | sweep (all three)\n"
 "  --batched       one launch for all antennas (one cuFFT plan; one fused kernel)\n"
+"  --chunk W       packed input: also run the end-to-end kernel and the 2-kernel pipelines one\n"
+"                  antenna and W windows at a time, the 2-kernel buffer reused for every chunk\n"
+"                  (so that it can stay in L2)\n"
 "  --invalid F     fraction of windows flagged invalid, default 0\n"
 "  --reps N        timed repetitions, default 20 (median and minimum reported)\n"
 "  --warmup N      untimed repetitions first, default 3\n"
@@ -312,8 +352,8 @@ int main(int argc, char** argv) {
     double bw = 64.0, invalidFrac = 0.0, taper = 0.0, overlap = 0.0;
     AutoMode amode = AutoMode::NONE;
     Rotator rotator = Rotator::FIXED;
-    int fpb = 0, ept = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
-    bool sweepEpt = false;
+    int fpb = 0, ept = 0, regcap = 0, chunk = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
+    bool sweepEpt = false, sweepRegcap = false;
     unsigned long long seed = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -347,11 +387,16 @@ int main(int argc, char** argv) {
         else if (a == "--singlepol") singlePol = true;
         else if (a == "--crosspol-pass") crossPolPass = true;
         else if (a == "--fpb") { std::string m = next(); if (m == "sweep") sweep = true; else fpb = std::stoi(m); }
+        else if (a == "--regcap") {
+            std::string m = next();
+            if (m == "sweep") sweepRegcap = true; else regcap = std::stoi(m);
+        }
         else if (a == "--ept") {
             std::string m = next();
             if (m == "sweep") sweepEpt = true; else if (m == "half") ept = -1; else ept = std::stoi(m);
         }
         else if (a == "--batched") batched = true;
+        else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
@@ -372,6 +417,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--input packed: %d bands of %d bits do not divide a %d-byte payload\n", g.nband, nbit, VDIF_PAYLOAD);
         return 2;
     }
+    if (chunk < 0 || (chunk > 0 && !packed)) { fprintf(stderr, "--chunk W: W > 0, with --input packed\n"); return 2; }
     if (packed && rotator == Rotator::DOUBLE && taper > 0) {
         fprintf(stderr, "--rotator double with packed input runs gpudifx's decode, which has no window\n");
         return 2;
@@ -404,7 +450,7 @@ int main(int argc, char** argv) {
         if (std::max(v.smem, tileBytes(v.fpb)) <= prop.sharedMemPerBlockOptin && v.threads <= (unsigned)prop.maxThreadsPerBlock)
             variants.push_back(v);
     std::sort(variants.begin(), variants.end(), [](const FusedVariant& a, const FusedVariant& b) {
-        return a.ept != b.ept ? a.ept > b.ept : a.fpb < b.fpb; });
+        return a.regcap != b.regcap ? a.regcap < b.regcap : a.ept != b.ept ? a.ept > b.ept : a.fpb < b.fpb; });
     // default: cuFFTDx's suggestion; with --ept alone, its suggested FFTs per block at that EPT
     unsigned eptDefault = 0, fpbDefault = 0;
     for (const auto& v : variants)
@@ -413,12 +459,13 @@ int main(int argc, char** argv) {
     const unsigned fpbWanted = fpb > 0 ? (unsigned)fpb : fpbDefault;
     const FusedVariant* chosen = nullptr;
     for (const auto& v : variants)
-        if (v.ept == eptWanted && v.fpb == fpbWanted)
+        if (v.ept == eptWanted && v.fpb == fpbWanted && v.regcap == (unsigned)regcap)
             chosen = &v;
     if (!chosen) {
-        fprintf(stderr, "no fused variant with %u FFTs per block and %u elements per thread fits this GPU for FFT "
-                "length %d (available, FFTs per block x elements per thread:", fpbWanted, eptWanted, g.fftchannels);
-        for (const auto& v : variants) fprintf(stderr, " %ux%u", v.fpb, v.ept);
+        fprintf(stderr, "no fused variant with %u FFTs per block, %u elements per thread and register cap %d fits "
+                "this GPU for FFT length %d (available, FFTs per block x elements per thread / cap:", fpbWanted,
+                eptWanted, regcap, g.fftchannels);
+        for (const auto& v : variants) fprintf(stderr, " %ux%u/%u", v.fpb, v.ept, v.regcap);
         fprintf(stderr, ")\n");
         return 2;
     }
@@ -742,6 +789,55 @@ int main(int argc, char** argv) {
                tol, 30 * tol, ok ? "OK" : "FAIL");
     }
 
+    // ---- packed input, --chunk: the same pipelines a chunk (one antenna, W windows) at a time ----
+    struct Chunked { std::string name; int kind; };          // 0 end-to-end, 1 2 kernels FP16, 2 FP32
+    std::vector<Chunked> chunked;
+    if (chunk > 0) {
+        const std::string w = std::to_string(chunk);
+        chunked = {{"end-to-end, chunks of " + w + " windows", 0},
+                   {"2 kernels -> FP16, chunks of " + w + " windows", 1},
+                   {"2 kernels -> FP32, chunks of " + w + " windows", 2}};
+    }
+    auto runChunked = [&](const Chunked& c) {
+        launchFixedPhase(g, pF, st);
+        launchFringePhase(g, pre.pk, st);
+        for (int a = 0; a < g.nant; a++)
+            for (int w0 = 0; w0 < g.nwin; w0 += chunk) {
+                const int nw = std::min(chunk, g.nwin - w0);
+                cuFloatComplex* out = outFused + g.index(a, w0, 0, 0);
+                if (c.kind == 0) {
+                    const ChunkView v = chunkView(g, pF, pre, a, w0, nw);
+                    chosen->launch(v.g, v.pre, v.p, doAuto, out, 0, 1, st);
+                    continue;
+                }
+                const ChunkView v = chunkView(g, pF, preDecode, a, w0, nw);
+                withPre(v.pre, [&](auto stage) {
+                    const unsigned tpb = std::min(g.nband * g.fftchannels / 8, 256);
+                    if (c.kind == 1) decode_to<8><<<nw, tpb, 0, st>>>(v.g, stage, (__half2*)twoBuf);
+                    else             decode_to<8><<<nw, tpb, 0, st>>>(v.g, stage, (float2*)twoBuf);
+                });
+                PreVariant load{};
+                load.half = c.kind == 1;
+                load.in = twoBuf;
+                load.window = pre.window;
+                load.hop = g.fftchannels;
+                chosen->launch(v.g, load, v.p, doAuto, out, 0, 1, st);
+            }
+        CHECK_CUDA(cudaGetLastError());
+    };
+    for (const auto& c : chunked) {
+        if (doAuto) CHECK_CUDA(cudaMemsetAsync(autoFused, 0, nauto * sizeof(cuFloatComplex), st));
+        CHECK_CUDA(cudaMemsetAsync(outFused, 0, nelem * sizeof(cuFloatComplex), st));
+        runChunked(c);
+        CHECK_CUDA(cudaStreamSynchronize(st));
+        const Diff d2 = compareDevice(g, outFused, outUnfused, p.validSamples);
+        const double tol = c.kind == 1 ? 1e-3 : specTol;
+        const bool ok = d2.rms < tol && d2.max < 30 * tol;
+        pass &= ok;
+        printf("check: %s vs unfused: rms %.2e, max %.2e (limits %.0e, %.0e)  %s\n", c.name.c_str(), d2.rms,
+               d2.max, tol, 30 * tol, ok ? "OK" : "FAIL");
+    }
+
     if (doAuto) {
         std::vector<cuFloatComplex> au(nauto), af(nauto);
         CHECK_CUDA(cudaMemcpy(au.data(), autoUnfused, nauto * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
@@ -792,11 +888,14 @@ int main(int argc, char** argv) {
     for (const auto& v : variants) {
         if (!sweep && v.fpb != chosen->fpb) continue;
         if (!sweepEpt && v.ept != chosen->ept) continue;
-        char name[96];
-        snprintf(name, sizeof name, "fused, %u FFT/block, %u/thr%s (%u thr, %u B)", v.fpb, v.ept, v.suggested ? "*" : "",
-                 v.threads, v.smem);
+        if (!sweepRegcap && v.regcap != chosen->regcap) continue;
+        char name[112];
         bool crossInKernel = false;
         const Timing t = timeIt([&] { crossInKernel = runFused(v); }, warmup, reps, st);
+        char cap[16] = "";
+        if (v.regcap) snprintf(cap, sizeof cap, " cap%u", v.regcap);
+        snprintf(name, sizeof name, "fused, %u FFT/block, %u/thr%s%s (%u thr, %u B, %d reg)", v.fpb, v.ept, cap,
+                 v.suggested ? "*" : "", v.threads, v.smem, fusedLastRegisters);
         if (amode == AutoMode::FULL && crossInKernel) strncat(name, " +xpol", sizeof name - strlen(name) - 1);
         line(name, t, tU.median);
         if (amode == AutoMode::FULL && !crossInKernel && &v == chosen)
@@ -810,6 +909,8 @@ int main(int argc, char** argv) {
              timeIt([&] { runTwoStage1(tk); }, warmup, reps, st), 0);
         line(tk.half ? "  fused FFT, FP16 load" : "  fused FFT, FP32 load", timeIt([&] { runTwoStage2(tk); }, warmup, reps, st), 0);
     }
+    for (const auto& c : chunked)
+        line(c.name.c_str(), timeIt([&] { runChunked(c); }, warmup, reps, st), tU.median);
     printf("  (fused: FFTs per block, FFT elements per thread, threads and shared memory per block; * cuFFTDx's\n"
            "   suggestion; speed-up is unfused / fused. The 2-kernel lines use the variant --fpb and --ept select)\n");
 

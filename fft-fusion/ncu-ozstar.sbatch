@@ -116,9 +116,13 @@ profile c128-packed-wola-ept-half fused_fft_frac "${C128[@]}" --input packed --w
 # the first stage of the two-kernel pipeline, and gpudifx's decode kernel (FP64 phases)
 profile c128-decode-to-fp16        decode_to      "${C128[@]}" --input packed --wola
 profile c128-gpudifx-decode        gpu_fused_fringe_tiled "${C128[@]}" --input packed --rotator double
+# registers capped for 1024 threads per SM (64 registers a thread on the A100)
+profile c128-fused-fp16-wola-cap1024 fused_fft_frac "${C128[@]}" --input fp16 --wola --regcap 1024
+profile c128-packed-wola-cap1024     fused_fft_frac "${C128[@]}" --input packed --wola --regcap 1024
 profile c1024-fused-fp32           fused_fft_frac "${C1024[@]}"
 profile c1024-packed-wola          fused_fft_frac "${C1024[@]}" --input packed --wola
 profile c1024-packed-wola-ept-half fused_fft_frac "${C1024[@]}" --input packed --wola --ept half
+profile c1024-packed-wola-cap1024  fused_fft_frac "${C1024[@]}" --input packed --wola --regcap 1024
 
 tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"

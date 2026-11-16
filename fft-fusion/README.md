@@ -63,6 +63,7 @@ make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everythin
 ./fusebench --nchan 128 --nwin 10000 --input fp16 --wola --fpb sweep  # one case
 ./fusebench --nchan 128 --nwin 10000 --input packed --wola --ept sweep # from the packed data
 ./run-bench.sh                                                       # the standard set below
+./run-nchan.sh                                                       # cost against channel count
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
 ```
@@ -313,6 +314,46 @@ kernel cannot apply a window, so the WOLA columns have no gpudifx rows.
    - not done yet: the bit width as a template parameter: -3 to -4% in a quick test, worth it
      in production code
 
+### Channel count, chunks and register caps: RTX 2070 SUPER
+
+**Channel count** (`run-nchan.sh`): the same 20 ms of data (2,560,000 samples per antenna and
+band) for every channel count, from the packed data, best variant of each pipeline; ms per
+subint (lower is better), and the end-to-end kernel relative to 128 channels.
+
+| nchan | windows | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 | end-to-end, WOLA | 2 kernels FP16, WOLA | end-to-end vs 128 ch |
+|---|---|---|---|---|---|---|---|
+| 32 | 40000 | 6.43 | 8.95 | 12.71 | 7.52 | 10.30 | 0.96 |
+| 64 | 20000 | 7.00 | 8.73 | 11.92 | 8.10 | 10.50 | 1.05 |
+| 128 | 10000 | 6.68 | 8.39 | 11.29 | 7.68 | 10.00 | 1 |
+| 256 | 5000 | 6.66 | 7.84 | 11.53 | 7.68 | 9.07 | 1.00 |
+| 512 | 2500 | 7.48 | 7.87 | 11.63 | 8.68 | 9.40 | 1.12 |
+| 1024 | 1250 | 7.70 | 7.88 | 11.93 | 8.99 | 9.37 | 1.15 |
+| 2048 | 625 | 8.59 | 9.06 | 12.71 | 9.82 | 10.61 | 1.29 |
+| 4096 | 312 | 10.90 | 11.84 | 15.50 | 12.34 | 15.11 | 1.64 |
+| 8192 | 156 | 12.18 | 13.57 | 16.84 | 14.39 | 17.12 | 1.83 |
+
+(4096 and 8192 channels: 19.97 ms of data, whole windows.) There is no case for a minimum
+channel count: 32 channels cost the same as 256. Larger FFTs cost more per unit of data, gently
+up to 1024 channels (+15%), then steeply (+29% at 2048, +64% at 4096, +83% at 8192). That is
+an argument for two-stage channelisation at high resolution (see the open items). The 2-kernel
+pipeline follows the same curve, 2-39% behind.
+
+**Chunks** (`--chunk W`): one antenna and W windows at a time, the 2-kernel buffer reused for
+every chunk, so that it can stay in L2. The 2070's L2 is 4 MB (a chunk of 256 windows at 128
+channels is 2 MB in FP16), so it shows the cost of chunking, not its benefit: 128 channels,
+WOLA, ms per subint:
+
+| chunk | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 |
+|---|---|---|---|
+| whole subint | 7.57 | 9.28 | 12.90 |
+| 4096 windows | 7.71 | 9.61 | 13.15 |
+| 1024 windows | 8.34 | 10.64 | 14.02 |
+| 256 windows | 9.96 | 12.79 | 14.17 |
+
+**Register caps** (`--regcap 1024|1536`): `__launch_bounds__` with a minimum of blocks per SM,
+to raise occupancy on the A100. A 2070 SM holds only 1024 threads, so on it the caps change
+nothing (58 registers either way).
+
 ### From the packed data: A100-SXM4-80GB (OzSTAR, gina10)
 
 `fusebench-ozstar.sbatch`, SLURM job 21016518, commit 2247eaa; the same runs as on the 2070, all
@@ -430,16 +471,33 @@ leakage by about 11 dB, for 17% more windows: 10-13% more fused-kernel time on t
 weights, so the shape costs nothing; only the taper length (the number of windows) does.
 All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|sine|vorbis`).
 
-### Not yet measured
+### Open items
 
-- Capping the fused kernels' registers for occupancy on the A100 (see the Nsight Compute
-  findings above), and fewer instructions per sample in the decode.
+- **The A100 runs of the register caps, the chunks and the channel-count sweep** (in
+  `fusebench-ozstar.sbatch` and `ncu-ozstar.sbatch`). Fewer instructions per sample in the
+  decode.
+- **An XMAC stage in the benchmark**, to measure what the spectra being in L2 is worth to the
+  cross-multiply, and how that scales with the number of stations. Chunking all antennas a range
+  of windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read
+  and write its accumulators once per chunk. With N stations, B bands, C channels and W windows
+  per chunk, accumulator traffic over spectrum traffic is about 2N / W (FP16 spectra, FP32
+  accumulators), and with W set by the L2 size, about 8 N^2 B C / L2: 1 at N ~ 70 for B C = 1024
+  on the A100 (40 MB), at N ~ 17 for B C = 16384. Beyond that chunking costs more than it saves,
+  unless the XMAC keeps its accumulators on chip across chunks (a persistent producer/consumer
+  design). A tensor-core XMAC reads through L2 like any other kernel (tensor cores work on
+  registers and shared memory), so the same holds for it; it wants FP16 input in its own block
+  layout, which the fused kernel could write directly, halving its output.
+- **Two-stage channelisation for high spectral resolution** (say above 512 channels): a coarse
+  first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
+  second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes
+  inaccurate with very long windows and high fringe rates), and two short FFTs may be faster
+  than one long one (see the channel-count table). The first stage is the question: a WOLA FFT
+  risks artefacts at the coarse channel edges, a PFB costs complexity and computation.
 - Two kernels with WOLA through a series buffer (each sample decoded, rotated and stored once,
   as `--layout series`) rather than a buffer per window, which repeats the 12.5% overlap. That
   needs the fringe phase to be continuous from window to window.
 - Fringe and fractional-sample phases by recurrence (one sincos per thread, then a complex
   multiply per element) instead of a sincos per element.
 - Complex packed data, phase cal, and CODIF in the end-to-end kernel.
-- Complex data (`--complex`) and other channel counts.
-- Decode and fringe rotation inside the fused kernel (the next pre-FFT stage).
+- Complex data (`--complex`).
 - The effect inside mpifxcorr, where the FFT and rotation overlap with transfers and the XMAC.

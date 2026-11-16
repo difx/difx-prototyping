@@ -50,11 +50,14 @@ struct FusedVariant {
     unsigned threads;      // threads per block
     unsigned smem;         // dynamic shared memory, bytes
     bool suggested;        // cuFFTDx's suggested FFTs per block
+    unsigned regcap;       // 0, or the threads per SM the registers are capped for (__launch_bounds__)
     // all antennas in [ant0, ant0 + nant) in one launch (after launchFixedPhase); returns true if
     // the kernel also formed the cross-pol products (p.crossPolInBlock, even FFTs per block)
     bool (*launch)(const Geometry& g, const PreVariant& pre, const FracParams& p, bool doAutocorr,
                    cuFloatComplex* out, int ant0, int nant, cudaStream_t st);
 };
+// registers per thread of the last fused kernel launched (for the report)
+extern int fusedLastRegisters;
 std::map<int, std::vector<FusedVariant>>& fusedRegistry();   // FFT size -> variants
 
 // The cross-pol autocorrelation pass, when the fused kernel cannot form the products itself.

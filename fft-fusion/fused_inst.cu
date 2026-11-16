@@ -37,8 +37,21 @@ using FFTn = decltype(FFTBase() + ElementsPerThread<E>() + FFTsPerBlock<FPB>());
 // With CROSSPOL the cross-pol autocorrelations are formed here too: bands 2f and 2f+1 of a window
 // are spectra y and y+1 of the same block (band fastest, even nband, even FFTs per block), and
 // thread (x, y) and (x, y+1) hold the same channels, so they swap values through shared memory.
-template<class FFT, class Pre, class Post, bool CROSSPOL>
-__launch_bounds__(FFT::max_threads_per_block)
+// REGCAP: 0, or a number of threads per SM to make room for: __launch_bounds__ then asks for at
+// least REGCAP / block threads blocks per SM, which caps the registers per thread.  The request
+// is clamped to what an SM holds (sm_80, sm_90: 2048 threads in 32 blocks; sm_75: 1024 in 16;
+// others: taken as 1536 in 16), so where the SM holds fewer threads than REGCAP (sm_75) the cap
+// asks for no more than the SM's own limit.
+constexpr bool BIG_SM = FUSE_SM == 800 || FUSE_SM >= 900;
+constexpr unsigned MAX_BLOCKS_PER_SM = BIG_SM ? 32 : 16;
+constexpr unsigned MAX_THREADS_PER_SM = BIG_SM ? 2048 : FUSE_SM == 750 ? 1024 : 1536;
+constexpr unsigned minBlocks(unsigned regcap, unsigned threads) {
+    const unsigned want = regcap == 0 ? 1 : (regcap + threads - 1) / threads;
+    const unsigned fit = MAX_THREADS_PER_SM / threads < MAX_BLOCKS_PER_SM ? MAX_THREADS_PER_SM / threads : MAX_BLOCKS_PER_SM;
+    return want < fit ? want : (fit ? fit : 1);
+}
+template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
+__launch_bounds__(FFT::max_threads_per_block, minBlocks(REGCAP, FFT::max_threads_per_block))
 __global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* out,
                                int ant0, unsigned long long nfft) {
     using complex_type = typename FFT::value_type;
@@ -106,19 +119,22 @@ __global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* o
     }
 }
 
-template<class FFT, class Pre, class Post, bool CROSSPOL>
+template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
 static void launchKernel(const Geometry& g, const Pre& pre, const FracParams& p, cuFloatComplex* out,
                          int ant0, int nant, cudaStream_t st) {
-    auto kernel = fused_fft_frac<FFT, Pre, Post, CROSSPOL>;
+    auto kernel = fused_fft_frac<FFT, Pre, Post, CROSSPOL, REGCAP>;
     constexpr unsigned xsBytes = CROSSPOL ? FFT::max_threads_per_block * sizeof(cuFloatComplex) : 0;
     constexpr unsigned tileBytes = Pre::tileBytes(size_of<FFT>::value, FFT::ffts_per_block);
     constexpr unsigned smem0 = FFT::shared_memory_size > xsBytes ? FFT::shared_memory_size : xsBytes;
     constexpr unsigned smemBytes = smem0 > tileBytes ? smem0 : tileBytes;
-    static bool attributeSet = false;
-    if (!attributeSet) {
+    static int regs = -1;
+    if (regs < 0) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
-        attributeSet = true;
+        cudaFuncAttributes attr;
+        CHECK_CUDA(cudaFuncGetAttributes(&attr, kernel));
+        regs = attr.numRegs;
     }
+    fusedLastRegisters = regs;
     const unsigned long long nfft = (unsigned long long)nant * g.nwin * g.nband;
     const unsigned long long blocks = (nfft + FFT::ffts_per_block - 1) / FFT::ffts_per_block;
     Post post;
@@ -127,42 +143,43 @@ static void launchKernel(const Geometry& g, const Pre& pre, const FracParams& p,
     CHECK_CUDA(cudaGetLastError());
 }
 
-template<class FFT, class Pre, class Post>
+template<class FFT, class Pre, class Post, unsigned REGCAP>
 static bool launchOne(const Geometry& g, const Pre& pre, const FracParams& p, cuFloatComplex* out,
                       int ant0, int nant, cudaStream_t st) {
     if constexpr (Post::doAutocorr && FFT::ffts_per_block % 2 == 0) {
         if (p.crossPol && p.crossPolInBlock) {
-            launchKernel<FFT, Pre, Post, true>(g, pre, p, out, ant0, nant, st);
+            launchKernel<FFT, Pre, Post, true, REGCAP>(g, pre, p, out, ant0, nant, st);
             return true;
         }
     }
-    launchKernel<FFT, Pre, Post, false>(g, pre, p, out, ant0, nant, st);
+    launchKernel<FFT, Pre, Post, false, REGCAP>(g, pre, p, out, ant0, nant, st);
     return false;
 }
 
 // The fused kernel always uses the fixed-point rotator (no FP64 per element).
-template<class FFT>
+template<class FFT, unsigned REGCAP>
 static bool launchVariant(const Geometry& g, const PreVariant& pre, const FracParams& p, bool doAutocorr,
                           cuFloatComplex* out, int ant0, int nant, cudaStream_t st) {
     bool crossDone = false;
     withPre(pre, [&](auto stage) {
         using Pre = decltype(stage);
-        if (doAutocorr) crossDone = launchOne<FFT, Pre, FracRotateFixed<true>>(g, stage, p, out, ant0, nant, st);
-        else            crossDone = launchOne<FFT, Pre, FracRotateFixed<false>>(g, stage, p, out, ant0, nant, st);
+        if (doAutocorr) crossDone = launchOne<FFT, Pre, FracRotateFixed<true>, REGCAP>(g, stage, p, out, ant0, nant, st);
+        else            crossDone = launchOne<FFT, Pre, FracRotateFixed<false>, REGCAP>(g, stage, p, out, ant0, nant, st);
     });
     return crossDone;
 }
 
-template<unsigned E, unsigned FPB>
+template<unsigned E, unsigned FPB, unsigned REGCAP = 0>
 static void addVariant(std::vector<FusedVariant>& v) {
     // only FFTs-per-block counts that fit in a block of 1024 threads
     if constexpr (FFTn<E, 1>::block_dim.x * FPB <= 1024) {
         using FFT = FFTn<E, FPB>;
         static_assert(!FFT::requires_workspace, "FFT size needs a workspace; only powers of two are supported");
         for (const auto& e : v)
-            if (e.fpb == FPB && e.ept == E) return;
+            if (e.fpb == FPB && e.ept == E && e.regcap == REGCAP) return;
         v.push_back({FPB, E, FFT::max_threads_per_block, FFT::shared_memory_size,
-                     E == E0 && FPB == FFTBase::suggested_ffts_per_block, &launchVariant<FFT>});
+                     E == E0 && FPB == FFTBase::suggested_ffts_per_block && REGCAP == 0, REGCAP,
+                     &launchVariant<FFT, REGCAP>});
     }
 }
 
@@ -170,6 +187,10 @@ template<unsigned E>
 static void addVariants(std::vector<FusedVariant>& v) {
     addVariant<E, 1>(v); addVariant<E, 2>(v); addVariant<E, 4>(v); addVariant<E, 8>(v);
     addVariant<E, 16>(v); addVariant<E, 32>(v);
+    // registers capped for 1024 and 1536 threads per SM (an A100 SM holds 2048 threads and 64K
+    // registers: 64 and 42 registers a thread), at the FFTs-per-block counts that do best here
+    addVariant<E, 1, 1024>(v); addVariant<E, 2, 1024>(v); addVariant<E, 4, 1024>(v);
+    addVariant<E, 1, 1536>(v); addVariant<E, 2, 1536>(v); addVariant<E, 4, 1536>(v);
 }
 
 static const int registered = [] {

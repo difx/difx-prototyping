@@ -18,8 +18,11 @@
 #                  FP64 phases; fixed-point with --wola, which gpudifx's decode cannot do); the
 #                  fused kernel does everything, with direct and with tiled decode; the 2-kernel
 #                  lines are decode + fringe into an FP16 or FP32 buffer, then the fused FFT
-# all FFTs-per-block and elements-per-thread variants of the fused kernel.  Logs go to
-# results-local/<host>-<stamp>/, with summary.txt the lines worth reading.
+#   *-chunk<W>     the packed-data pipelines one antenna and W windows at a time, the 2-kernel
+#                  buffer reused for every chunk so that it can stay in L2 (--chunk)
+# all FFTs-per-block and elements-per-thread variants of the fused kernel, and (wola-fp16,
+# packed-wola) the register caps (--regcap).  Logs go to results-local/<host>-<stamp>/, with
+# summary.txt the lines worth reading.  The channel-count sweep is run-nchan.sh.
 
 set -u
 cd "$(dirname "$0")"
@@ -40,7 +43,7 @@ run() {   # run <name> <fusebench options...>
     local rc=$?
     [ $rc = 0 ] || fail=1
     { echo "== $name (exit $rc): fusebench $* ${EXTRA[*]}"
-      grep -E "^FFT input|^Input|^check: (PASS|FAIL)$|FAIL|unfused total|^    |^  fused|^  2 kernels" "$OUT/$name.log"
+      grep -E "^FFT input|^Input|^check: (PASS|FAIL)$|FAIL|unfused total|^    |^  fused|^  2 kernels|^  end-to-end" "$OUT/$name.log"
     } | tee -a "$OUT/summary.txt"
 }
 
@@ -51,12 +54,15 @@ for shape in "c128:--nchan 128 --nwin 10000" "c1024:--nchan 1024 --nwin 1000"; d
     run "$tag-fp32"            "${opts[@]}" --fpb sweep --ept sweep
     run "$tag-fp16"            "${opts[@]}" --input fp16 --fpb sweep --ept sweep
     run "$tag-wola-fp32"       "${opts[@]}" --wola --fpb sweep --ept sweep
-    run "$tag-wola-fp16"       "${opts[@]}" --wola --input fp16 --fpb sweep --ept sweep
+    run "$tag-wola-fp16"       "${opts[@]}" --wola --input fp16 --fpb sweep --ept sweep --regcap sweep
     run "$tag-wola-fp16-hop75" "${opts[@]}" --wola --overlap 0.25 --input fp16 --ept sweep
     run "$tag-packed"          "${opts[@]}" --input packed --rotator double --fpb sweep --ept sweep
     run "$tag-packed-tiled"    "${opts[@]}" --input packed --decode tiled --fpb sweep --ept sweep
-    run "$tag-packed-wola"     "${opts[@]}" --input packed --wola --fpb sweep --ept sweep
+    run "$tag-packed-wola"     "${opts[@]}" --input packed --wola --fpb sweep --ept sweep --regcap sweep
     run "$tag-packed-wola-ept-half" "${opts[@]}" --input packed --wola --ept half
+    for w in 4096 2048 1024 512 256; do
+        run "$tag-packed-wola-chunk$w" "${opts[@]}" --input packed --wola --ept half --chunk $w --check 4
+    done
 done
 echo "Results in $OUT (summary.txt)"
 [ $fail = 0 ] || { echo "SOME RUNS FAILED: see the logs" >&2; exit 1; }
