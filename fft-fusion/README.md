@@ -127,16 +127,20 @@ all in the load, and the FFT itself is not the bottleneck. An FP16 FFT would com
 precision (unit roundoff 5e-4, with rounding error growing with the number of FFT stages) and
 return FP16, for no speed gain in a kernel that is memory-bound.
 
-## Results: RTX 2070 SUPER, 2026-11-16
+## Results, 2026-11-16
 
-CUDA 13.2, cuFFT 12.2, cuFFTDx 1.5.0. 10 antennas, 8 bands, real data, 64 MHz bands, no
-autocorrelations. Median of 20 subints, ms per subint for all 10 antennas. Fused times are for
-the best FFTs-per-block setting, with cuFFTDx's suggested setting in brackets where it differs.
-"vs mpifxcorr" is relative to the first row: FP32 input, cuFFT, then mpifxcorr's rotation
-kernel. WOLA is 12.5% tapers with hop 0.875 FFT lengths; "WOLA, hop 0.75" is the same window
-with consecutive windows sharing 25% (`--overlap 0.25`), for comparison. These were timed with
-Tukey tapers, `--wola`'s shape at the time. The taper shape does not change the cost (the window
-is a table of weights; Tukey, sine and Vorbis time the same).
+`run-bench.sh`: 10 antennas, 8 bands, real data, 64 MHz bands, no autocorrelations. Median of
+20 subints, ms per subint for all 10 antennas. Fused times are for the best FFTs-per-block
+setting, with cuFFTDx's suggested setting in brackets where it differs. "vs mpifxcorr" is
+relative to the first row: FP32 input, cuFFT, then mpifxcorr's rotation kernel. WOLA is 12.5%
+tapers with hop 0.875 FFT lengths; "WOLA, hop 0.75" is the same window with consecutive windows
+sharing 25% (`--overlap 0.25`), for comparison. The 2070 was timed with Tukey tapers, `--wola`'s
+shape at the time, and the A100 with Vorbis tapers. The taper shape does not change the cost
+(the window is a table of weights; Tukey, sine and Vorbis time the same).
+
+### RTX 2070 SUPER
+
+CUDA 13.2, cuFFT 12.2, cuFFTDx 1.5.0. 448 GB/s memory bandwidth, FP64 at 1/32 rate.
 
 **128 channels** (256-point FFT), 20 ms subint (10000 FFT lengths):
 
@@ -162,7 +166,7 @@ is a table of weights; Tukey, sine and Vorbis time the same).
 
 (The hop 0.75 rows were timed at the suggested setting only.)
 
-### What the numbers say
+#### What the numbers say
 
 1. **Fused with FP32 input is 2.7-2.8x faster than mpifxcorr's FFT + rotation today.** That
    splits into two parts. Replacing the per-element FP64 phases with fixed point is worth
@@ -183,6 +187,59 @@ is a table of weights; Tukey, sine and Vorbis time the same).
 4. **FFTs per block matter.** One per block is bad for small FFTs (256 points). Above 16 KB of
    shared memory per block, the larger settings lose. cuFFTDx's suggestion is within about 6% of
    the best everywhere here.
+
+### A100-SXM4-80GB (OzSTAR, gina7)
+
+`fusebench-ozstar.sbatch`, SLURM job 21008444. CUDA 12.8, cuFFTDx 1.5.0. 2039 GB/s memory
+bandwidth (4.6x the 2070), FP64 at 1/2 rate. Every check passed.
+
+**128 channels** (256-point FFT), 20 ms subint (10000 FFT lengths):
+
+| FFT input | windows | unfused: prep + cuFFT + rotation | unfused | fused | fused vs unfused | fused vs mpifxcorr |
+|---|---|---|---|---|---|---|
+| FP32, mpifxcorr's FP64 rotation | 10000 | 0 + 1.97 + 1.16 | 3.13 | 1.64 | 1.91 | **1.9** |
+| FP32 | 10000 | 0 + 1.96 + 1.13 | 3.09 | 1.64 | 1.89 | **1.9** |
+| FP16 | 10000 | 1.59 + 1.96 + 1.13 | 4.69 | 1.40 | 3.36 | **2.2** |
+| FP32, WOLA | 11428 | 2.27 + 2.23 + 1.28 | 5.77 | 2.23 | 2.59 | **1.4** |
+| FP16, WOLA | 11428 | 1.97 + 2.23 + 1.28 | 5.48 | 1.85 | 2.96 | **1.7** |
+| FP16, WOLA, hop 0.75 | 13333 | 2.24 + 2.58 + 1.49 | 6.31 | (2.08) | 3.03 | **1.5** |
+
+**1024 channels** (2048-point FFT), 16 ms subint (1000 FFT lengths):
+
+| FFT input | windows | unfused: prep + cuFFT + rotation | unfused | fused | fused vs unfused | fused vs mpifxcorr |
+|---|---|---|---|---|---|---|
+| FP32, mpifxcorr's FP64 rotation | 1000 | 0 + 1.62 + 1.06 | 2.68 | 1.35 | 1.98 | **2.0** |
+| FP32 | 1000 | 0 + 1.62 + 0.90 | 2.52 | 1.35 | 1.86 | **2.0** |
+| FP16 | 1000 | 1.28 + 1.62 + 0.90 | 3.80 | 1.26 | 3.03 | **2.1** |
+| FP32, WOLA | 1142 | 1.81 + 1.83 + 1.02 | 4.65 | 1.83 | 2.54 | **1.5** |
+| FP16, WOLA | 1142 | 1.56 + 1.83 + 1.02 | 4.40 | 1.55 | 2.84 | **1.7** |
+| FP16, WOLA, hop 0.75 | 1333 | 1.78 + 2.12 + 1.18 | 5.07 | (1.76) | 2.88 | **1.5** |
+
+#### What changes on the A100
+
+1. **Fused is 1.9-2.0x faster than mpifxcorr's FFT + rotation with FP32 input, 2.1-2.2x with
+   FP16** (2070: 2.7-2.8x and 3.8-4.0x). The A100 runs mpifxcorr's FFT + rotation 5.2-5.6x
+   faster than the 2070, but the fused kernel only 2.8-3.9x faster.
+2. **Fixed-point phases gain little here; the gain is fusion.** With FP64 at half rate,
+   mpifxcorr's rotation kernel takes about as long as the fixed-point one: 1.16 vs 1.13 ms at
+   128 channels (2%), 1.06 vs 0.90 ms at 1024 (17%). Fixed-point phases still matter on cards
+   with low-rate FP64, such as the 2070.
+3. **The fused kernel does not reach the memory-bandwidth limit, and is further from it on the
+   A100 than on the 2070.**
+   Counting the bytes it must move (input once, `nchan` FP32 complex outputs), it reaches
+   783-1002 GB/s, 38-49% of the A100's bandwidth; the fixed-point rotation kernel, a plain
+   streaming kernel, reaches 1450 GB/s (71%). On the 2070 the same figures are 57-62% and
+   84-86%. FP16 input moves 25% fewer bytes but saves only 7-15% of the time on the A100 (29-30%
+   on the 2070). Streaming like the rotation kernel, the fused kernel would be 1.5-1.9x faster
+   on the A100. Next: an Nsight Compute profile there (occupancy, registers, the
+   shared-memory exchange).
+4. **WOLA costs 23-36% over the fused kernel without it** (2070: 26-34%), and hop 0.75 another
+   13-14% (2070: 10-13%). Fused with FP16 input, WOLA is still 1.7x faster than mpifxcorr's
+   FFT + rotation without windowing; unfused it would cost 1.6-1.8x mpifxcorr's time.
+5. **cuFFTDx's suggested FFTs per block was the best setting in every case.**
+6. For this array (10 antennas, 8 x 64 MHz bands), the fused FP16 WOLA kernel runs at
+   10.3-10.8x real time, mpifxcorr's FFT + rotation at 6.0-6.4x. That is this stage alone,
+   without unpacking, fringe rotation, the cross-multiply or transfers.
 
 ### Window design
 
@@ -256,8 +313,7 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Not yet measured
 
-- **The A100** (`fusebench-ozstar.sbatch`). FP64 runs at half rate there and memory bandwidth
-  is 3.5x higher.
+- Why the fused kernel stays well below the memory bandwidth (Nsight Compute on the A100).
 - Complex data (`--complex`) and other channel counts.
 - Decode and fringe rotation inside the fused kernel (the next pre-FFT stage).
 - The effect inside mpifxcorr, where the FFT and rotation overlap with transfers and the XMAC.
