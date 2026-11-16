@@ -31,15 +31,24 @@ Directions this follows (gpudifx, 2026-11-16):
 
 ## Build and run
 
-cuFFTDx is part of NVIDIA's header-only MathDx package. It is not in the CUDA toolkit. Get it
-from https://developer.nvidia.com/cufftdx-downloads, or unpack the `nvidia-mathdx` wheel from
-PyPI (`pip download --no-deps nvidia-mathdx`, then unzip it). `MATHDX` is the directory that
-holds `include/cufftdx.hpp` and `external/cutlass` (in the wheel: `nvidia/mathdx`). Tested with
-MathDx 25.6.0 (cuFFTDx 1.5.0) and CUDA 13.2. MathDx is not redistributed here (NVIDIA licence).
+With a gpudifx `setup.bash` sourced, `make -j8` is all that is needed. The Makefile takes CUDA
+from `CUDAROOT` and the GPU architecture from the `-arch=sm_NN` in `NVCCFLAGS`. Without them it
+falls back to the `nvcc` on `PATH` and the GPU that `nvidia-smi` reports. It prints what it
+chose at the start of every build.
+
+cuFFTDx is part of NVIDIA's header-only MathDx package. It is not in the CUDA toolkit, and
+NVIDIA's licence does not let us commit it here. On the first build the Makefile downloads the
+`nvidia-mathdx` 25.6.0 wheel from PyPI, checks its sha256 and unpacks it into
+`mathdx-25.6.0/` (git-ignored). On a machine whose build nodes have no network access, run
+`make mathdx` first on one that does (an OzSTAR login node). To use a MathDx you already have,
+set `MATHDX` to the directory that holds `include/cufftdx.hpp` and `external/cutlass`. Tested
+with MathDx 25.6.0 (cuFFTDx 1.5.0) and CUDA 13.2.
 
 ```bash
-make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # RTX 2070 (sm_75)
-make -j8 MATHDX=<mathdx dir> SM=80                                   # A100
+source <gpudifx>/setup.bash
+make -j8                                                             # as setup.bash says
+make -j8 SM=80                                                       # A100, whatever setup.bash says
+make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everything given explicitly
 ./fusebench --help
 ./fusebench --nchan 128 --nwin 10000 --input fp16 --wola --fpb sweep  # one case
 ./run-bench.sh                                                       # the standard set below

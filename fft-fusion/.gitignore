@@ -4,3 +4,4 @@ fusebench
 results-local/
 build.log
 __pycache__/
+mathdx-*/
