@@ -23,10 +23,11 @@ Directions this follows (gpudifx, 2026-11-16):
   64-bit fixed point.
 - **FP16 out of decode and fringe rotation** (`--input fp16`). The FFT takes FP16 in and gives
   FP32 out (see "FP16 in, FP32 out" below).
-- **A windowed overlap-add front end** (`--wola`): Tukey window with 12.5% / 75% / 12.5%
+- **A windowed overlap-add front end** (`--wola`): a window with 12.5% / 75% / 12.5%
   taper / flat / taper, each window overlapping each neighbour over its taper (25% of each
   window is overlapped, 12.5% at each end; consecutive windows start 87.5% of an FFT length
-  apart). Sine and Vorbis tapers are options too. See "Window design" below.
+  apart), with Vorbis tapers, which lose no sensitivity. Tukey and sine tapers are options
+  too. See "Window design" below.
 
 ## Build and run
 
@@ -62,8 +63,8 @@ The main options:
   series per antenna and band, which overlapping windows need;
 - the window: `--taper F` (taper length at each end, as a fraction of the FFT length),
   `--overlap F` (the fraction of an FFT length consecutive windows share; the hop is 1 - F),
-  `--window tukey|sine|vorbis` (taper shape), or `--wola` (`--taper 0.125 --overlap 0.125`,
-  Tukey);
+  `--window tukey|sine|vorbis` (taper shape), or `--wola` (`--taper 0.125 --overlap 0.125
+  --window vorbis`; a `--window` given as well takes precedence);
 - `--rotator`, `--autocorr`, `--fpb N|sweep` (FFTs per block of the fused kernel, default
   cuFFTDx's suggestion), `--batched` (one launch for all antennas), `--invalid F` (flag a
   fraction of the windows).
@@ -121,8 +122,10 @@ CUDA 13.2, cuFFT 12.2, cuFFTDx 1.5.0. 10 antennas, 8 bands, real data, 64 MHz ba
 autocorrelations. Median of 20 subints, ms per subint for all 10 antennas. Fused times are for
 the best FFTs-per-block setting, with cuFFTDx's suggested setting in brackets where it differs.
 "vs mpifxcorr" is relative to the first row: FP32 input, cuFFT, then mpifxcorr's rotation
-kernel. WOLA is `--wola` (hop 0.875 FFT lengths); "WOLA, hop 0.75" is the same window with
-consecutive windows sharing 25% (`--wola --overlap 0.25`), for comparison.
+kernel. WOLA is 12.5% tapers with hop 0.875 FFT lengths; "WOLA, hop 0.75" is the same window
+with consecutive windows sharing 25% (`--overlap 0.25`), for comparison. These were timed with
+Tukey tapers, `--wola`'s shape at the time. The taper shape does not change the cost (the window
+is a table of weights; Tukey, sine and Vorbis time the same).
 
 **128 channels** (256-point FFT), 20 ms subint (10000 FFT lengths):
 
@@ -176,9 +179,10 @@ All the designs here overlap neighbouring windows over exactly their tapers (wit
 consecutive windows start 0.875 FFT lengths apart). Three taper shapes, with x running from 0
 to 1 across the taper:
 
-- **Tukey**, the raised cosine 0.5 (1 - cos πx). This is the `--wola` default.
+- **Tukey**, the raised cosine 0.5 (1 - cos πx).
 - **Sine**, sin(πx/2).
-- **Vorbis**, sin(π/2 · raised cosine). This is the taper of the window used in Ogg Vorbis.
+- **Vorbis**, sin(π/2 · raised cosine). This is the taper of the window used in Ogg Vorbis,
+  and the `--wola` default.
 
 ![Three taper shapes](plots/tapers.png)
 
@@ -219,9 +223,9 @@ depend on the FFT length.
 | design | FFTs | sensitivity, delay 0 / 4 / 16 samples | leakage beyond 5 / 20 channels |
 |---|---|---|---|
 | rectangular, no overlap (mpifxcorr now) | 1.000 | 1.000 / 0.984 / 0.938 | -16.9 / -23.0 dB |
-| Tukey 12.5% (`--wola`) | 1.143 | 0.994 / 0.991 / 0.955 | -25.0 / -60.4 dB |
+| Tukey 12.5% | 1.143 | 0.994 / 0.991 / 0.955 | -25.0 / -60.4 dB |
 | sine 12.5% | 1.143 | 1.000 / 0.997 / 0.965 | -26.6 / -47.2 dB |
-| Vorbis 12.5% | 1.143 | 1.000 / 0.997 / 0.957 | -23.4 / -59.2 dB |
+| Vorbis 12.5% (`--wola`) | 1.143 | 1.000 / 0.997 / 0.957 | -23.4 / -59.2 dB |
 | Tukey 25% | 1.333 | 0.986 / 0.984 / 0.960 | -44.2 / -71.2 dB |
 | sine 25% | 1.333 | 1.000 / 0.998 / 0.977 | -34.4 / -52.8 dB |
 | Vorbis 25% | 1.333 | 1.000 / 0.998 / 0.970 | -34.2 / -70.7 dB |
@@ -233,7 +237,7 @@ overlaps are counted twice (weights 1 to 2). It costs more and does worse on eve
 
 **Choosing.** For no loss of continuum sensitivity at any taper length, use the Vorbis taper.
 It keeps the Tukey taper's far-sidelobe suppression. At 12.5% it costs 1.143x the FFTs
-(`--wola --window vorbis`). Going to 25% improves the near leakage by about 11 dB and the far
+(`--wola`). Going to 25% improves the near leakage by about 11 dB and the far
 leakage by about 11 dB, for 17% more windows: 10-13% more fused-kernel time on the 2070 (the
 "hop 0.75" rows in the results above have the same window count). The window is a table of
 weights, so the shape costs nothing; only the taper length (the number of windows) does.

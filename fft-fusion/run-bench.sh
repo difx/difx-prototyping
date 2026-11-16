@@ -10,7 +10,7 @@
 # No autocorrelations (they are to move to the XMAC). For each shape:
 #   mpifxcorr      FP32 input, mpifxcorr's FP64-phase rotation kernel in the unfused pipeline
 #   fp32, fp16     FFT input precision, fixed-point phases in both pipelines
-#   wola-*         --wola: Tukey window 12.5% / 75% / 12.5%, each window overlapping each
+#   wola-*         --wola: Vorbis-taper window 12.5% / 75% / 12.5%, each window overlapping each
 #                  neighbour over its taper (hop 0.875 FFT lengths), FP32 and FP16 input; and,
 #                  for comparison, the same window with hop 0.75 (consecutive windows share 25%)
 # all FFTs-per-block variants of the fused kernel.  Logs go to results-local/<host>-<stamp>/,

@@ -217,8 +217,9 @@ static void usage() {
 "  --overlap F     consecutive windows share F of the FFT length (the hop is 1 - F FFT lengths),\n"
 "                  default 0; needs --layout series. With F equal to the taper, the tapers of\n"
 "                  neighbouring windows lie on top of each other\n"
-"  --wola          short for --layout series --taper 0.125 --overlap 0.125: Tukey window\n"
-"                  12.5%% / 75%% / 12.5%%, each window overlapping each neighbour over its taper\n"
+"  --wola          short for --layout series --taper 0.125 --overlap 0.125 --window vorbis:\n"
+"                  12.5%% / 75%% / 12.5%% taper / flat / taper, each window overlapping each\n"
+"                  neighbour over its taper (a --window given as well takes precedence)\n"
 "Rotation and autocorrelations:\n"
 "  --rotator R     unfused pipeline: fixed (default, as the fused kernel) | double (mpifxcorr's\n"
 "                  kernel verbatim, FP64 per element)\n"
@@ -242,6 +243,7 @@ int main(int argc, char** argv) {
     bool complexData = false, batched = false, singlePol = false, sweep = false, crossPolPass = false;
     bool half = false, series = false;
     Taper shape = Taper::TUKEY;
+    bool wola = false, shapeGiven = false;
     double bw = 64.0, invalidFrac = 0.0, taper = 0.0, overlap = 0.0;
     AutoMode amode = AutoMode::NONE;
     Rotator rotator = Rotator::FIXED;
@@ -269,9 +271,9 @@ int main(int argc, char** argv) {
         else if (a == "--input") half = choose({"fp32", "fp16"}) == 1;
         else if (a == "--layout") series = choose({"window", "series"}) == 1;
         else if (a == "--taper") taper = std::stod(next());
-        else if (a == "--window") shape = (Taper)choose({"tukey", "sine", "vorbis"});
+        else if (a == "--window") { shape = (Taper)choose({"tukey", "sine", "vorbis"}); shapeGiven = true; }
         else if (a == "--overlap") overlap = std::stod(next());
-        else if (a == "--wola") { series = true; taper = 0.125; overlap = 0.125; }
+        else if (a == "--wola") { series = true; taper = 0.125; overlap = 0.125; wola = true; }
         else if (a == "--rotator") rotator = choose({"double", "fixed"}) == 0 ? Rotator::DOUBLE : Rotator::FIXED;
         else if (a == "--autocorr") amode = (AutoMode)choose({"none", "band", "full"});
         else if (a == "--singlepol") singlePol = true;
@@ -286,6 +288,8 @@ int main(int argc, char** argv) {
         else if (a == "--device") device = std::stoi(next());
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }
+    if (wola && !shapeGiven)
+        shape = Taper::VORBIS;
     g.fftchannels = complexData ? g.nchan : 2 * g.nchan;
     if (g.nant < 1 || g.nband < 1 || g.nwin < 1 || g.nchan < 1 || reps < 1 || taper < 0 || taper > 0.5 ||
         overlap < 0 || overlap >= 1) { usage(); return 2; }
