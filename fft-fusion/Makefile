@@ -82,13 +82,13 @@ endif
 fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(FUSED_OBJ)
 	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
 
-$(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh | $(BUILD) $(MATHDX_DEP)
+$(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD) $(MATHDX_DEP)
 	$(NVCC) $(FLAGS) -I$(MATHDX)/include -c $< -o $@
 
-$(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh | $(BUILD)
+$(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
-$(BUILD)/fused_%.o: fused_inst.cu pipelines.cuh stages.cuh common.cuh | $(BUILD) $(MATHDX_DEP)
+$(BUILD)/fused_%.o: fused_inst.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD) $(MATHDX_DEP)
 	$(NVCC) $(FLAGS) $(DXFLAGS) -DFUSE_N=$* -c $< -o $@
 
 $(BUILD):

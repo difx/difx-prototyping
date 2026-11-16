@@ -19,15 +19,20 @@ using namespace cufftdx;
 
 using FFTBase = decltype(Size<FUSE_N>() + Precision<float>() + Type<fft_type::c2c>() +
                          Direction<fft_direction::forward>() + SM<FUSE_SM>() + Block());
-template<unsigned FPB>
-using FFTn = decltype(FFTBase() + ElementsPerThread<FFTBase::elements_per_thread>() + FFTsPerBlock<FPB>());
+// E elements per thread (cuFFTDx's suggestion E0, or E0 / 2: measured faster for these kernels,
+// see README.md) and FPB FFTs per block
+constexpr unsigned E0 = FFTBase::elements_per_thread;
+template<unsigned E, unsigned FPB>
+using FFTn = decltype(FFTBase() + ElementsPerThread<E>() + FFTsPerBlock<FPB>());
 
 // One block does FFT::ffts_per_block spectra; spectrum f of the launch is (ant0 + f / (nwin *
 // nband), window, band) with band fastest, so a block's spectra are contiguous in memory.
 // Thread (x, y) holds elements x, x + stride, x + 2 stride, ... of spectrum y, before and after
 // the FFT (natural order), which keeps the global loads and stores coalesced.
-// Pre is the pre-FFT stage (PreLoad: FP32 or FP16 storage, optional window and overlap), converted
-// to FP32 on load; the FFT is FP32.  Post is the post-FFT stage (FracRotateFixed, stages.cuh).
+// Pre is the pre-FFT stage (PreLoad: FP32 or FP16 storage, optional window and overlap, converted
+// to FP32 on load; PreDecode: from the packed data, decode.cuh); the FFT is FP32.  A staged Pre
+// (tiled PreDecode) first fills shared memory with the whole block, before the FFT uses it.  Post
+// is the post-FFT stage (FracRotateFixed, stages.cuh).
 //
 // With CROSSPOL the cross-pol autocorrelations are formed here too: bands 2f and 2f+1 of a window
 // are spectra y and y+1 of the same block (band fastest, even nband, even FFTs per block), and
@@ -50,15 +55,22 @@ __global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* o
         ant = ant0 + (int)(t / g.nwin);
     }
 
+    float* tile = reinterpret_cast<float*>(smem);
+    if constexpr (Pre::staged) {
+        pre.stage(g, ant0, (unsigned long long)blockIdx.x * FFT::ffts_per_block, nfft, N, FFT::ffts_per_block, tile);
+        __syncthreads();
+    }
     complex_type td[FFT::storage_size];
 #pragma unroll
     for (unsigned i = 0; i < FFT::input_ept; i++) {
         const unsigned s = threadIdx.x + i * FFT::stride;
         if (active && s < N) {
-            const cuFloatComplex v = pre(g, ant, win, band, s);
+            const cuFloatComplex v = pre.load(g, ant, win, band, s, threadIdx.y, N, FFT::ffts_per_block, tile);
             td[i] = complex_type{v.x, v.y};
         }
     }
+    if constexpr (Pre::staged)
+        __syncthreads();                    // the FFT reuses the tile's shared memory
 
     FFT().execute(td, smem);
 
@@ -99,7 +111,9 @@ static void launchKernel(const Geometry& g, const Pre& pre, const FracParams& p,
                          int ant0, int nant, cudaStream_t st) {
     auto kernel = fused_fft_frac<FFT, Pre, Post, CROSSPOL>;
     constexpr unsigned xsBytes = CROSSPOL ? FFT::max_threads_per_block * sizeof(cuFloatComplex) : 0;
-    constexpr unsigned smemBytes = FFT::shared_memory_size > xsBytes ? FFT::shared_memory_size : xsBytes;
+    constexpr unsigned tileBytes = Pre::tileBytes(size_of<FFT>::value, FFT::ffts_per_block);
+    constexpr unsigned smem0 = FFT::shared_memory_size > xsBytes ? FFT::shared_memory_size : xsBytes;
+    constexpr unsigned smemBytes = smem0 > tileBytes ? smem0 : tileBytes;
     static bool attributeSet = false;
     if (!attributeSet) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
@@ -139,23 +153,32 @@ static bool launchVariant(const Geometry& g, const PreVariant& pre, const FracPa
     return crossDone;
 }
 
-template<unsigned FPB>
+template<unsigned E, unsigned FPB>
 static void addVariant(std::vector<FusedVariant>& v) {
     // only FFTs-per-block counts that fit in a block of 1024 threads
-    if constexpr (FFTn<1>::block_dim.x * FPB <= 1024) {
-        using FFT = FFTn<FPB>;
+    if constexpr (FFTn<E, 1>::block_dim.x * FPB <= 1024) {
+        using FFT = FFTn<E, FPB>;
         static_assert(!FFT::requires_workspace, "FFT size needs a workspace; only powers of two are supported");
         for (const auto& e : v)
-            if (e.fpb == FPB) return;
-        v.push_back({FPB, FFT::elements_per_thread, FFT::max_threads_per_block, FFT::shared_memory_size,
-                     FPB == FFTBase::suggested_ffts_per_block, &launchVariant<FFT>});
+            if (e.fpb == FPB && e.ept == E) return;
+        v.push_back({FPB, E, FFT::max_threads_per_block, FFT::shared_memory_size,
+                     E == E0 && FPB == FFTBase::suggested_ffts_per_block, &launchVariant<FFT>});
     }
+}
+
+template<unsigned E>
+static void addVariants(std::vector<FusedVariant>& v) {
+    addVariant<E, 1>(v); addVariant<E, 2>(v); addVariant<E, 4>(v); addVariant<E, 8>(v);
+    addVariant<E, 16>(v); addVariant<E, 32>(v);
 }
 
 static const int registered = [] {
     auto& v = fusedRegistry()[FUSE_N];
-    addVariant<FFTBase::suggested_ffts_per_block>(v);
-    addVariant<1>(v); addVariant<2>(v); addVariant<4>(v); addVariant<8>(v);
-    addVariant<16>(v); addVariant<32>(v);
+    addVariant<E0, FFTBase::suggested_ffts_per_block>(v);
+    addVariants<E0>(v);
+    using Half = decltype(Size<FUSE_N>() + Precision<float>() + Type<fft_type::c2c>() +
+                          Direction<fft_direction::forward>() + Block() + ElementsPerThread<(E0 / 2 >= 2 ? E0 / 2 : 2)>());
+    if constexpr (E0 / 2 >= 2 && is_supported_v<Half, FUSE_SM>)
+        addVariants<E0 / 2>(v);
     return 0;
 }();

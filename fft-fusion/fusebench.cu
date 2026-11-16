@@ -1,8 +1,11 @@
 // fusebench.cu - is fusing the FFT and the fractional-sample correction with cuFFTDx worth it?
 //
-// Times, on synthetic data in GPU memory (no decode, no host transfers), one subint's
+// Times, on synthetic data in GPU memory (no host transfers), one subint's
 //   unfused:  [pre-FFT stage kernel] + cuFFT + rotation kernel, per antenna (mpifxcorr's shape)
 //   fused:    one cuFFTDx kernel per antenna doing the same
+// where the input is either the FFT input as mpifxcorr's decode + fringe-rotation kernel leaves it
+// (FP32 or FP16), or the packed data itself (--input packed: the pre-FFT stage is the decode and
+// fringe rotation, gpudifx's kernel in the unfused pipeline, inside the fused kernel otherwise)
 // and checks that both give the same spectra (and autocorrelations, if asked for), and match a
 // double-precision DFT of the exact, unrounded input on a sample of spectra. See README.md.
 #include <algorithm>
@@ -66,6 +69,32 @@ __global__ void fill_noise(T* x, size_t n, unsigned long long seed) {
         store(x, i, noise(seed, i));
 }
 
+// The first kernel of the two-kernel pipeline (--input packed): decode + fringe rotation of all
+// antennas into a buffer per FFT window, [ant][win][band][fftchannels], in FP32 or FP16.  A block
+// per (antenna, window); its nband * fftchannels samples e are spread over the threads U at a
+// time (e = e0 + tx + k * blockDim, k < U, unrolled, so that what depends only on the window is
+// computed once per thread, as in the fused kernel), samples on consecutive lanes (coalesced
+// stores).  fftchannels is a power of two.  The window weights are left to the FFT kernel, which
+// applies them as it loads.
+template<int U, class Pre, class T>
+__global__ void decode_to(Geometry g, Pre pre, T* out) {
+    const unsigned aw = blockIdx.x;                      // ant * nwin + win
+    const int ant = aw / g.nwin, win = aw % g.nwin;
+    const int shift = __ffs(g.fftchannels) - 1;
+    const int total = g.nband * g.fftchannels;
+    T* o = out + (size_t)aw * total;
+    for (int e0 = 0; e0 < total; e0 += U * blockDim.x) {
+#pragma unroll
+        for (int k = 0; k < U; k++) {
+            const int e = e0 + threadIdx.x + k * blockDim.x;
+            if (e < total) {
+                const int band = e >> shift;
+                store(o, e, pre(g, ant, win, band, e - (band << shift)));
+            }
+        }
+    }
+}
+
 // The exact FFT input of a few chosen spectra (the noise before rounding to the storage
 // precision, times the window), for the double-precision reference.
 template<class Pre>
@@ -117,15 +146,39 @@ static std::vector<float> taperedWindow(int n, double taper, Taper shape) {
     return w;
 }
 
+// ---- packed data -----------------------------------------------------------------------------
+// Multi-channel VDIF: 32-byte headers, 8000-byte payloads, nband interleaved nbit-bit samples per
+// sample time, little-endian bit order, offset-binary levels as mark5access decodes them.
+static const int VDIF_HEADER = 32, VDIF_PAYLOAD = 8000;
+
+// The host's own decode of one sample (written from mark5access's level tables, independently of
+// the GPU code), for the reference.
+static double hostDecode(const unsigned char* payload, int nbit, int nband, int sampleInFrame, int band) {
+    const long bit = ((long)sampleInFrame * nband + band) * nbit;
+    if (nbit <= 2) {
+        const int v = (payload[bit / 8] >> (bit % 8)) & ((1 << nbit) - 1);
+        static const double two[4] = {-OPTIMAL_2BIT_HIGH, -1.0, 1.0, OPTIMAL_2BIT_HIGH};
+        return nbit == 1 ? (v ? 1.0 : -1.0) : two[v];
+    }
+    unsigned int w;
+    memcpy(&w, payload + bit / 32 * 4, 4);
+    const int v = (w >> (bit % 32)) & ((1u << nbit) - 1);
+    return nbit == 4 ? (v - 7.5) / 2.95 : (v - 128.0) / 3.3;
+}
+
 // ---- comparison ------------------------------------------------------------------------------
-// over the nchan used channels of every spectrum: max |a - b|, sum |a - b|^2, sum |b|^2
-__global__ void compare_kernel(Geometry g, const cuFloatComplex* a, const cuFloatComplex* b, double* sums,
-                               unsigned int* maxbits) {
+// over the nchan used channels of every spectrum of a valid window ([ant][win]; the pipelines need
+// not agree on the others): max |a - b|, sum |a - b|^2, sum |b|^2, count
+__global__ void compare_kernel(Geometry g, const cuFloatComplex* a, const cuFloatComplex* b, const bool* valid,
+                               double* sums, unsigned int* maxbits) {
     const size_t n = g.spectra() * g.nchan;
-    double d2 = 0, r2 = 0;
+    double d2 = 0, r2 = 0, cnt = 0;
     float dmax = 0;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        const size_t idx = (i / g.nchan) * g.fftchannels + i % g.nchan;
+        const size_t spec = i / g.nchan;
+        if (!valid[spec / g.nband]) continue;              // spectra are [ant][win][band]
+        cnt += 1;
+        const size_t idx = spec * g.fftchannels + i % g.nchan;
         const float dx = a[idx].x - b[idx].x, dy = a[idx].y - b[idx].y;
         const float d = dx * dx + dy * dy;
         d2 += d;
@@ -134,18 +187,19 @@ __global__ void compare_kernel(Geometry g, const cuFloatComplex* a, const cuFloa
     }
     atomicAdd(&sums[0], d2);
     atomicAdd(&sums[1], r2);
+    atomicAdd(&sums[2], cnt);
     atomicMax(maxbits, __float_as_uint(sqrtf(dmax)));   // non-negative floats order as their bits
 }
 
 struct Diff { double rms, max; };   // relative to the rms of the reference
 
-static Diff compareDevice(const Geometry& g, const cuFloatComplex* a, const cuFloatComplex* ref) {
-    double* sums = devAlloc<double>(2);
+static Diff compareDevice(const Geometry& g, const cuFloatComplex* a, const cuFloatComplex* ref, const bool* valid) {
+    double* sums = devAlloc<double>(3);
     unsigned int* mx = devAlloc<unsigned int>(1);
-    CHECK_CUDA(cudaMemset(sums, 0, 2 * sizeof(double)));
+    CHECK_CUDA(cudaMemset(sums, 0, 3 * sizeof(double)));
     CHECK_CUDA(cudaMemset(mx, 0, sizeof(unsigned int)));
-    compare_kernel<<<1024, 256>>>(g, a, ref, sums, mx);
-    double h[2];
+    compare_kernel<<<1024, 256>>>(g, a, ref, valid, sums, mx);
+    double h[3];
     unsigned int m;
     CHECK_CUDA(cudaMemcpy(h, sums, sizeof h, cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&m, mx, sizeof m, cudaMemcpyDeviceToHost));
@@ -153,8 +207,8 @@ static Diff compareDevice(const Geometry& g, const cuFloatComplex* a, const cuFl
     cudaFree(mx);
     float fm;
     memcpy(&fm, &m, sizeof fm);
-    const double rref = sqrt(h[1] / (g.spectra() * g.nchan));
-    return {sqrt(h[0] / (g.spectra() * g.nchan)) / rref, fm / rref};
+    const double rref = sqrt(h[1] / h[2]);
+    return {sqrt(h[0] / h[2]) / rref, fm / rref};
 }
 
 static Diff compareHost(const std::vector<std::complex<double>>& a, const std::vector<std::complex<double>>& ref) {
@@ -205,8 +259,15 @@ static void usage() {
 "                  antenna without overlap (numBufferedFFTs); with --overlap there are more\n"
 "  --complex       complex-sampled data: FFT length = nchan (default real: FFT length = 2 nchan)\n"
 "  --bw MHz        bandwidth per band, sets the sample time and the real-time figure, default 64\n"
-"FFT input (the output of decode + fringe rotation):\n"
-"  --input P       fp32 (default) | fp16 storage; the FFT itself is FP32 either way\n"
+"FFT input (the output of decode + fringe rotation, or the packed data):\n"
+"  --input P       fp32 (default) | fp16: the FFT input, stored by an earlier stage; the FFT itself\n"
+"                  is FP32 either way | packed: start from the packed data (multi-channel VDIF),\n"
+"                  so that the pre-FFT stage is the decode, sideband handling (odd bands are lower\n"
+"                  sideband) and fringe rotation; with --rotator double the unfused pipeline runs\n"
+"                  gpudifx's decode + fringe kernel (FP64 phases), else fixed-point phases\n"
+"  --nbit N        packed: bits per sample, 1, 2 (default), 4 or 8\n"
+"  --decode D      packed, fused kernel: direct (default; each FFT thread decodes its own\n"
+"                  samples) | tiled (the block decodes into shared memory with band on the lane)\n"
 "  --layout L      window (default: one buffer per FFT window, mpifxcorr's layout) | series\n"
 "                  (one continuous series per antenna and band)\n"
 "  --taper F       window on the FFT input with tapers of F of the FFT length at each end,\n"
@@ -215,20 +276,23 @@ static void usage() {
 "                  raised cosine): with --overlap equal to --taper, sine and vorbis tapers lose\n"
 "                  no sensitivity\n"
 "  --overlap F     consecutive windows share F of the FFT length (the hop is 1 - F FFT lengths),\n"
-"                  default 0; needs --layout series. With F equal to the taper, the tapers of\n"
-"                  neighbouring windows lie on top of each other\n"
+"                  default 0; needs --layout series or packed input. With F equal to the\n"
+"                  taper, the tapers of neighbouring windows lie on top of each other\n"
 "  --wola          short for --layout series --taper 0.125 --overlap 0.125 --window vorbis:\n"
 "                  12.5%% / 75%% / 12.5%% taper / flat / taper, each window overlapping each\n"
 "                  neighbour over its taper (a --window given as well takes precedence)\n"
 "Rotation and autocorrelations:\n"
 "  --rotator R     unfused pipeline: fixed (default, as the fused kernel) | double (mpifxcorr's\n"
-"                  kernel verbatim, FP64 per element)\n"
+"                  kernels verbatim, FP64 per element: the fractional-sample rotation and, with\n"
+"                  packed input, the decode + fringe rotation)\n"
 "  --autocorr M    none (default; autocorrelations in the XMAC) | band (per-band, atomics in the\n"
 "                  rotation, as mpifxcorr with DIFX_GPU_XMAC_AUTOCORR unset) | full (plus cross-pol)\n"
 "  --singlepol     no band pairs (no cross-pol products)\n"
 "  --crosspol-pass fused: form the cross-pol products in a separate pass, not in the kernel\n"
 "Fused kernel and run:\n"
 "  --fpb N|sweep   FFTs per block: cuFFTDx's suggestion (default), N, or time all\n"
+"  --ept E         FFT elements per thread: cuFFTDx's suggestion (default) | half (of it, where\n"
+"                  supported) | N | sweep (both)\n"
 "  --batched       one launch for all antennas (one cuFFT plan; one fused kernel)\n"
 "  --invalid F     fraction of windows flagged invalid, default 0\n"
 "  --reps N        timed repetitions, default 20 (median and minimum reported)\n"
@@ -241,13 +305,15 @@ static void usage() {
 int main(int argc, char** argv) {
     Geometry g{10, 8, 10000, 0, 128};
     bool complexData = false, batched = false, singlePol = false, sweep = false, crossPolPass = false;
-    bool half = false, series = false;
+    bool half = false, series = false, packed = false, tiled = false;
+    int nbit = 2;
     Taper shape = Taper::TUKEY;
     bool wola = false, shapeGiven = false;
     double bw = 64.0, invalidFrac = 0.0, taper = 0.0, overlap = 0.0;
     AutoMode amode = AutoMode::NONE;
     Rotator rotator = Rotator::FIXED;
-    int fpb = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
+    int fpb = 0, ept = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
+    bool sweepEpt = false;
     unsigned long long seed = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -268,7 +334,9 @@ int main(int argc, char** argv) {
         else if (a == "--nwin") g.nwin = std::stoi(next());
         else if (a == "--complex") complexData = true;
         else if (a == "--bw") bw = std::stod(next());
-        else if (a == "--input") half = choose({"fp32", "fp16"}) == 1;
+        else if (a == "--input") { const int k = choose({"fp32", "fp16", "packed"}); half = k == 1; packed = k == 2; }
+        else if (a == "--nbit") nbit = std::stoi(next());
+        else if (a == "--decode") tiled = choose({"direct", "tiled"}) == 1;
         else if (a == "--layout") series = choose({"window", "series"}) == 1;
         else if (a == "--taper") taper = std::stod(next());
         else if (a == "--window") { shape = (Taper)choose({"tukey", "sine", "vorbis"}); shapeGiven = true; }
@@ -279,6 +347,10 @@ int main(int argc, char** argv) {
         else if (a == "--singlepol") singlePol = true;
         else if (a == "--crosspol-pass") crossPolPass = true;
         else if (a == "--fpb") { std::string m = next(); if (m == "sweep") sweep = true; else fpb = std::stoi(m); }
+        else if (a == "--ept") {
+            std::string m = next();
+            if (m == "sweep") sweepEpt = true; else if (m == "half") ept = -1; else ept = std::stoi(m);
+        }
         else if (a == "--batched") batched = true;
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--reps") reps = std::stoi(next());
@@ -293,7 +365,17 @@ int main(int argc, char** argv) {
     g.fftchannels = complexData ? g.nchan : 2 * g.nchan;
     if (g.nant < 1 || g.nband < 1 || g.nwin < 1 || g.nchan < 1 || reps < 1 || taper < 0 || taper > 0.5 ||
         overlap < 0 || overlap >= 1) { usage(); return 2; }
-    if (overlap > 0 && !series) { fprintf(stderr, "--overlap needs --layout series\n"); return 2; }
+    if (overlap > 0 && !series && !packed) { fprintf(stderr, "--overlap needs --layout series\n"); return 2; }
+    if (packed && complexData) { fprintf(stderr, "--input packed: real data only so far\n"); return 2; }
+    if (packed && nbit != 1 && nbit != 2 && nbit != 4 && nbit != 8) { fprintf(stderr, "--nbit: 1, 2, 4 or 8\n"); return 2; }
+    if (packed && (VDIF_PAYLOAD * 8) % (g.nband * nbit) != 0) {
+        fprintf(stderr, "--input packed: %d bands of %d bits do not divide a %d-byte payload\n", g.nband, nbit, VDIF_PAYLOAD);
+        return 2;
+    }
+    if (packed && rotator == Rotator::DOUBLE && taper > 0) {
+        fprintf(stderr, "--rotator double with packed input runs gpudifx's decode, which has no window\n");
+        return 2;
+    }
     // the subint is nwin FFT lengths of data; overlapping windows step by hop samples through it
     const int nwinNoOverlap = g.nwin;
     const int hop = g.fftchannels - (int)std::lround(overlap * g.fftchannels);
@@ -315,18 +397,28 @@ int main(int argc, char** argv) {
         fprintf(stderr, "); add it to SIZES in the Makefile\n");
         return 2;
     }
+    // shared memory: the FFT's, or the tiled decode's tile if that is larger
+    auto tileBytes = [&](unsigned f) { return packed && tiled ? PreDecode<true>::tileBytes(g.fftchannels, f) : 0u; };
     std::vector<FusedVariant> variants;
     for (const auto& v : reg->second)
-        if (v.smem <= prop.sharedMemPerBlockOptin && v.threads <= (unsigned)prop.maxThreadsPerBlock)
+        if (std::max(v.smem, tileBytes(v.fpb)) <= prop.sharedMemPerBlockOptin && v.threads <= (unsigned)prop.maxThreadsPerBlock)
             variants.push_back(v);
-    std::sort(variants.begin(), variants.end(), [](const FusedVariant& a, const FusedVariant& b) { return a.fpb < b.fpb; });
+    std::sort(variants.begin(), variants.end(), [](const FusedVariant& a, const FusedVariant& b) {
+        return a.ept != b.ept ? a.ept > b.ept : a.fpb < b.fpb; });
+    // default: cuFFTDx's suggestion; with --ept alone, its suggested FFTs per block at that EPT
+    unsigned eptDefault = 0, fpbDefault = 0;
+    for (const auto& v : variants)
+        if (v.suggested) { eptDefault = v.ept; fpbDefault = v.fpb; }
+    const unsigned eptWanted = ept > 0 ? (unsigned)ept : ept < 0 ? eptDefault / 2 : eptDefault;
+    const unsigned fpbWanted = fpb > 0 ? (unsigned)fpb : fpbDefault;
     const FusedVariant* chosen = nullptr;
     for (const auto& v : variants)
-        if ((fpb == 0 && v.suggested) || (fpb != 0 && (int)v.fpb == fpb)) chosen = &v;
+        if (v.ept == eptWanted && v.fpb == fpbWanted)
+            chosen = &v;
     if (!chosen) {
-        fprintf(stderr, "no fused variant with %d FFTs per block fits this GPU for FFT length %d (available:",
-                fpb, g.fftchannels);
-        for (const auto& v : variants) fprintf(stderr, " %u", v.fpb);
+        fprintf(stderr, "no fused variant with %u FFTs per block and %u elements per thread fits this GPU for FFT "
+                "length %d (available, FFTs per block x elements per thread:", fpbWanted, eptWanted, g.fftchannels);
+        for (const auto& v : variants) fprintf(stderr, " %ux%u", v.fpb, v.ept);
         fprintf(stderr, ")\n");
         return 2;
     }
@@ -336,13 +428,23 @@ int main(int argc, char** argv) {
     const size_t nelem = g.perAnt() * g.nant;                      // FFT input/output, per window
     const size_t seriesLen = (size_t)(g.nwin - 1) * hop + g.fftchannels;
     const size_t ninput = series ? (size_t)g.nant * g.nband * seriesLen : nelem;
+    // packed: each antenna's data starts a few samples early (an integer delay), then windows of
+    // fftchannels samples every hop samples
+    const int framesamples = VDIF_PAYLOAD * 8 / (g.nband * nbit);
+    const int maxDelay = 64;
+    const int nframes = (int)(((size_t)(g.nwin - 1) * hop + g.fftchannels + maxDelay + framesamples - 1) / framesamples);
+    const size_t bytesPerAnt = (size_t)nframes * (VDIF_HEADER + VDIF_PAYLOAD);
     const double gib = 1.0 / 1073741824.0;
     const char* amodeName[] = {"none", "band", "full"};
     printf("GPU %s (sm_%d%d, %d SMs), CUDA runtime %d, cuFFT %d, cuFFTDx %d\n", prop.name, prop.major, prop.minor,
            prop.multiProcessorCount, rtVersion, cufftVersion, CUFFTDX_VERSION);
     printf("%d antennas x %d bands, %s data, FFT length %d, %d channels kept; %.0f MHz bands -> subint %.3f ms\n",
            g.nant, g.nband, complexData ? "complex" : "real", g.fftchannels, g.nchan, bw, subintMs);
-    printf("FFT input: %s, %s layout, ", half ? "FP16" : "FP32", series ? "series" : "per-window");
+    if (packed)
+        printf("Input: packed VDIF, %d-bit, %d frames of %d samples per antenna, decode %s (fused); FFT input: ",
+               nbit, nframes, framesamples, tiled ? "tiled" : "direct");
+    else
+        printf("FFT input: %s, %s layout, ", half ? "FP16" : "FP32", series ? "series" : "per-window");
     const char* shapeName[] = {"Tukey", "sine-taper", "Vorbis-taper"};
     if (taper > 0) printf("%s window (%.1f%% tapers), ", shapeName[(int)shape], 100 * taper);
     else printf("no window, ");
@@ -381,7 +483,47 @@ int main(int argc, char** argv) {
     pre.hop = hop;
     pre.seriesLen = seriesLen;
     pre.window = taper > 0 ? devCopy(taperedWindow(g.fftchannels, taper, shape)) : nullptr;
-    if (half) {
+    pre.packed = packed;
+    pre.tiled = tiled;
+    std::vector<unsigned char> hPacked;
+    std::vector<int> sampleIndex;
+    std::vector<double> bigA, bigB;
+    std::vector<unsigned char> decodeFlags;
+    const long datasamples = 1000001;          // odd: the ALTSIGN sign starts at -1
+    if (packed) {
+        hPacked.resize(g.nant * bytesPerAnt);
+        for (size_t i = 0; i < hPacked.size(); i += 8) {
+            const unsigned long long r = splitmix(seed * 0x1000003 + i);
+            memcpy(&hPacked[i], &r, std::min<size_t>(8, hPacked.size() - i));
+        }
+        sampleIndex.resize((size_t)g.nant * g.nwin);
+        for (int a = 0; a < g.nant; a++) {
+            const int delay = (int)(rng.uniform() * maxDelay);
+            for (int w = 0; w < g.nwin; w++) sampleIndex[(size_t)a * g.nwin + w] = w * hop + delay;
+        }
+        // fringe phase slope (turns per sample; |A| <= 3e-4 is e.g. 3 us/s of delay rate at 10 GHz
+        // and 64 MHz) and offset, per window and band, as gpu_precompute_fringe_rotator makes them
+        bigA.resize(g.spectra());
+        bigB.resize(g.spectra());
+        for (size_t i = 0; i < bigA.size(); i++) {
+            bigA[i] = rng.range(-3e-4, 3e-4);
+            bigB[i] = rng.range(-1.0, 1.0);
+        }
+        decodeFlags.resize((size_t)g.nant * g.nband);
+        for (size_t i = 0; i < decodeFlags.size(); i++) decodeFlags[i] = (i % g.nband) % 2 ? GPUDECODE_BAND_ALTSIGN : 0;
+        PackedInput& d = pre.pk;
+        d.packed = devCopy(hPacked);
+        d.bytesPerAnt = bytesPerAnt;
+        d.ms = mark5_stream{framesamples, VDIF_HEADER + VDIF_PAYLOAD, VDIF_HEADER, nbit, g.nband, 1};
+        d.nframes = nframes;
+        d.validFrames = devCopyBool(std::vector<char>((size_t)g.nant * nframes, 1));
+        d.sampleIndex = devCopy(sampleIndex);
+        d.decodeFlags = devCopy(decodeFlags);
+        d.datasamples = datasamples;
+        d.bigA = devCopy(bigA);
+        d.bigBred = devCopy(bigB);
+        d.fringePhase = devAlloc<ulonglong2>(g.spectra());
+    } else if (half) {
         __half2* in = devAlloc<__half2>(ninput);
         fill_noise<<<4096, 256>>>(in, ninput, seed);
         pre.in = in;
@@ -403,7 +545,7 @@ int main(int argc, char** argv) {
     unf.init(g, batched, !direct);
     cuFloatComplex* outUnfused = devAlloc<cuFloatComplex>(nelem);
     cuFloatComplex* outFused = direct ? devAlloc<cuFloatComplex>(nelem) : unf.staging;
-    const size_t inputBytes = ninput * (half ? sizeof(__half2) : sizeof(float2));
+    const size_t inputBytes = packed ? hPacked.size() : ninput * (half ? sizeof(__half2) : sizeof(float2));
     printf("GPU memory: input %.2f GiB, outputs %.2f GiB each%s\n", inputBytes * gib,
            nelem * sizeof(cuFloatComplex) * gib, direct ? "" : " (fused output shares the unfused staging buffer)");
 
@@ -434,6 +576,8 @@ int main(int argc, char** argv) {
                         indices[f * MAX_INDICIES + 1] == (unsigned)(2 * f + 1);
     p.crossPolInBlock = adjacentPairs && !crossPolPass;
 
+    unf.decodeRotator = rotator;
+    unf.validSamples = p.validSamples;
     FracParams pU = p, pF = p;
     pU.autocorr = autoUnfused;
     pF.autocorr = autoFused;
@@ -444,6 +588,7 @@ int main(int argc, char** argv) {
     auto runFused = [&](const FusedVariant& v) {
         if (doAuto) CHECK_CUDA(cudaMemsetAsync(autoFused, 0, nauto * sizeof(cuFloatComplex), st));
         launchFixedPhase(g, pF, st);
+        if (packed) launchFringePhase(g, pre.pk, st);
         bool crossDone = false;
         if (batched) crossDone = v.launch(g, pre, pF, doAuto, outFused, 0, g.nant, st);
         else for (int a = 0; a < g.nant; a++) crossDone = v.launch(g, pre, pF, doAuto, outFused, a, 1, st);
@@ -461,7 +606,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaGetLastError());
 
     bool pass = true;
-    const Diff dSpec = compareDevice(g, outFused, outUnfused);
+    const Diff dSpec = compareDevice(g, outFused, outUnfused, p.validSamples);
     // fused vs unfused spectra: single-precision FFTs of the same (rounded) input, rotated with
     // the same or (--rotator double) a different phase arithmetic: a few 1e-7 rms (relative)
     const double specTol = 1e-5;
@@ -482,9 +627,32 @@ int main(int argc, char** argv) {
         const int nc = which.size() / 3;
         int* dWhich = devCopy(which);
         double2* dIn = devAlloc<double2>((size_t)nc * g.fftchannels);
-        withPre(pre, [&](auto stage) { gather_exact<<<nc, 256>>>(g, stage, seed, dWhich, dIn); });
         std::vector<double2> hIn((size_t)nc * g.fftchannels);
-        CHECK_CUDA(cudaMemcpy(hIn.data(), dIn, hIn.size() * sizeof(double2), cudaMemcpyDeviceToHost));
+        if (packed) {
+            // decode, sideband sign, window and fringe rotation, all in double on the host
+            const std::vector<float> w = taper > 0 ? taperedWindow(g.fftchannels, taper, shape)
+                                                   : std::vector<float>(g.fftchannels, 1.0f);
+            for (int k = 0; k < nc; k++) {
+                const int ant = which[3 * k], win = which[3 * k + 1], band = which[3 * k + 2];
+                const size_t sp = ((size_t)ant * g.nwin + win) * g.nband + band;
+                for (int s = 0; s < g.fftchannels; s++) {
+                    const long gs = (long)sampleIndex[(size_t)ant * g.nwin + win] + s;
+                    const int frame = (int)(gs / framesamples);
+                    const unsigned char* payload = &hPacked[ant * bytesPerAnt + (size_t)frame * (VDIF_HEADER + VDIF_PAYLOAD) + VDIF_HEADER];
+                    double x = hostDecode(payload, nbit, g.nband, (int)(gs - (long)frame * framesamples), band);
+                    if ((decodeFlags[(size_t)ant * g.nband + band] & GPUDECODE_BAND_ALTSIGN) && ((datasamples + gs) & 1))
+                        x = -x;
+                    x *= w[s];
+                    const double ph = -TWO_PI * (bigA[sp] * s + bigB[sp]);
+                    hIn[(size_t)k * g.fftchannels + s] = make_double2(x * cos(ph), x * sin(ph));
+                }
+            }
+        } else {
+            withPre(pre, [&](auto stage) {
+                if constexpr (!decltype(stage)::packedInput) gather_exact<<<nc, 256>>>(g, stage, seed, dWhich, dIn);
+            });
+            CHECK_CUDA(cudaMemcpy(hIn.data(), dIn, hIn.size() * sizeof(double2), cudaMemcpyDeviceToHost));
+        }
         std::vector<std::complex<double>> ref, gu, gf;
         std::vector<cuFloatComplex> row(g.nchan);
         for (int k = 0; k < nc; k++) {
@@ -515,6 +683,63 @@ int main(int argc, char** argv) {
                "fused rms %.2e max %.2e  %s\n", nc, eu.rms, eu.max, ef.rms, ef.max, refOk ? "OK" : "FAIL");
         cudaFree(dWhich);
         cudaFree(dIn);
+    }
+
+    // ---- packed input: the two-kernel pipeline (decode + fringe -> buffer -> fused FFT) ----
+    // the buffer is FP16 or FP32; its first stage is either the fixed-point decode or (no window)
+    // gpudifx's own kernel; the fused FFT kernel is the chosen variant, writing to outFused
+    struct TwoKernel { const char* name; bool half, gpudifx; };
+    std::vector<TwoKernel> twoKernels;
+    void* twoBuf = nullptr;
+    if (packed) {
+        twoKernels = {{"2 kernels: decode + fringe -> FP16, fused FFT", true, false},
+                      {"2 kernels: decode + fringe -> FP32, fused FFT", false, false}};
+        if (taper == 0) twoKernels.push_back({"2 kernels: gpudifx decode (FP64) -> FP32, fused FFT", false, true});
+        twoBuf = devAlloc<float2>(nelem);
+    }
+    PreVariant preDecode = pre;           // decode + fringe without the window
+    preDecode.window = nullptr;
+    preDecode.tiled = false;
+    auto runTwoStage1 = [&](const TwoKernel& tk) {
+        if (tk.gpudifx) {
+            Unfused tmp = unf;            // gpudifx's kernel, into twoBuf
+            tmp.staging = (cuFloatComplex*)twoBuf;
+            tmp.decodeRotator = Rotator::DOUBLE;
+            tmp.runPre(pre, st);
+            return;
+        }
+        launchFringePhase(g, pre.pk, st);
+        withPre(preDecode, [&](auto stage) {
+            const unsigned tpb = std::min(g.nband * g.fftchannels / 8, 256);
+            const unsigned nb = (unsigned)g.nant * g.nwin;
+            if (tk.half) decode_to<8><<<nb, tpb, 0, st>>>(g, stage, (__half2*)twoBuf);
+            else         decode_to<8><<<nb, tpb, 0, st>>>(g, stage, (float2*)twoBuf);
+        });
+        CHECK_CUDA(cudaGetLastError());
+    };
+    auto runTwoStage2 = [&](const TwoKernel& tk) {
+        PreVariant load{};
+        load.half = tk.half;
+        load.in = twoBuf;
+        load.window = pre.window;
+        load.hop = g.fftchannels;
+        launchFixedPhase(g, pF, st);
+        if (batched) chosen->launch(g, load, pF, doAuto, outFused, 0, g.nant, st);
+        else for (int a = 0; a < g.nant; a++) chosen->launch(g, load, pF, doAuto, outFused, a, 1, st);
+    };
+    for (const auto& tk : twoKernels) {
+        if (doAuto) CHECK_CUDA(cudaMemsetAsync(autoFused, 0, nauto * sizeof(cuFloatComplex), st));
+        CHECK_CUDA(cudaMemsetAsync(outFused, 0, nelem * sizeof(cuFloatComplex), st));
+        runTwoStage1(tk);
+        runTwoStage2(tk);
+        CHECK_CUDA(cudaStreamSynchronize(st));
+        const Diff d2 = compareDevice(g, outFused, outUnfused, p.validSamples);
+        // FP16 storage rounds every sample (unit roundoff 4.9e-4): ~2e-4 rms relative
+        const double tol = tk.half ? 1e-3 : specTol;
+        const bool ok = d2.rms < tol && d2.max < 30 * tol;
+        pass &= ok;
+        printf("check: %s vs unfused: rms %.2e, max %.2e (limits %.0e, %.0e)  %s\n", tk.name, d2.rms, d2.max,
+               tol, 30 * tol, ok ? "OK" : "FAIL");
     }
 
     if (doAuto) {
@@ -555,16 +780,20 @@ int main(int argc, char** argv) {
     const Timing tU = timeIt(runUnfused, warmup, reps, st);
     line("unfused total", tU, 0);
     if (!direct)
-        line("  pre-FFT stage kernel (to FP32 buffer)", timeIt([&] { unf.runPre(pre, st); }, warmup, reps, st), 0);
+        line(!packed ? "  pre-FFT stage kernel (to FP32 buffer)"
+             : rotator == Rotator::DOUBLE ? "  decode + fringe (gpudifx kernel, FP64)"
+                                          : "  decode + fringe (fixed-point phases)",
+             timeIt([&] { unf.runPre(pre, st); }, warmup, reps, st), 0);
     line("  cuFFT", timeIt([&] { unf.runFFT(pre, outUnfused, st); }, warmup, reps, st), 0);
     line(rotator == Rotator::DOUBLE ? "  rotation (mpifxcorr kernel, FP64)" : "  rotation (fixed-point phases)",
          timeIt([&] {
         if (doAuto) CHECK_CUDA(cudaMemsetAsync(autoUnfused, 0, nauto * sizeof(cuFloatComplex), st));
         unf.runFrac(pU, amode, rotator, outUnfused, st); }, warmup, reps, st), 0);
     for (const auto& v : variants) {
-        if (!sweep && &v != chosen) continue;
+        if (!sweep && v.fpb != chosen->fpb) continue;
+        if (!sweepEpt && v.ept != chosen->ept) continue;
         char name[96];
-        snprintf(name, sizeof name, "fused, %u FFT/block%s (%u thr, %u B smem)", v.fpb, v.suggested ? "*" : "",
+        snprintf(name, sizeof name, "fused, %u FFT/block, %u/thr%s (%u thr, %u B)", v.fpb, v.ept, v.suggested ? "*" : "",
                  v.threads, v.smem);
         bool crossInKernel = false;
         const Timing t = timeIt([&] { crossInKernel = runFused(v); }, warmup, reps, st);
@@ -574,7 +803,15 @@ int main(int argc, char** argv) {
             line("  of which cross-pol pass", timeIt([&] { launchCrossPol(g, pF, outFused, prop.maxThreadsPerBlock, st); },
                                                       warmup, reps, st), 0);
     }
-    printf("  (* cuFFTDx's suggested FFTs per block; speed-up is unfused / fused)\n");
+    for (const auto& tk : twoKernels) {
+        line(tk.name, timeIt([&] { runTwoStage1(tk); runTwoStage2(tk); }, warmup, reps, st), tU.median);
+        line(tk.gpudifx ? "  decode + fringe (gpudifx kernel, FP64), to FP32" :
+             tk.half ? "  decode + fringe (fixed-point), to FP16" : "  decode + fringe (fixed-point), to FP32",
+             timeIt([&] { runTwoStage1(tk); }, warmup, reps, st), 0);
+        line(tk.half ? "  fused FFT, FP16 load" : "  fused FFT, FP32 load", timeIt([&] { runTwoStage2(tk); }, warmup, reps, st), 0);
+    }
+    printf("  (fused: FFTs per block, FFT elements per thread, threads and shared memory per block; * cuFFTDx's\n"
+           "   suggestion; speed-up is unfused / fused. The 2-kernel lines use the variant --fpb and --ept select)\n");
 
     unf.destroy();
     return pass ? 0 : 1;

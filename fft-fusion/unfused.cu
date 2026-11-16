@@ -6,7 +6,9 @@
 #include <algorithm>
 #include "pipelines.cuh"
 
+#ifndef GPUDECODE_BAND_CONJ_DC
 #define GPUDECODE_BAND_CONJ_DC FUSE_BAND_CONJ_DC
+#endif
 
 // ---- copied from mpifxcorr/src/gpumode.cu ----------------------------------------------------
 // Adapted from https://forums.developer.nvidia.com/t/atomic-add-for-complex-numbers/39757
@@ -203,6 +205,25 @@ __global__ void fixed_phase_kernel(Geometry g, FracParams p, ulonglong2* out) {
                              slope < 1.0 ? __double2ull_rz(slope * two64) : 0ull);
 }
 
+// The fringe phase exp(-2 pi i (A j + B)) of gpudifx's decode kernels, as a fixed-point offset
+// (B) and slope (A) per (antenna, window, band); one thread each.
+__global__ void fringe_phase_kernel(Geometry g, PackedInput d) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= g.spectra()) return;
+    double a = d.bigA[i], b = d.bigBred[i];
+    a -= floor(a);
+    b -= floor(b);
+    const double two64 = 18446744073709551616.0;
+    d.fringePhase[i] = make_ulonglong2(b < 1.0 ? __double2ull_rz(b * two64) : 0ull,
+                                       a < 1.0 ? __double2ull_rz(a * two64) : 0ull);
+}
+
+void launchFringePhase(const Geometry& g, const PackedInput& d, cudaStream_t st) {
+    const unsigned tpb = 256;
+    fringe_phase_kernel<<<(unsigned)((g.spectra() + tpb - 1) / tpb), tpb, 0, st>>>(g, d);
+    CHECK_CUDA(cudaGetLastError());
+}
+
 void launchFixedPhase(const Geometry& g, const FracParams& p, cudaStream_t st) {
     const unsigned tpb = 256;
     fixed_phase_kernel<<<(unsigned)((g.spectra() + tpb - 1) / tpb), tpb, 0, st>>>(
@@ -238,6 +259,38 @@ void Unfused::destroy() {
 
 void Unfused::runPre(const PreVariant& pre, cudaStream_t st) {
     const unsigned tpb = 256;
+    if (pre.packed && decodeRotator == Rotator::DOUBLE) {
+        // gpudifx today: its tiled decode + fringe-rotation kernel, FP64 phases, one launch per
+        // antenna (GPUMode::fringeRotation)
+        const PackedInput& d = pre.pk;
+        for (int a = 0; a < g.nant; a++) {
+            FringeTileArgs args{};
+            args.dest = staging + (size_t)a * g.perAnt();
+            args.sampleIndexes = d.sampleIndex + (size_t)a * g.nwin;
+            args.validSamples = validSamples + (size_t)a * g.nwin;
+            args.bigA = d.bigA + (size_t)a * g.nwin * g.nband;
+            args.bigBred = d.bigBred + (size_t)a * g.nwin * g.nband;
+            args.fftloop = 0;
+            args.startblock = 0;
+            args.numblocks = g.nwin;
+            args.numBufferedFFTs = g.nwin;
+            args.fftchannels = g.fftchannels;
+            args.numrecordedbands = g.nband;
+            args.ms = d.ms;
+            args.packed = d.packed + (size_t)a * d.bytesPerAnt;
+            args.valid_frames = d.validFrames + (size_t)a * d.nframes;
+            args.skipped = 0;
+            args.framestounpack = d.nframes;
+            args.datasamples = (int)d.datasamples;
+            args.codif = false;
+            args.bandflags = d.decodeFlags + (size_t)a * g.nband;
+            dispatch_fused_fringe_tiled<false, false>(st, g.nwin, args);
+        }
+        CHECK_CUDA(cudaGetLastError());
+        return;
+    }
+    if (pre.packed)
+        launchFringePhase(g, pre.pk, st);
     const unsigned blocks = (g.perAnt() + tpb - 1) / tpb;
     withPre(pre, [&](auto stage) {
         if (stage.direct())

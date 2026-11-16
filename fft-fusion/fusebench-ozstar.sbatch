@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8         # for the parallel build (the fused kernel is compiled per FFT length)
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
-#SBATCH --time=0:15:00            # estimate: build 2-4 min, run-bench.sh about 1 min (30 s on an RTX 2070)
+#SBATCH --time=0:30:00            # estimate: build 4-8 min, run-bench.sh 1-2 min (70 s on an RTX 2070)
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #

@@ -13,8 +13,13 @@
 #   wola-*         --wola: Vorbis-taper window 12.5% / 75% / 12.5%, each window overlapping each
 #                  neighbour over its taper (hop 0.875 FFT lengths), FP32 and FP16 input; and,
 #                  for comparison, the same window with hop 0.75 (consecutive windows share 25%)
-# all FFTs-per-block variants of the fused kernel.  Logs go to results-local/<host>-<stamp>/,
-# with summary.txt the lines worth reading.
+#   packed-*       from the packed data (2-bit VDIF): decode + fringe rotation as well. The
+#                  unfused pipeline is gpudifx today (its decode kernel and mpifxcorr's rotation,
+#                  FP64 phases; fixed-point with --wola, which gpudifx's decode cannot do); the
+#                  fused kernel does everything, with direct and with tiled decode; the 2-kernel
+#                  lines are decode + fringe into an FP16 or FP32 buffer, then the fused FFT
+# all FFTs-per-block and elements-per-thread variants of the fused kernel.  Logs go to
+# results-local/<host>-<stamp>/, with summary.txt the lines worth reading.
 
 set -u
 cd "$(dirname "$0")"
@@ -35,7 +40,7 @@ run() {   # run <name> <fusebench options...>
     local rc=$?
     [ $rc = 0 ] || fail=1
     { echo "== $name (exit $rc): fusebench $* ${EXTRA[*]}"
-      grep -E "^FFT input|^check: (PASS|FAIL)$|FAIL|unfused total|^    |^  fused" "$OUT/$name.log"
+      grep -E "^FFT input|^Input|^check: (PASS|FAIL)$|FAIL|unfused total|^    |^  fused|^  2 kernels" "$OUT/$name.log"
     } | tee -a "$OUT/summary.txt"
 }
 
@@ -43,11 +48,15 @@ for shape in "c128:--nchan 128 --nwin 10000" "c1024:--nchan 1024 --nwin 1000"; d
     tag=${shape%%:*}
     read -r -a opts <<< "${shape#*:}"
     run "$tag-mpifxcorr"       "${opts[@]}" --rotator double
-    run "$tag-fp32"            "${opts[@]}" --fpb sweep
-    run "$tag-fp16"            "${opts[@]}" --input fp16 --fpb sweep
-    run "$tag-wola-fp32"       "${opts[@]}" --wola --fpb sweep
-    run "$tag-wola-fp16"       "${opts[@]}" --wola --input fp16 --fpb sweep
-    run "$tag-wola-fp16-hop75" "${opts[@]}" --wola --overlap 0.25 --input fp16
+    run "$tag-fp32"            "${opts[@]}" --fpb sweep --ept sweep
+    run "$tag-fp16"            "${opts[@]}" --input fp16 --fpb sweep --ept sweep
+    run "$tag-wola-fp32"       "${opts[@]}" --wola --fpb sweep --ept sweep
+    run "$tag-wola-fp16"       "${opts[@]}" --wola --input fp16 --fpb sweep --ept sweep
+    run "$tag-wola-fp16-hop75" "${opts[@]}" --wola --overlap 0.25 --input fp16 --ept sweep
+    run "$tag-packed"          "${opts[@]}" --input packed --rotator double --fpb sweep --ept sweep
+    run "$tag-packed-tiled"    "${opts[@]}" --input packed --decode tiled --fpb sweep --ept sweep
+    run "$tag-packed-wola"     "${opts[@]}" --input packed --wola --fpb sweep --ept sweep
+    run "$tag-packed-wola-ept-half" "${opts[@]}" --input packed --wola --ept half
 done
 echo "Results in $OUT (summary.txt)"
 [ $fail = 0 ] || { echo "SOME RUNS FAILED: see the logs" >&2; exit 1; }

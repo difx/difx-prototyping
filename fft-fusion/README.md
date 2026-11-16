@@ -14,6 +14,13 @@ agree:
 - **fused**: one cuFFTDx kernel per antenna. It loads the FFT input (FP32 or FP16, optionally
   windowed and overlapped) into registers as FP32, does an FP32 FFT in shared memory, rotates
   each channel, and writes only the channels the correlator uses, in FP32.
+- **from the packed data** (`--input packed`): the same, but starting from 1, 2, 4 or 8-bit
+  multi-channel VDIF, so that the decode, sideband handling and fringe rotation come first. The
+  fused kernel then goes all the way from the packed bytes to fringe-rotated, channelised,
+  fractional-sample-corrected spectra. The unfused pipeline with `--rotator double` is gpudifx
+  today: its decode + fringe kernel (copied verbatim into `gpudecode_copy.cuh`), cuFFT and
+  mpifxcorr's rotation, all with FP64 phases. Also timed: **two kernels**, decode + fringe into
+  an FP16 or FP32 buffer, then the fused FFT + correction reading it.
 
 Directions this follows (gpudifx, 2026-11-16):
 - **Autocorrelations will move to the XMAC.** They are off by default (`--autocorr none`).
@@ -28,6 +35,9 @@ Directions this follows (gpudifx, 2026-11-16):
   window is overlapped, 12.5% at each end; consecutive windows start 87.5% of an FFT length
   apart), with Vorbis tapers, which lose no sensitivity. Tukey and sine tapers are options
   too. See "Window design" below.
+- **Decode and fringe rotation in the same kernel, if it pays** (`--input packed`), against
+  keeping the trip through global memory between fringe rotation and the FFT (two kernels).
+  See "From the packed data" below.
 
 ## Build and run
 
@@ -51,6 +61,7 @@ make -j8 SM=80                                                       # A100, wha
 make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everything given explicitly
 ./fusebench --help
 ./fusebench --nchan 128 --nwin 10000 --input fp16 --wola --fpb sweep  # one case
+./fusebench --nchan 128 --nwin 10000 --input packed --wola --ept sweep # from the packed data
 ./run-bench.sh                                                       # the standard set below
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
@@ -59,10 +70,12 @@ python3 plot_windows.py                                              # the plots
 On OzSTAR: run `make mathdx` on a login node, then `sbatch fusebench-ozstar.sbatch` from
 `fft-fusion`. The job sources your gpudifx setup (`DIFX_SETUP`, default
 `$HOME/setup_difx.claude`: module loads, then `setup.bash`), builds for the GPU it gets and runs
-`run-bench.sh`. Its header has the details.
+`run-bench.sh`. Its header has the details. `ncu-ozstar.sbatch`, submitted the same way,
+profiles the kernels with Nsight Compute (`--set full`) and packs the reports.
 
 The fused kernel is compiled once per FFT length (`SIZES` in the Makefile, default 64 to
-16384). That takes about a minute with `-j8`. `fusebench` exits non-zero if a check fails.
+16384), in all its variants. That takes about 4 minutes with `-j8` (8 cores); `SIZES="256 2048"`
+builds just the two the standard set uses. `fusebench` exits non-zero if a check fails.
 `run-bench.sh` takes about 30 s and writes its logs to `results-local/<host>-<stamp>/`
 (git-ignored).
 
@@ -98,8 +111,10 @@ Each run checks:
 |---|---|
 | `common.cuh` | `Geometry` (the `[ant][window][band][fftchannels]` layout of mpifxcorr's buffers), error macros |
 | `stages.cuh` | the stages either side of the FFT: `PreLoad<T, SERIES>` (FP32/FP16 storage, per-window or series layout, optional window), `withPre()` (the one place stage types are instantiated); `FracRotateFixed` |
+| `decode.cuh` | `PreDecode<TILED>`: decode, sideband sign and fixed-point fringe rotation from the packed data, as a pre-FFT stage |
+| `gpudecode_copy.cuh` | gpudifx's decode helpers and tiled decode + fringe kernel, copied verbatim (the commit and the two changes are noted there) |
 | `unfused.cu` | the copied production kernel, cuFFT plans as `GPUMode` makes them, the kernel that materialises a pre-FFT stage, the generic rotation kernel, the fixed-point phase precompute |
-| `fused_inst.cu` | the fused kernel, compiled per FFT length; each length registers its FFTs-per-block variants at start-up |
+| `fused_inst.cu` | the fused kernel, compiled per FFT length; each length registers its variants (FFTs per block, and cuFFTDx's elements per thread or half of it) at start-up |
 | `fusebench.cu` | data, window, checks, timing, options |
 | `window_response.py` | sensitivity and spectral response of window designs |
 
@@ -107,8 +122,10 @@ Both pipelines are built from the same stage objects. A pre-FFT stage is a struc
 `operator()(geometry, ant, window, band, sample)` that returns the FP32 FFT input, plus
 `sourceIndex()` and `weight()`, which the check uses to rebuild the exact input. The fused
 kernel calls it while loading the FFT input. The unfused pipeline runs it as its own kernel
-into an FP32 staging buffer, then runs cuFFT on that buffer. To try decode + fringe rotation in
-the kernel, write a stage struct that reads the packed samples, and add it to `withPre()`.
+into an FP32 staging buffer, then runs cuFFT on that buffer. A stage can also be `staged`: the
+whole block first fills shared memory (`stage()`), then each thread loads from there (`load()`);
+the tiled decode works this way. For packed input the check decodes the bytes on the host with
+its own decoder, rotates in double precision and does a DFT.
 
 A note for that step: the series layout assumes the stage before the FFT produces one
 continuous series per band. Each window then starts at its own sample (`window * hop`, and in
@@ -224,15 +241,17 @@ bandwidth (4.6x the 2070), FP64 at 1/2 rate. Every check passed.
    mpifxcorr's rotation kernel takes about as long as the fixed-point one: 1.16 vs 1.13 ms at
    128 channels (2%), 1.06 vs 0.90 ms at 1024 (17%). Fixed-point phases still matter on cards
    with low-rate FP64, such as the 2070.
-3. **The fused kernel does not reach the memory-bandwidth limit, and is further from it on the
-   A100 than on the 2070.**
-   Counting the bytes it must move (input once, `nchan` FP32 complex outputs), it reaches
-   783-1002 GB/s, 38-49% of the A100's bandwidth; the fixed-point rotation kernel, a plain
-   streaming kernel, reaches 1450 GB/s (71%). On the 2070 the same figures are 57-62% and
-   84-86%. FP16 input moves 25% fewer bytes but saves only 7-15% of the time on the A100 (29-30%
-   on the 2070). Streaming like the rotation kernel, the fused kernel would be 1.5-1.9x faster
-   on the A100. Next: an Nsight Compute profile there (occupancy, registers, the
-   shared-memory exchange).
+3. **With FP32 input the fused kernel is limited by memory bandwidth; with FP16 input, on the
+   A100, it is not.** It must read each window's `fftchannels` complex input samples and write
+   `nchan` FP32 complex channels: 2.46 GB per subint at 128 channels with FP32 input, 1.64 GB
+   with FP16. With FP32 input that is 1.45-1.50 TB/s, 71-74% of the A100's 2039 GB/s, as fast
+   as the fixed-point rotation kernel, a plain streaming kernel (1.45 TB/s, 71%); on the 2070
+   86-88%, against the streaming kernel's 84-86% (Nsight Compute agrees: 89% DRAM throughput).
+   With FP16 input it is 1.04-1.17 TB/s, 51-58%: FP16 moves 33% fewer bytes but saves only
+   7-15% of the time on the A100 (29-30% on the 2070, 80-83% of its bandwidth). So only the
+   FP16 path has room on the A100, up to about 1.3-1.4x. (Corrected: the first version of this
+   paragraph, in 501bc92, counted the FP32 input at 4 bytes a sample instead of 8, and
+   concluded wrongly that the FP32 kernel reached only 38-49%.)
 4. **WOLA costs 23-36% over the fused kernel without it** (2070: 26-34%), and hop 0.75 another
    13-14% (2070: 10-13%). Fused with FP16 input, WOLA is still 1.7x faster than mpifxcorr's
    FFT + rotation without windowing; unfused it would cost 1.6-1.8x mpifxcorr's time.
@@ -240,6 +259,59 @@ bandwidth (4.6x the 2070), FP64 at 1/2 rate. Every check passed.
 6. For this array (10 antennas, 8 x 64 MHz bands), the fused FP16 WOLA kernel runs at
    10.3-10.8x real time, mpifxcorr's FFT + rotation at 6.0-6.4x. That is this stage alone,
    without unpacking, fringe rotation, the cross-multiply or transfers.
+
+### From the packed data: RTX 2070 SUPER
+
+`run-bench.sh`, the `packed-*` cases: 2-bit, 8-band VDIF (8000-byte payloads), odd bands lower
+sideband, an integer delay per antenna, a fringe phase slope and offset per window and band.
+Best variant of each fused kernel (FFTs per block, elements per thread), ms per subint for all
+10 antennas, all checks passing. The FFT stage of the 2-kernel rows is the better of cuFFTDx's
+and half its elements per thread where both were timed (the WOLA columns). gpudifx's decode
+kernel cannot apply a window, so the WOLA columns have no gpudifx rows.
+
+| pipeline | 128 ch | 128 ch, WOLA | 1024 ch | 1024 ch, WOLA |
+|---|---|---|---|---|
+| gpudifx today: decode + fringe (FP64), cuFFT, rotation (FP64) | 13.52 + 8.45 + 9.26 = 31.18 | | 9.50 + 6.77 + 7.41 = 23.65 | |
+| unfused, fixed-point phases | 21.15 | 24.10 | 16.06 | 18.18 |
+| **end-to-end fused kernel** | **6.71** (4.6x) | **7.88** | **6.20** (3.8x) | **7.19** |
+| 2 kernels: decode + fringe -> FP16, fused FFT | 3.78 + 4.72 = 8.46 | 4.33 + 5.21 = 9.54 | 2.69 + 3.56 = 6.32 | 3.05 + 4.92 = 7.94 |
+| 2 kernels: decode + fringe -> FP32, fused FFT | 4.90 + 6.38 = 11.28 | 5.55 + 7.31 = 12.87 | 4.55 + 5.00 = 9.54 | 5.14 + 5.95 = 11.08 |
+| 2 kernels: gpudifx's decode (FP64) -> FP32, fused FFT | 13.52 + 6.38 = 19.98 | | 9.50 + 5.00 = 14.61 | |
+| end-to-end, tiled decode | 8.69 | | 6.29 | |
+
+1. **On the 2070 the end-to-end kernel is the fastest: 4.6x gpudifx today at 128 channels,
+   3.8x at 1024.** Against two kernels with an FP16 buffer between them it takes 21% less time
+   at 128 channels (17% with WOLA), and 2% less at 1024 channels (9% with WOLA). WOLA costs the
+   end-to-end kernel 16-17% (1.14x the windows). The A100 has 4.6x the memory bandwidth and
+   about 2x the arithmetic, which makes the trip through memory relatively cheaper there: it
+   needs measuring (`run-bench.sh`) before choosing. The first kernel of the pair was written
+   for this comparison (one block per antenna and window, 8 samples per thread, unrolled, as in
+   the fused kernel). At 128 channels it is still far from the write bandwidth (4.33 ms for
+   0.94 GB with WOLA), so it may have more in it.
+2. **Decode is half the end-to-end kernel**, not the FFT. Taking pieces out of it (128
+   channels, no window, cuFFTDx's elements per thread): FFT + correction + store 3.02 ms; with
+   fringe rotation 3.89; with the decode 7.58. Per sample the decode finds its frame, checks
+   that the frame is valid and reads its bits, and that is long latency for little arithmetic
+   (Nsight Compute: 49% of issue slots used, DRAM 22% busy, the main stalls instruction-cache
+   misses and load latency).
+3. **The tiled decode does not pay here.** Decoding the block's windows into shared memory with
+   band on the lane (gpudifx's tiling) is slower at 128 channels (8.80 vs 6.75 ms) and level at
+   1024. Its point in gpudifx is coalescing the stores; in the fused kernel the FFT's own layout
+   already keeps the stores coalesced, and each window decodes only its own samples (a few
+   bytes per sample time, read straight from the payload).
+4. **cuFFTDx's suggested elements per thread is not the best.** Half of it (8 instead of 16 for
+   both the 256- and 2048-point FFT on this card) takes 7-10% off the end-to-end kernel and 16%
+   off the fused FFT of an FP16 buffer (WOLA, 128 channels: 6.15 -> 5.13 ms), against cuFFTDx's
+   suggested setting. The variants are registered for both, and `--ept sweep` times them. The
+   earlier tables for the FP32 and FP16 buffers were taken with cuFFTDx's setting only.
+5. Other changes tried on the end-to-end kernel (128 channels):
+   - kept: 32-bit sample numbers in the decode (gpudifx: 64-bit, whose division is a long
+     software routine): -4%; 1- and 2-bit levels by arithmetic, not from `__constant__`
+     memory: -2%
+   - not kept: finding each window's frame once and stepping per sample: +12% (slower);
+     one launch for all antennas: no change
+   - not done yet: the bit width as a template parameter: -3 to -4% in a quick test, worth it
+     in production code
 
 ### Window design
 
@@ -313,7 +385,15 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Not yet measured
 
-- Why the fused kernel stays well below the memory bandwidth (Nsight Compute on the A100).
+- Why the fused kernel with FP16 input, and the end-to-end kernel, stay below the A100's memory
+  bandwidth (Nsight Compute on the A100: `ncu-ozstar.sbatch`).
+- The packed-data comparison (end-to-end kernel against two kernels) on the A100.
+- Two kernels with WOLA through a series buffer (each sample decoded, rotated and stored once,
+  as `--layout series`) rather than a buffer per window, which repeats the 12.5% overlap. That
+  needs the fringe phase to be continuous from window to window.
+- Fringe and fractional-sample phases by recurrence (one sincos per thread, then a complex
+  multiply per element) instead of a sincos per element.
+- Complex packed data, phase cal, and CODIF in the end-to-end kernel.
 - Complex data (`--complex`) and other channel counts.
 - Decode and fringe rotation inside the fused kernel (the next pre-FFT stage).
 - The effect inside mpifxcorr, where the FFT and rotation overlap with transfers and the XMAC.

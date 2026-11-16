@@ -12,7 +12,12 @@
 //         exact (unrounded) FFT input from these
 //     bool direct() const   true if the unfused pipeline can hand the stored buffer straight to
 //                           cuFFT (FP32, one buffer per window, no weights), as mpifxcorr does now
+//     static constexpr bool staged, packedInput; tileBytes(n, fpb), stage(...), load(...)
+//         the fused kernel's interface: a staged Pre first fills a shared-memory tile with the
+//         whole block (stage), then each thread loads its samples (load); packedInput marks the
+//         stages whose exact input the host check rebuilds by decoding (decode.cuh)
 // To try a new pre-FFT step, write a struct like PreLoad and add it to withPre() below.
+// PreDecode (decode.cuh) starts from the packed data: decode, sideband, fringe rotation, window.
 //
 // The post-FFT stage is FracRotateFixed: the fractional-sample correction with each spectrum's
 // phase slope computed once in double and each channel's phase in 64-bit fixed point.  The
@@ -22,6 +27,7 @@
 #include <type_traits>
 #include <cuda_fp16.h>
 #include "common.cuh"
+#include "decode.cuh"
 
 __device__ __forceinline__ float2 toFloat2(float2 v) { return v; }
 __device__ __forceinline__ float2 toFloat2(__half2 v) { return __half22float2(v); }
@@ -36,6 +42,8 @@ __device__ __forceinline__ float2 toFloat2(__half2 v) { return __half22float2(v)
 // hop < fftchannels this is a windowed overlap-add (WOLA) front end.
 template<class T, bool SERIES>
 struct PreLoad {
+    static constexpr bool staged = false;
+    static constexpr bool packedInput = false;
     const T* in;
     const float* window;      // fftchannels weights, or nullptr for none
     int hop;                  // SERIES: samples between window starts
@@ -57,6 +65,13 @@ struct PreLoad {
         }
         return v;
     }
+    static constexpr unsigned tileBytes(unsigned, unsigned) { return 0; }
+    __device__ __forceinline__ void stage(const Geometry&, int, unsigned long long, unsigned long long, unsigned,
+                                          unsigned, float*) const {}
+    __device__ __forceinline__ cuFloatComplex load(const Geometry& g, int ant, int win, int band, int s,
+                                                   unsigned, unsigned, unsigned, const float*) const {
+        return (*this)(g, ant, win, band, s);
+    }
 };
 
 // One pre-FFT stage chosen at run time.
@@ -67,13 +82,19 @@ struct PreVariant {
     const float* window;
     int hop;
     size_t seriesLen;
+    bool packed;              // start from the packed data (PreDecode); in, half, series unused
+    bool tiled;               // PreDecode<true>: the fused kernel decodes through shared memory
+    PackedInput pk;
 };
 
 // Calls f(pre) with the PreLoad matching v. Every pre-FFT stage type the pipelines can run is
 // instantiated here, so this is the one place to add a new one.
 template<class F>
 void withPre(const PreVariant& v, F&& f) {
-    if (v.half) {
+    if (v.packed) {
+        if (v.tiled) f(PreDecode<true>{v.pk, v.window});
+        else         f(PreDecode<false>{v.pk, v.window});
+    } else if (v.half) {
         if (v.series) f(PreLoad<__half2, true>{(const __half2*)v.in, v.window, v.hop, v.seriesLen});
         else          f(PreLoad<__half2, false>{(const __half2*)v.in, v.window, v.hop, v.seriesLen});
     } else {

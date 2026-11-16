@@ -19,6 +19,10 @@ struct Unfused {
     int maxThreadsPerBlock = 1024;
     std::vector<cufftHandle> plans;
     cuFloatComplex* staging = nullptr;    // FP32 FFT input when the pre-FFT stage is not direct
+    // packed input: DOUBLE runs gpudifx's decode + fringe kernel verbatim (FP64 phases), which
+    // skips the windows validSamples ([ant][win]) flags invalid; FIXED materialises PreDecode
+    Rotator decodeRotator = Rotator::FIXED;
+    const bool* validSamples = nullptr;
 
     void init(const Geometry& geom, bool batchedPlan, bool needStaging);
     void destroy();
