@@ -313,6 +313,53 @@ kernel cannot apply a window, so the WOLA columns have no gpudifx rows.
    - not done yet: the bit width as a template parameter: -3 to -4% in a quick test, worth it
      in production code
 
+### From the packed data: A100-SXM4-80GB (OzSTAR, gina10)
+
+`fusebench-ozstar.sbatch`, SLURM job 21016518, commit 2247eaa; the same runs as on the 2070, all
+checks passing. ms per subint.
+
+| pipeline | 128 ch | 128 ch, WOLA | 1024 ch | 1024 ch, WOLA |
+|---|---|---|---|---|
+| gpudifx today: decode + fringe (FP64), cuFFT, rotation (FP64) | 3.09 + 1.96 + 1.15 = 6.19 | | 2.17 + 1.62 + 1.08 = 4.84 | |
+| unfused, fixed-point phases | 5.99 | 6.82 | 4.77 | 5.42 |
+| **end-to-end fused kernel** | **2.85** (2.2x) | **3.24** | 2.48 (2.0x) | **2.83** |
+| 2 kernels: decode + fringe -> FP16, fused FFT | 1.65 + 1.39 = 3.02 | 1.88 + 1.73 = 3.60 | **1.18 + 1.25 = 2.43** | 1.34 + 1.63 = 2.97 |
+| 2 kernels: decode + fringe -> FP32, fused FFT | 1.66 + 1.63 = 3.31 | 1.89 + 2.11 = 4.01 | 1.17 + 1.35 = 2.52 | 1.33 + 1.80 = 3.13 |
+| 2 kernels: gpudifx's decode (FP64) -> FP32, fused FFT | 3.09 + 1.63 = 4.74 | | 2.17 + 1.35 = 3.52 | |
+| end-to-end, tiled decode | 3.02 | | 2.48 | |
+
+1. **The end-to-end kernel's lead shrinks on the A100, as expected.** Against two kernels with
+   an FP16 buffer it takes 6% less time at 128 channels (10% with WOLA) and 5% less at 1024
+   channels with WOLA; without a window at 1024 channels the two kernels are 2% faster. Against
+   gpudifx today both are about 2x (2.2x at 128 channels, 2.0x at 1024); on the 2070 4.6x and
+   3.8x, where gpudifx's FP64 phases cost far more.
+2. **Decode + fringe rotation is not limited by bandwidth on the A100 either.** Writing FP16 or
+   FP32 takes the same time (1.65 vs 1.66 ms at 128 channels), so the FP32 buffer costs only
+   what its larger read costs the FFT kernel. The FP16 buffer still wins.
+3. **Half of cuFFTDx's elements per thread** takes 7-10% off the end-to-end kernel and 8-10%
+   off the fused FFT with WOLA (not with FP16 input at 1024 channels, where cuFFTDx's setting is
+   best), as on the 2070. The tiled decode does best at 1 FFT per block, and there only matches
+   the direct decode.
+4. **For this array the end-to-end kernel with WOLA runs at 5.7-6.2x real time**, this stage
+   alone.
+
+What Nsight Compute shows (`ncu-ozstar.sbatch`, job 21016519; per antenna; ncu runs the GPU at
+its base clock):
+- **Occupancy is limited by registers.** The fused kernels use 64-72 registers a thread, which
+  leaves 36-42% of the A100's warp slots active (81-98% on the 2070, whose SMs hold half as
+  many threads). The main stall is waiting for loads (long scoreboard), with too few warps to
+  hide it. Halving the elements per thread cuts registers to 48-56 and raises occupancy to
+  51-61%, which is where its gain comes from. Next: cap the registers (`__launch_bounds__`
+  with a minimum of blocks per SM) and measure.
+- **The end-to-end kernel uses 3-10% of the memory bandwidth** and 49-68% of its issue slots,
+  and executes 2.6-3.4x the instructions of the same kernel reading an FP32 buffer: decode and
+  fringe rotation are about two-thirds of its instructions. Making it faster means fewer
+  instructions per sample in the decode.
+- **cuFFTDx's shared-memory exchange has bank conflicts** in every fused variant: 1.0-1.2M
+  excess wavefronts per launch at 256 points, 4.1-4.7M at 2048 (the same on the 2070).
+- The 128-channel profiles of this run (2000 windows, 33 MB of input per antenna) fit in the
+  A100's 40 MB L2 cache, which understates their DRAM traffic; the job now profiles 10000.
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -385,9 +432,8 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Not yet measured
 
-- Why the fused kernel with FP16 input, and the end-to-end kernel, stay below the A100's memory
-  bandwidth (Nsight Compute on the A100: `ncu-ozstar.sbatch`).
-- The packed-data comparison (end-to-end kernel against two kernels) on the A100.
+- Capping the fused kernels' registers for occupancy on the A100 (see the Nsight Compute
+  findings above), and fewer instructions per sample in the decode.
 - Two kernels with WOLA through a series buffer (each sample decoded, rotated and stored once,
   as `--layout series`) rather than a buffer per window, which repeats the 12.5% overlap. That
   needs the fringe phase to be continuous from window to window.

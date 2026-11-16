@@ -58,9 +58,20 @@ echo "Environment from $DIFX_SETUP"
 nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap --format=csv,noheader
 echo "Building for sm_$SM ..."
 t0=$(date +%s)
-make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" > "build-sm$SM.log" 2>&1 \
-    || { echo "ERROR: build failed, see $BENCHDIR/build-sm$SM.log" >&2; tail -20 "build-sm$SM.log" >&2; exit 1; }
-head -1 "build-sm$SM.log"                   # what the Makefile chose: CUDA, MathDx
+# Jobs started together (fusebench-ozstar.sbatch and ncu-ozstar.sbatch) build in the same
+# build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
+# filesystem does not support locks, warn and build without one.
+blog="build-sm$SM.${SLURM_JOB_ID:-manual}.log"
+lock=(flock "build-sm$SM.lock")
+flock -n -E 200 "build-sm$SM.lock" true 2>/dev/null
+rc=$?
+if [ $rc != 0 ] && [ $rc != 200 ]; then
+    echo "WARNING: file locks do not work in $BENCHDIR; building without one, so do not start two of these jobs at once"
+    lock=()
+fi
+"${lock[@]}" make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" > "$blog" 2>&1 \
+    || { echo "ERROR: build failed, see $BENCHDIR/$blog" >&2; tail -20 "$blog" >&2; exit 1; }
+head -1 "$blog"                   # what the Makefile chose: CUDA, MathDx
 "${CUDAROOT:+$CUDAROOT/bin/}nvcc" --version | tail -1   # the Makefile's choice: CUDAROOT, else PATH
 echo "Built in $(( $(date +%s) - t0 )) s"
 

@@ -23,7 +23,8 @@
 #   <case>.run.log   fusebench's own output under the profiler
 # and packs it into a .tgz next to it: send that and the SLURM log back.  If the GPU's
 # performance counters are restricted to administrators, ncu fails with ERR_NVGPUCTRPERM; the job
-# then stops and says so.
+# then stops and says so.  ncu locks the GPU to its base clock while it profiles (the A100's
+# 1095 MHz rather than 1410), so its durations are longer than fusebench's.
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
@@ -55,14 +56,26 @@ echo "Node $(hostname), job ${SLURM_JOB_ID:-manual}, difx-prototyping $(git log 
 echo "Environment from $DIFX_SETUP; $("$NCU" --version | tail -1)"
 nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap --format=csv,noheader
 echo "Building for sm_$SM ..."
-make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" > "build-sm$SM.log" 2>&1 \
-    || { echo "ERROR: build failed, see $BENCHDIR/build-sm$SM.log" >&2; tail -20 "build-sm$SM.log" >&2; exit 1; }
-head -1 "build-sm$SM.log"
+# Jobs started together (fusebench-ozstar.sbatch and ncu-ozstar.sbatch) build in the same
+# build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
+# filesystem does not support locks, warn and build without one.
+blog="build-sm$SM.${SLURM_JOB_ID:-manual}.log"
+lock=(flock "build-sm$SM.lock")
+flock -n -E 200 "build-sm$SM.lock" true 2>/dev/null
+rc=$?
+if [ $rc != 0 ] && [ $rc != 200 ]; then
+    echo "WARNING: file locks do not work in $BENCHDIR; building without one, so do not start two of these jobs at once"
+    lock=()
+fi
+"${lock[@]}" make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" > "$blog" 2>&1 \
+    || { echo "ERROR: build failed, see $BENCHDIR/$blog" >&2; tail -20 "$blog" >&2; exit 1; }
+head -1 "$blog"
 
 OUT=results-local/ncu-$(hostname -s)-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 QUICK=(--reps 1 --warmup 0 --check 0)
-C128=(--nchan 128 --nwin 2000)
+# big enough not to fit in the A100's 40 MB L2 cache (128 channels: 164 MB of FP32 input per antenna)
+C128=(--nchan 128 --nwin 10000)
 C1024=(--nchan 1024 --nwin 1000)
 fail=0
 
