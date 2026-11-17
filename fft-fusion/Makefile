@@ -79,6 +79,8 @@ ifeq ($(filter clean mathdx,$(MAKECMDGOALS)),)
   $(info fusebench: sm_$(SM) (from $(SM_FROM)), CUDA $(CUDA_HOME), MathDx $(MATHDX))
 endif
 
+all: fusebench xmacbench
+
 fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(FUSED_OBJ)
 	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
 
@@ -86,6 +88,16 @@ $(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh decode.cu
 	$(NVCC) $(FLAGS) -I$(MATHDX)/include -c $< -o $@
 
 $(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD)
+	$(NVCC) $(FLAGS) -c $< -o $@
+
+# the XMAC stage on its own (xmac.cuh)
+xmacbench: $(BUILD)/xmacbench.o $(BUILD)/xmac.o
+	$(NVCC) $(FLAGS) $^ -o $@
+
+$(BUILD)/xmacbench.o: xmacbench.cu xmac.cuh common.cuh | $(BUILD)
+	$(NVCC) $(FLAGS) -c $< -o $@
+
+$(BUILD)/xmac.o: xmac.cu xmac.cuh xmac_copy.cuh common.cuh | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
 $(BUILD)/fused_%.o: fused_inst.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD) $(MATHDX_DEP)
@@ -108,6 +120,6 @@ $(MATHDX_STAMP):
 	touch $@
 
 clean:
-	rm -rf build-sm* fusebench
+	rm -rf build-sm* fusebench xmacbench
 
-.PHONY: clean mathdx
+.PHONY: all clean mathdx

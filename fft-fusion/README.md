@@ -21,6 +21,10 @@ agree:
   today: its decode + fringe kernel (copied verbatim into `gpudecode_copy.cuh`), cuFFT and
   mpifxcorr's rotation, all with FP64 phases. Also timed: **two kernels**, decode + fringe into
   an FP16 or FP32 buffer, then the fused FFT + correction reading it.
+- **the cross-multiply** (`xmacbench`, a separate program): the XMAC stage on its own, from
+  station spectra in the layout the fused kernel writes. gpudifx's kernel (copied verbatim into
+  `xmac_copy.cuh`), a register-tiled FP32 kernel, and a tensor-core kernel (FP16 in, FP32 sums)
+  with the transpose into its layout. See "The XMAC stage" below.
 
 Directions this follows (gpudifx, 2026-11-16):
 - **Autocorrelations will move to the XMAC.** They are off by default (`--autocorr none`).
@@ -64,6 +68,8 @@ make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everythin
 ./fusebench --nchan 128 --nwin 10000 --input packed --wola --ept sweep # from the packed data
 ./run-bench.sh                                                       # the standard set below
 ./run-nchan.sh                                                       # cost against channel count
+./xmacbench --nant 10                                                # the XMAC stage, 10 stations
+./run-xmac.sh                                                        # XMAC against the number of stations
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
 ```
@@ -71,8 +77,9 @@ python3 plot_windows.py                                              # the plots
 On OzSTAR: run `make mathdx` on a login node, then `sbatch fusebench-ozstar.sbatch` from
 `fft-fusion`. The job sources your gpudifx setup (`DIFX_SETUP`, default
 `$HOME/setup_difx.claude`: module loads, then `setup.bash`), builds for the GPU it gets and runs
-`run-bench.sh`. Its header has the details. `ncu-ozstar.sbatch`, submitted the same way,
-profiles the kernels with Nsight Compute (`--set full`) and packs the reports.
+`run-bench.sh`, `run-nchan.sh` and `run-xmac.sh`. Its header has the details.
+`ncu-ozstar.sbatch`, submitted the same way, profiles the kernels with Nsight Compute (`--set
+full`) and packs the reports.
 
 The fused kernel is compiled once per FFT length (`SIZES` in the Makefile, default 64 to
 16384), in all its variants. That takes about 4 minutes with `-j8` (8 cores); `SIZES="256 2048"`
@@ -117,6 +124,9 @@ Each run checks:
 | `unfused.cu` | the copied production kernel, cuFFT plans as `GPUMode` makes them, the kernel that materialises a pre-FFT stage, the generic rotation kernel, the fixed-point phase precompute, and for packed input the fringe phases and window descriptors (`launchPackedSetup`) |
 | `fused_inst.cu` | the fused kernel, compiled per FFT length; each length registers its variants (FFTs per block, and cuFFTDx's elements per thread or half of it) at start-up |
 | `fusebench.cu` | data, window, checks, timing, options |
+| `xmac.cuh`, `xmac.cu` | the XMAC stage: the shapes and layouts, the three versions |
+| `xmac_copy.cuh` | gpudifx's XMAC kernel, copied verbatim, and its launch geometry as GPUCore sets it |
+| `xmacbench.cu` | the XMAC benchmark: station spectra with a common signal, the double-precision check, timing |
 | `window_response.py` | sensitivity and spectral response of window designs |
 
 Both pipelines are built from the same stage objects. A pre-FFT stage is a struct with
@@ -693,6 +703,74 @@ passed it from 2048 channels up), and the step at 512 channels has gone: with th
 16 elements per thread at 1024 points needs 48 registers (72 before) and is the fastest.  Longer FFTs
 still cost more: +42% at 2048 channels, twice the time at 8192.
 
+### The XMAC stage: RTX 2070 SUPER
+
+`xmacbench` cross-multiplies station spectra in the layout the fused kernel writes
+(`[ant][win][band][fftchannels]`, FP32, bands 2f and 2f+1 the two polarisations of frequency f)
+for every baseline and all four polarisation products, summed over the subint, and checks a
+sample of channels against a double-precision sum.  The spectra are a common signal (correlation
+0.1 between stations) plus each station's own noise.  Three versions:
+
+- **gpudifx**: `gpu_fuse_xmac_and_average`, verbatim, launched as GPUCore launches it: a thread per
+  (baseline, product, channel), each reading both stations' FP32 values for every window from
+  global memory, so each station's spectra are read twice per baseline it is in.
+- **tiled**: FP32 on the CUDA cores, a thread per (channel, 4 x 4 block of receiver pairs), each
+  loaded value used 4 times from registers.
+- **tensor**: FP16 in, FP32 sums, WMMA 16 x 16 x 16: per channel, the receivers (station,
+  polarisation) as rows and 16 windows as columns, V += X X^H as four real products.  It needs its
+  own layout (per channel, blocks of 16 windows, receivers on the rows, real and imaginary planes);
+  here a transpose kernel makes it from the fused kernel's output, timed separately.  The rows are
+  not padded to 16: a tile that runs past the last receiver reads the next plane's rows, whose
+  products are discarded (padding 20 receivers to 32 made the XMAC 64% slower).
+
+The new versions take invalid windows to be zero, which the station processing would write (it
+knows which windows are invalid), rather than reading flags per sample; gpudifx's kernel skips
+them, which gives the same sums.  All pass the check: FP32 versions within 1-4e-7 rms of the
+double-precision sums, the tensor version within 4-7e-5 (FP16 rounding of the input).
+
+`run-xmac.sh` (`results-local/ar313-adeller-xmac-20261117-134059`): 4 frequencies x 2
+polarisations, 128 channels; ms per ms of data (below 1: faster than real time; 10000 windows,
+4000 from 24 stations up, to fit the 2070's 8 GB).  For context, the station processing that
+comes before it (2-bit data, no window, 128 channels; `run-bench.sh`,
+`results-local/ar313-adeller-20261117-123426`, measured at 10 stations and scaled by the
+number of stations): gpudifx today (its decode + fringe kernel and fractional-sample
+correction, both with FP64 phases, and cuFFT: 31.0 ms per 20 ms at 10 stations; the 2070's FP64
+runs at 1/32 of its FP32 rate), the end-to-end kernel (4.06 ms) and the 2 kernels with an FP16
+buffer (7.34 ms); with WOLA the last two cost 15% more.  Scaling them by the number of stations
+is fair: each station is processed on its own (its own launches, no data shared between
+stations, each launch enough to fill the GPU), and measured with 4 to 32 stations (fusebench
+`--nant`, 10000 windows up to 12 stations, 2500 to 32) the cost per station is the same within
+3% for all three; only 2 stations cost 13-20% more per station (the fixed work of a subint), and
+quarter-length subints 1-4% more per ms of data.
+
+| stations | station: gpudifx | station: end-to-end kernel | station: 2 kernels, FP16 | XMAC: gpudifx | XMAC: tiled | XMAC: tensor | transpose | XMAC: tensor + transpose |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 0.621 | 0.081 | 0.147 | 0.118 | 0.040 | 0.021 | 0.081 | 0.103 |
+| 6 | 0.931 | 0.122 | 0.220 | 0.265 | 0.064 | 0.031 | 0.123 | 0.154 |
+| 10 | 1.55 | 0.203 | 0.367 | 0.700 | 0.159 | 0.055 | 0.196 | 0.250 |
+| 16 | 2.48 | 0.325 | 0.587 | 2.78 | 0.610 | 0.105 | 0.280 | 0.380 |
+| 24 | 3.72 | 0.487 | 0.880 | 6.20 | 0.970 | 0.186 | 0.420 | 0.610 |
+| 32 | 4.97 | 0.649 | 1.17 | 12.0 | 2.87 | 0.410 | 0.550 | 0.960 |
+| 48 | 7.45 | 0.974 | 1.76 | 30.8 | 7.30 | 0.790 | 0.830 | 1.62 |
+| 64 | 9.93 | 1.30 | 2.35 | 57.8 | 14.7 | 1.14 | 1.11 | 2.25 |
+
+(1024 channels, 1000 windows: 10 stations 0.65 / 0.194 / 0.057; 32 stations 11.7 / 3.18 / 0.21.)
+
+- **gpudifx's XMAC is the most expensive stage once the station processing is fast.**  At 10
+  stations it costs 0.70 ms per ms of data, 3.5 times the end-to-end kernel (0.20), though less
+  than gpudifx's own station processing on this card (1.55, FP64-bound); from 16 stations up it
+  costs more than that too.  It runs at 40-65 G complex multiply-accumulates per second whatever
+  the number of stations, so its cost grows as the number of baselines, and it stops keeping up
+  with real time at about 12 stations.
+- **Register tiling alone gains 3-6x** (150-300 Gcmac/s): 0.16 at 10 stations.
+- **The tensor cores gain another 2-13x**, more the more stations (0.055 at 10 stations, real
+  time up to about 55 stations on the 2070), but only if the station kernel writes their layout:
+  the transpose costs more than the tensor XMAC itself (it reads the FP32 spectra and writes the
+  FP16 copy).  Written directly by the fused kernel, the layout would also halve the fused
+  kernel's output (FP16).
+  Next: the fused kernel writing it (16 windows of a band per block, transposed through shared
+  memory on the way out), and the two stages together, in sequence and overlapped in chunks.
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -769,17 +847,18 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample
   correction.  cuFFTDx's shared-memory exchange (bank conflicts; the main stall on the 2070).
-- **An XMAC stage in the benchmark**, to measure what the spectra being in L2 is worth to the
-  cross-multiply, and how that scales with the number of stations. Chunking all antennas a range
-  of windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read
-  and write its accumulators once per chunk. With N stations, B bands, C channels and W windows
-  per chunk, accumulator traffic over spectrum traffic is about 2N / W (FP16 spectra, FP32
+- **The XMAC with the station processing** (`xmacbench` has the XMAC on its own): the fused
+  kernel writing the tensor layout directly (FP16; 16 windows of a band per block, transposed
+  through shared memory on the way out) and what that costs it; then the two stages in sequence
+  and overlapped in chunks, against the number of stations.  Chunking all antennas a range of
+  windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read and
+  write its accumulators once per chunk. With N stations, B bands, C channels and W windows per
+  chunk, accumulator traffic over spectrum traffic is about 2N / W (FP16 spectra, FP32
   accumulators), and with W set by the L2 size, about 8 N^2 B C / L2: 1 at N ~ 70 for B C = 1024
   on the A100 (40 MB), at N ~ 17 for B C = 16384. Beyond that chunking costs more than it saves,
   unless the XMAC keeps its accumulators on chip across chunks (a persistent producer/consumer
-  design). A tensor-core XMAC reads through L2 like any other kernel (tensor cores work on
-  registers and shared memory), so the same holds for it; it wants FP16 input in its own block
-  layout, which the fused kernel could write directly, halving its output.
+  design).  The tensor XMAC at small N: fewer wasted products (a 16 x 16 tile holds at most 8
+  stations' pairs), autocorrelations in it.
 - **Two-stage channelisation for high spectral resolution** (say above 512 channels): a coarse
   first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
   second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes

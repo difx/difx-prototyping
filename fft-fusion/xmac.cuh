@@ -1,0 +1,89 @@
+// xmac.cuh - the cross-multiply-accumulate (XMAC) stage: the station spectra the fused kernel
+// writes, cross-multiplied for every baseline and polarisation product and summed over the
+// subint's FFT windows.  Three versions (xmac.cu), timed by xmacbench.cu:
+//   gpudifx  gpudifx's kernel verbatim (xmac_copy.cuh), launched as GPUCore launches it: a thread
+//            per (baseline, product, channel), each reading both stations' FP32 spectra for
+//            every window
+//   tiled    FP32 on the CUDA cores, register-tiled: a thread per (channel, T x T block of
+//            receiver pairs), so that each value it loads is used T times
+//   tensor   FP16 in, FP32 accumulation on the tensor cores (WMMA 16 x 16 x 16), from a
+//            transposed copy of the spectra (per channel, blocks of 16 windows with the receivers
+//            as rows: TensorLayout), made by a transpose kernel that is timed separately
+#pragma once
+#include <cuda_fp16.h>
+#include "common.cuh"
+
+// The input: nant stations' spectra, [ant][win][band][fftchannels] FP32 complex, the first nchan
+// channels of each used (the fused kernel's output; fftchannels = 2 nchan for real data).  Bands
+// 2f and 2f+1 are the two polarisations, A and B, of frequency f.  A window invalid at a station
+// (valid[ant][win] false) must add nothing to its baselines: gpudifx's kernel skips it, the other
+// two take it to be zero, which the station processing would write (it knows the window is
+// invalid), so that they need not read the flags per sample.
+//
+// The output: visibilities [freq][baseline][product][nchan] FP32 complex, summed over the windows.
+// Baselines (a, b), a < b, in the order (0,1), (0,2), ..., (0,n-1), (1,2), ...; products
+// 0 (A,A), 1 (B,B), 2 (A,B), 3 (B,A), each X_a(pol1) conj(X_b(pol2)).  No autocorrelations yet.
+struct XmacShape {
+    int nant, nfreq, nchan, nwin, fftchannels;
+    __host__ __device__ int nband() const { return 2 * nfreq; }
+    __host__ __device__ int nbaseline() const { return nant * (nant - 1) / 2; }
+    __host__ __device__ int nrecv() const { return 2 * nant; }        // receivers: (station, pol)
+    __host__ __device__ size_t visCount() const { return (size_t)nfreq * nbaseline() * 4 * nchan; }
+    __host__ __device__ size_t visIndex(int f, int bl, int p, int c) const {
+        return (((size_t)f * nbaseline() + bl) * 4 + p) * nchan + c;
+    }
+    __host__ __device__ size_t specIndex(int ant, int win, int band, int c) const {
+        return (((size_t)ant * nwin + win) * nband() + band) * fftchannels + c;
+    }
+    // complex multiply-accumulates per subint (the work, for throughput figures)
+    double cmacs() const { return (double)nfreq * nchan * nwin * nbaseline() * 4; }
+};
+__host__ __device__ inline int baselineIndex(int a, int b, int nant) {      // a < b
+    return a * (2 * nant - a - 1) / 2 + (b - a - 1);
+}
+__host__ __device__ inline int productIndex(int pol1, int pol2) {
+    return pol1 == pol2 ? pol1 : 2 + pol1;
+}
+
+// The tensor version's input: per (freq, channel, block of 16 windows), two planes (real,
+// imaginary) of nrecv x 16 FP16 values, receiver r = 2 ant + pol on the rows, the 16 windows along
+// each row; windows past the subint are zero.  [freq][chan][tb][plane][nrecv][16].  The receivers
+// are not padded to the tensor cores' 16 rows: a block of 16 rows that runs past the last
+// receiver reads the next plane's rows (or the 16 rows of slack at the end of the buffer), whose
+// products only land in outputs that are discarded.  (Padding 20 receivers to 32 would make the
+// XMAC read 60% more.)
+struct TensorLayout {
+    int rows, ntb;
+    __host__ __device__ size_t index(const XmacShape& s, int f, int c, int tb, int plane, int r, int t) const {
+        return (((((size_t)f * s.nchan + c) * ntb + tb) * 2 + plane) * rows + r) * 16 + t;
+    }
+    size_t count(const XmacShape& s) const { return (size_t)s.nfreq * s.nchan * ntb * 2 * rows * 16 + 16 * 16; }
+};
+inline TensorLayout tensorLayout(const XmacShape& s) { return {s.nrecv(), (s.nwin + 15) / 16}; }
+
+// gpudifx's kernel, one launch per frequency as GPUCore makes them; vis is zeroed first.
+struct XmacGpudifx {
+    XmacShape s{};
+    int sms = 0;
+    // per-frequency launch metadata, as GPUCore::buildXmacPlans uploads it
+    const cuFloatComplex** m1 = nullptr, ** m2 = nullptr;     // [baseline] station spectra
+    const bool** v1 = nullptr, ** v2 = nullptr;               // [baseline] station valid flags
+    int* b1 = nullptr, * b2 = nullptr, * offsets = nullptr;    // [freq][baseline][product]
+    int* bandStride = nullptr, * windowStride = nullptr;      // [baseline]
+    void init(const XmacShape& shape, const cuFloatComplex* spectra, const bool* valid, int multiprocessors);
+    void run(cuFloatComplex* vis, cudaStream_t st) const;
+    void destroy();
+};
+
+// Both split the windows over several blocks when the baselines and channels alone would not fill
+// the GPU (as gpudifx's launch does), and add the partial sums atomically: vis is zeroed first.
+// The register-tiled FP32 version, 4 x 4 receiver pairs a thread.
+void xmacTiled(const XmacShape& s, const cuFloatComplex* spectra, cuFloatComplex* vis, int multiprocessors,
+               cudaStream_t st);
+
+// The tensor version: the transpose into TensorLayout (spectra -> h; the slack at its end must have
+// been zeroed once), then the tensor-core XMAC (h -> vis).
+void xmacTranspose(const XmacShape& s, const TensorLayout& L, const cuFloatComplex* spectra, __half* h,
+                   cudaStream_t st);
+void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFloatComplex* vis, int multiprocessors,
+                cudaStream_t st);
