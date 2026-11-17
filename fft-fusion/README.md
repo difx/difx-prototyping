@@ -771,6 +771,43 @@ quarter-length subints 1-4% more per ms of data.
   Next: the fused kernel writing it (16 windows of a band per block, transposed through shared
   memory on the way out), and the two stages together, in sequence and overlapped in chunks.
 
+### The XMAC stage: A100-SXM4-80GB (OzSTAR, gina9)
+
+`fusebench-ozstar.sbatch`, SLURM job 21055513, commit 8e7cb4b, all runs passing (`run-bench.sh` 38,
+`run-xmac.sh` 10, and the channel sweep); 10000 windows at every station count.  As for the 2070,
+ms per ms of data, 128 channels, with the station processing for context (2-bit, no window, from
+`run-bench.sh` in the same job at 10 stations, scaled by the number of stations: gpudifx 6.18 ms
+per 20 ms, the end-to-end kernel 1.50, the 2 kernels with an FP16 buffer 2.87; the scaling was
+measured on the 2070):
+
+| stations | station: gpudifx | station: end-to-end kernel | station: 2 kernels, FP16 | XMAC: gpudifx | XMAC: tiled | XMAC: tensor | transpose | XMAC: tensor + transpose |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 0.124 | 0.0301 | 0.0573 | 0.0427 | 0.0152 | 0.0065 | 0.0171 | 0.0234 |
+| 6 | 0.185 | 0.0451 | 0.0860 | 0.100 | 0.0225 | 0.0087 | 0.0265 | 0.0353 |
+| 10 | 0.309 | 0.0751 | 0.143 | 0.281 | 0.0506 | 0.0172 | 0.0432 | 0.0600 |
+| 16 | 0.495 | 0.120 | 0.229 | 0.708 | 0.121 | 0.0231 | 0.0656 | 0.0885 |
+| 24 | 0.742 | 0.180 | 0.344 | 1.52 | 0.263 | 0.0391 | 0.0983 | 0.136 |
+| 32 | 0.989 | 0.240 | 0.459 | 3.06 | 0.439 | 0.0579 | 0.131 | 0.187 |
+| 48 | 1.48 | 0.361 | 0.688 | 6.69 | 1.24 | 0.108 | 0.196 | 0.303 |
+| 64 | 1.98 | 0.481 | 0.917 | 12.5 | 2.53 | 0.183 | 0.260 | 0.441 |
+
+(1024 channels, 1000 windows: 10 stations 0.269 / 0.052 / 0.019; 32 stations 2.50 / 0.573 / 0.064.)
+
+- **gpudifx's XMAC** runs at 140-200 G complex multiply-accumulates per second (about 3 times the
+  2070): at 10 stations it costs nearly as much as gpudifx's own station processing and 3.7
+  times the end-to-end kernel, from 12 stations up more than both, and it keeps up with real time
+  to about 19 stations.
+- **The tiled FP32 kernel** runs at 0.4-1.2 T per second (about half the A100's FP32 peak): it
+  costs as much as the end-to-end station kernel at 16 stations and keeps up to about 45.
+- **The tensor kernel** runs at up to 11 T per second at 64 stations (about 30% of the A100's
+  FP16 tensor-core peak), 2-14 times the tiled kernel, more the more stations: 0.017 at 10
+  stations, a quarter of the end-to-end station kernel, and 0.18 at 64, still well under the
+  station processing (0.48).
+  With the tensor XMAC, the station processing is the larger cost at every station count here.
+- **The transpose costs 1.4-3.0 times the tensor XMAC**; even with it the tensor version beats
+  the tiled one from about 12 stations up.  Writing the tensor layout from the station kernel
+  remains the step that decides it.
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -859,6 +896,53 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   unless the XMAC keeps its accumulators on chip across chunks (a persistent producer/consumer
   design).  The tensor XMAC at small N: fewer wasted products (a 16 x 16 tile holds at most 8
   stations' pairs), autocorrelations in it.
+- **DiFX's flexibility in the tensor XMAC**: zoom bands (a channel range of a recorded band),
+  mixed bandwidths, channel counts that are not powers of two, stations that do not record every
+  frequency, single-polarisation stations, baselines not correlated, channel averaging.  The
+  tensor kernel itself need not see any of it: the channels are its batch dimension (each one an
+  independent X X^H), so their number is free, and the tensor cores only constrain the windows
+  (blocks of 16, padded with zeros) and the receivers (16-row tiles, the spare rows discarded).
+  The rest can be two tables, like the band indexes and result offsets gpudifx's XMAC takes now:
+  an input map for whatever writes the tensor layout (per correlated frequency and receiver: the
+  station's band and channel offset; a zoom band and a narrower band at another station are both
+  a channel range of a spectrum; stations without the frequency have no row), and an output map
+  for the XMAC's store (per frequency and receiver pair: the result offset, or none for a
+  baseline not wanted, whose products are computed anyway and dropped).  Channel averaging in the
+  store or a pass after it.  To show it in `xmacbench`: a "messy" configuration (per-frequency
+  station subsets, a zoom band at a channel offset, a subset of baselines, a non-power-of-two
+  channel count such as 1000) against the reference, and what the tables cost.  Still open:
+  pulsar binning (an accumulator set per bin, or a pass per bin, with the off-bin windows zero),
+  and FP16's range (65504): a strong tone in a long FFT can approach it, so the writer should
+  scale the spectra (free in the fractional-sample rotation), with a test with a strong tone; BF16
+  has the range but only 8 bits of mantissa.
+- **FFT lengths that are not powers of two.**  The main case is the EHT: ALMA's 62.5 MHz channels
+  need FFTs of N x 125 points to match the channel width of the other stations, which record
+  power-of-two bandwidths (so this is also mixed-bandwidth correlation, below).  cuFFTDx (MathDx
+  25.6) does some lengths directly and others only with Bluestein's algorithm, which needs a
+  workspace in global memory and several FFTs of a longer power-of-two length, and is capped at
+  a Bluestein length of 16384:
+
+  | points | sm_80 and sm_75 |
+  |---|---|
+  | 125, 500, 1000, 8000 | direct (25, 50, 10 and 20 elements per thread: 50 is a lot of registers) |
+  | 250, 2000, 4000 | Bluestein |
+  | 16000 | not available (its Bluestein length, 32768, is over the cap) |
+
+  (Other lengths: 400 direct; 640, 800, 1536, 1800, 3200, 6000 Bluestein.)  The fused kernel
+  rejects the workspace for now, and in places assumes the elements per thread divide the length
+  (true for the direct ones) and a multiple of 32 (`decode_to`).  To do: build and time the
+  N x 125 lengths against the neighbouring powers of two, direct and Bluestein; cuFFT (any
+  length, mixed radix) as the fallback in the 2-kernel pipeline where Bluestein costs too much
+  or is not available; and see whether other N x 125 decompositions (e.g. 2000 as a 2-stage
+  16 x 125) do better.
+- **Mixed-bandwidth correlation** (e.g. 32 MHz bands at one station, 128 MHz at another; ALMA's
+  62.5 MHz against 64 MHz or more elsewhere in the EHT): the channel width, so the FFT duration
+  and the window count, are the same at both, but the FFT lengths differ (4 times longer at the
+  128 MHz station), so each station gets its own fused-kernel size (it is launched per station
+  already), and the wide station's spectrum supplies a quarter of its channels to each of the
+  narrow station's bands (the input map above).  `fusebench` assumes
+  one shape for every station: per-station shapes, then the two stages together with mixed
+  bandwidths.  Mixed real and complex sampling works the same way.
 - **Two-stage channelisation for high spectral resolution** (say above 512 channels): a coarse
   first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
   second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes
