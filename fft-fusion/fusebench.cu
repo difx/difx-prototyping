@@ -338,6 +338,11 @@ static void usage() {
 "  --regcap R      registers capped (__launch_bounds__) to fit R threads per SM: 0 (default, no\n"
 "                  cap) | 1024 | 1536 (1, 2 and 4 FFTs per block only) | sweep (all three)\n"
 "  --batched       one launch for all antennas (one cuFFT plan; one fused kernel)\n"
+"  --xmac          packed input (2-bit, lean decode, dual pol, --invalid 0): also run the XMAC\n"
+"                  after the station processing: gpudifx's XMAC, the tiled FP32 one, the tensor-core\n"
+"                  one through the transpose, and the tensor-core one from the end-to-end kernel\n"
+"                  writing its layout directly (FP16); checked against each other, timed alone and\n"
+"                  each with the station processing\n"
 "  --chunk W       packed input: also run the end-to-end kernel and the 2-kernel pipelines W\n"
 "                  windows at a time, each antenna on its own stream (the antennas run together),\n"
 "                  each antenna's part of the 2-kernel buffer reused for every chunk, so that\n"
@@ -361,7 +366,7 @@ int main(int argc, char** argv) {
     AutoMode amode = AutoMode::NONE;
     Rotator rotator = Rotator::FIXED;
     int fpb = 0, ept = 0, regcap = 0, chunk = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
-    bool sweepEpt = false, sweepRegcap = false;
+    bool sweepEpt = false, sweepRegcap = false, xmac = false;
     unsigned long long seed = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -406,6 +411,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--batched") batched = true;
         else if (a == "--chunk") chunk = std::stoi(next());
+        else if (a == "--xmac") xmac = true;
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
@@ -428,6 +434,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (chunk < 0 || (chunk > 0 && !packed)) { fprintf(stderr, "--chunk W: W > 0, with --input packed\n"); return 2; }
+    if (xmac && (!packed || !lean || nbit != 2 || amode != AutoMode::NONE || g.nband % 2 || singlePol || invalidFrac > 0)) {
+        fprintf(stderr, "--xmac: with --input packed, --nbit 2, --decode lean, --autocorr none, dual polarisation "
+                "(even --nband) and --invalid 0\n");
+        return 2;
+    }
     if (packed && lean && nbit != 2 && amode != AutoMode::NONE) {
         fprintf(stderr, "--decode lean: the autocorrelations are compiled for 2 bits only (or use --decode direct)\n");
         return 2;
@@ -762,6 +773,68 @@ int main(int argc, char** argv) {
         cudaFree(dIn);
     }
 
+    // ---- --xmac: the XMAC stage after the station processing (xmac.cuh) ----
+    // outFused holds the end-to-end kernel's FP32 spectra here (the 2-kernel checks below reuse it).
+    const XmacShape xs{g.nant, g.nband / 2, g.nchan, g.nwin, g.fftchannels};
+    const TensorLayout xL = tensorLayout(xs);
+    __half *hDirect = nullptr, *hTrans = nullptr;
+    cuFloatComplex *visA = nullptr, *visB = nullptr;
+    XmacGpudifx gx;
+    TensorOut tout{};
+    const int sms = prop.multiProcessorCount;
+    auto runTensorStation = [&](const FusedVariant& v) {
+        launchFixedPhase(g, pF, st);
+        launchPackedSetup(g, pre.pk, st);
+        if (batched) v.launchTensor(g, pre, pF, tout, 0, g.nant, st);
+        else for (int a = 0; a < g.nant; a++) v.launchTensor(g, pre, pF, tout, a, 1, st);
+    };
+    if (xmac) {
+        if (!chosen->launchTensor) { fprintf(stderr, "--xmac: the chosen variant has no tensor-layout output (--regcap 0)\n"); return 2; }
+        hDirect = devAlloc<__half>(xL.count(xs));
+        hTrans = devAlloc<__half>(xL.count(xs));
+        CHECK_CUDA(cudaMemset(hDirect, 0, xL.count(xs) * sizeof(__half)));      // the slack at the end
+        CHECK_CUDA(cudaMemset(hTrans, 0, xL.count(xs) * sizeof(__half)));
+        visA = devAlloc<cuFloatComplex>(xs.visCount());
+        visB = devAlloc<cuFloatComplex>(xs.visCount());
+        int half = 0;                                         // scale 2^-floor(log2(N) / 2)
+        while ((2u << (2 * half + 1)) <= (unsigned)g.fftchannels) half++;
+        tout = {hDirect, xs, xL, ldexpf(1.f, -half)};
+        gx.init(xs, outFused, p.validSamples, sms);
+        printf("XMAC: %d baselines x 4 products, %d channels; tensor layout %.2f GiB (FP16, spectra scaled by 2^-%d)\n",
+               xs.nbaseline(), xs.nchan, xL.count(xs) * sizeof(__half) * gib, half);
+        runTensorStation(*chosen);
+        xmacTranspose(xs, xL, outFused, hTrans, st);
+        CHECK_CUDA(cudaStreamSynchronize(st));
+        std::vector<cuFloatComplex> va(xs.visCount()), vb(xs.visCount());
+        auto visDiff = [&](const char* name, double scaleA, double tol) {
+            CHECK_CUDA(cudaStreamSynchronize(st));
+            CHECK_CUDA(cudaMemcpy(va.data(), visA, va.size() * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(vb.data(), visB, vb.size() * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+            double d2 = 0, r2 = 0, dmax = 0;
+            for (size_t i = 0; i < va.size(); i++) {
+                const double dx = va[i].x * scaleA - vb[i].x, dy = va[i].y * scaleA - vb[i].y;
+                d2 += dx * dx + dy * dy;
+                r2 += (double)vb[i].x * vb[i].x + (double)vb[i].y * vb[i].y;
+                dmax = std::max(dmax, sqrt(dx * dx + dy * dy));
+            }
+            const double rref = sqrt(r2 / va.size()), rms = sqrt(d2 / va.size()) / rref, mx = dmax / rref;
+            const bool ok = std::isfinite(rms) && rms < tol && mx < 30 * tol;
+            pass &= ok;
+            printf("check: %s: rms %.2e, max %.2e (relative to rms; limits %.0e, %.0e)  %s\n", name, rms, mx, tol,
+                   30 * tol, ok ? "OK" : "FAIL");
+        };
+        const double unscale = 1.0 / ((double)tout.scale * tout.scale);
+        // the same FP16 values up to the power-of-two scale: the same visibilities
+        xmacTensor(xs, xL, hDirect, visA, sms, st);
+        xmacTensor(xs, xL, hTrans, visB, sms, st);
+        visDiff("XMAC tensor, layout from the end-to-end kernel vs through the transpose", unscale, 1e-5);
+        // against FP32: FP16 rounding of the spectra
+        gx.run(visB, st);
+        visDiff("XMAC tensor, layout from the end-to-end kernel vs gpudifx's XMAC (FP32)", unscale, 1e-3);
+        xmacTiled(xs, outFused, visA, sms, st);
+        visDiff("XMAC tiled vs gpudifx's XMAC", 1.0, 1e-5);
+    }
+
     // ---- packed input: the two-kernel pipeline (decode + fringe -> buffer -> fused FFT) ----
     // the buffer is FP16 or FP32; its first stage is either the fixed-point decode or (no window)
     // gpudifx's own kernel; the fused FFT kernel is the chosen variant, writing to outFused
@@ -939,6 +1012,8 @@ int main(int argc, char** argv) {
          timeIt([&] {
         if (doAuto) CHECK_CUDA(cudaMemsetAsync(autoUnfused, 0, nauto * sizeof(cuFloatComplex), st));
         unf.runFrac(pU, amode, rotator, outUnfused, st); }, warmup, reps, st), 0);
+    const FusedVariant* bestFused = chosen;      // the fastest variant timed (for --xmac)
+    double bestFusedMs = 1e30;
     for (const auto& v : variants) {
         if (!sweep && v.fpb != chosen->fpb) continue;
         if (!sweepEpt && v.ept != chosen->ept) continue;
@@ -946,6 +1021,7 @@ int main(int argc, char** argv) {
         char name[112];
         bool crossInKernel = false;
         const Timing t = timeIt([&] { crossInKernel = runFused(v); }, warmup, reps, st);
+        if (t.median < bestFusedMs) { bestFusedMs = t.median; bestFused = &v; }
         char cap[16] = "";
         if (v.regcap) snprintf(cap, sizeof cap, " cap%u", v.regcap);
         snprintf(name, sizeof name, "fused, %u FFT/block, %u/thr%s%s (%u thr, %u B, %d reg)", v.fpb, v.ept, cap,
@@ -965,6 +1041,41 @@ int main(int argc, char** argv) {
     }
     for (const auto& c : chunked)
         line(c.name.c_str(), timeIt([&] { runChunked(c); }, warmup, reps, st), tU.median);
+    if (xmac) {
+        // the tensor-layout output in every variant timed above that has it; the combined lines use
+        // the fastest of each kind (FP32 spectra, tensor layout)
+        const FusedVariant* bestTensor = nullptr;
+        double bestTensorMs = 1e30;
+        for (const auto& v : variants) {
+            if (!v.launchTensor) continue;
+            if (!sweep && v.fpb != chosen->fpb) continue;
+            if (!sweepEpt && v.ept != chosen->ept) continue;
+            const Timing t = timeIt([&] { runTensorStation(v); }, warmup, reps, st);
+            char name[112];
+            snprintf(name, sizeof name, "end-to-end -> tensor layout, %u FFT/block, %u/thr (%d reg)", v.fpb, v.ept,
+                     fusedLastRegisters);
+            line(name, t, tU.median);
+            if (t.median < bestTensorMs) { bestTensorMs = t.median; bestTensor = &v; }
+        }
+        printf("  (the combined lines below: FP32 spectra from %u FFT/block, %u/thr%s; the tensor layout from %u "
+               "FFT/block, %u/thr)\n", bestFused->fpb, bestFused->ept, bestFused->regcap ? " (capped)" : "",
+               bestTensor->fpb, bestTensor->ept);
+        line("XMAC: gpudifx (FP32 spectra)", timeIt([&] { gx.run(visA, st); }, warmup, reps, st), 0);
+        line("XMAC: tiled (FP32 spectra)", timeIt([&] { xmacTiled(xs, outFused, visA, sms, st); }, warmup, reps, st), 0);
+        line("XMAC: transpose", timeIt([&] { xmacTranspose(xs, xL, outFused, hTrans, st); }, warmup, reps, st), 0);
+        line("XMAC: tensor", timeIt([&] { xmacTensor(xs, xL, hDirect, visA, sms, st); }, warmup, reps, st), 0);
+        line(rotator == Rotator::DOUBLE ? "station + XMAC: gpudifx today (both)" : "station + XMAC: unfused + gpudifx XMAC",
+             timeIt([&] { runUnfused(); gx.run(visA, st); }, warmup, reps, st), 0);
+        line("station + XMAC: end-to-end + gpudifx XMAC", timeIt([&] { runFused(*bestFused); gx.run(visA, st); },
+                                                                 warmup, reps, st), 0);
+        line("station + XMAC: end-to-end + tiled", timeIt([&] {
+            runFused(*bestFused); xmacTiled(xs, outFused, visA, sms, st); }, warmup, reps, st), 0);
+        line("station + XMAC: end-to-end + transpose + tensor", timeIt([&] {
+            runFused(*bestFused); xmacTranspose(xs, xL, outFused, hTrans, st); xmacTensor(xs, xL, hTrans, visA, sms, st); },
+            warmup, reps, st), 0);
+        line("station + XMAC: end-to-end -> tensor layout + tensor", timeIt([&] {
+            runTensorStation(*bestTensor); xmacTensor(xs, xL, hDirect, visA, sms, st); }, warmup, reps, st), 0);
+    }
     printf("  (fused: FFTs per block, FFT elements per thread, threads and shared memory per block; * cuFFTDx's\n"
            "   suggestion; speed-up is unfused / fused. The 2-kernel lines use the variant --fpb and --ept select)\n");
 

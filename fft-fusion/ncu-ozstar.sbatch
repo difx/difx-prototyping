@@ -135,6 +135,13 @@ profile c1024-fused-fp32           fused_fft_frac "${C1024[@]}"
 profile c1024-packed-wola          fused_fft_frac "${C1024[@]}" --input packed --wola
 profile c1024-packed-wola-ept-half fused_fft_frac "${C1024[@]}" --input packed --wola --ept half
 profile c1024-packed-wola-cap1024  fused_fft_frac "${C1024[@]}" --input packed --wola --regcap 1024
+# the end-to-end kernel writing the tensor-core XMAC's layout (fusebench --xmac), at the variants
+# fastest on the 2070, and the XMAC kernels (10 stations, from the same run)
+profile c128-tensor-out-fpb16      fused_fft_tensor "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
+profile c1024-tensor-out-fpb4      fused_fft_tensor "${C1024[@]}" --input packed --xmac --fpb 4 --ept 16
+profile c128-xmac-tensor           xmac_tensor_kernel "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
+profile c128-xmac-tiled            xmac_tiled_kernel "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
+profile c128-xmac-gpudifx          gpu_fuse_xmac_and_average "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
 
 tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"

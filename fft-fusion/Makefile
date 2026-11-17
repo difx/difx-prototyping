@@ -81,13 +81,13 @@ endif
 
 all: fusebench xmacbench
 
-fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(FUSED_OBJ)
+fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(BUILD)/xmac.o $(FUSED_OBJ)
 	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
 
-$(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD) $(MATHDX_DEP)
+$(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD) $(MATHDX_DEP)
 	$(NVCC) $(FLAGS) -I$(MATHDX)/include -c $< -o $@
 
-$(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD)
+$(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
 # the XMAC stage on its own (xmac.cuh)
@@ -100,7 +100,7 @@ $(BUILD)/xmacbench.o: xmacbench.cu xmac.cuh common.cuh | $(BUILD)
 $(BUILD)/xmac.o: xmac.cu xmac.cuh xmac_copy.cuh common.cuh | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
-$(BUILD)/fused_%.o: fused_inst.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh | $(BUILD) $(MATHDX_DEP)
+$(BUILD)/fused_%.o: fused_inst.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD) $(MATHDX_DEP)
 	$(NVCC) $(FLAGS) $(DXFLAGS) -DFUSE_N=$* -c $< -o $@
 
 $(BUILD):

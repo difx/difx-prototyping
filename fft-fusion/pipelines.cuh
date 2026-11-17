@@ -3,6 +3,7 @@
 #include <map>
 #include <vector>
 #include "stages.cuh"
+#include "xmac.cuh"
 
 // Fills p.fixedPhase for FracRotateFixed: one thread per (antenna, window, band).
 void launchFixedPhase(const Geometry& g, const FracParams& p, cudaStream_t st);
@@ -44,6 +45,19 @@ struct Unfused {
 // FP32 FFT whatever the input precision; FP32 output.  Writes only the nchan channels the
 // correlator uses; for real-sampled data the unused upper half of each spectrum is not written
 // (cuFFT writes it in the unfused pipeline; mpifxcorr's XMAC never reads it).
+// The fused kernel's other output (FusedVariant::launchTensor): the tensor-core XMAC's input layout
+// (xmac.cuh), FP16, written directly instead of the FP32 spectra.  Each block takes FFTs-per-block
+// consecutive windows of one (antenna, band) and writes, per channel and plane, their values as one
+// contiguous run.  Bands 2f and 2f+1 are the polarisations of frequency f (receiver 2 ant + pol).
+// Invalid windows are written as zeros.  The values are multiplied by scale (a power of two, about
+// 1 / sqrt(FFT length), to keep FP16 well inside its range), so the visibilities by scale^2.
+struct TensorOut {
+    __half* h;
+    XmacShape s;
+    TensorLayout L;
+    float scale;
+};
+
 struct FusedVariant {
     unsigned fpb;          // FFTs per block
     unsigned ept;          // elements per thread
@@ -55,6 +69,10 @@ struct FusedVariant {
     // the kernel also formed the cross-pol products (p.crossPolInBlock, even FFTs per block)
     bool (*launch)(const Geometry& g, const PreVariant& pre, const FracParams& p, bool doAutocorr,
                    cuFloatComplex* out, int ant0, int nant, cudaStream_t st);
+    // the same writing TensorOut (after launchFixedPhase and launchPackedSetup); compiled for the
+    // 2-bit lean decode, no autocorrelations, uncapped variants only (else nullptr)
+    void (*launchTensor)(const Geometry& g, const PreVariant& pre, const FracParams& p, const TensorOut& out,
+                         int ant0, int nant, cudaStream_t st);
 };
 // registers per thread of the last fused kernel launched (for the report)
 extern int fusedLastRegisters;

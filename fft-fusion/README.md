@@ -99,7 +99,9 @@ The main options:
   --window vorbis`; a `--window` given as well takes precedence);
 - `--rotator`, `--autocorr`, `--fpb N|sweep` (FFTs per block of the fused kernel, default
   cuFFTDx's suggestion), `--batched` (one launch for all antennas), `--invalid F` (flag a
-  fraction of the windows).
+  fraction of the windows);
+- `--xmac` (packed 2-bit input, lean decode, dual polarisation): the XMAC after the station
+  processing, including the end-to-end kernel writing the tensor XMAC's layout itself.
 
 ### Checks
 
@@ -768,8 +770,7 @@ quarter-length subints 1-4% more per ms of data.
   the transpose costs more than the tensor XMAC itself (it reads the FP32 spectra and writes the
   FP16 copy).  Written directly by the fused kernel, the layout would also halve the fused
   kernel's output (FP16).
-  Next: the fused kernel writing it (16 windows of a band per block, transposed through shared
-  memory on the way out), and the two stages together, in sequence and overlapped in chunks.
+  The fused kernel writing it, and the two stages together: see "The whole chain" below.
 
 ### The XMAC stage: A100-SXM4-80GB (OzSTAR, gina9)
 
@@ -807,6 +808,70 @@ measured on the 2070):
 - **The transpose costs 1.4-3.0 times the tensor XMAC**; even with it the tensor version beats
   the tiled one from about 12 stations up.  Writing the tensor layout from the station kernel
   remains the step that decides it.
+
+### The whole chain, station processing + XMAC: RTX 2070 SUPER
+
+`fusebench --xmac` runs the XMAC after the station processing from 2-bit packed data (no window),
+in sequence on one stream, with a fifth way in: the end-to-end kernel **writing the tensor XMAC's
+layout itself** (`fused_fft_tensor` in `fused_inst.cu`), FP16, instead of its FP32 spectra.  A
+block takes W consecutive windows of one (antenna, band), FFTs-per-block at a time, puts each
+pass's channels into a shared-memory tile [plane][channel][window] (rows padded by one 32-bit
+word against bank conflicts), then writes each channel's run of W windows with 16-byte stores.
+W is 16 when the FFT's shared memory and the tile fit in a block, else 8, else FFTs per block.
+The spectra are scaled by 2^-floor(log2(N) / 2) on the way to FP16 (N the FFT length), the
+visibilities by its square.  Checks: the XMAC from the kernel's layout matches the XMAC through
+the transpose to 1-2e-9 rms (the same FP16 values), and gpudifx's FP32 XMAC to 3e-4 rms.
+
+Three things decided its cost (128 channels, 10 stations; the end-to-end kernel alone 4.06 ms):
+- **Block order.**  With the band slowest in the launch, the blocks of one window group's 8 bands,
+  which read the same packed bytes, ran far apart, and the packed data was read from DRAM 6.6
+  times over (52.9 MB instead of 8.0): 15.2 ms.  Band fastest: 4.95 ms.
+- **The stores.**  Padding the tile rows split the 16-byte global stores into four 4-byte ones
+  (6.2 ms); `__stcg` of one `uint4` built from four 32-bit shared loads restores them: 4.79 ms.
+- **FFTs per block**: 16 is best at 128 channels (4.89 ms; 5.81 at 8, 5.47 at 32, 12.9 at 1),
+  4 at 1024 (6.43 ms).
+
+`run-xmac.sh` (`results-local/ar313-adeller-xmac-20261117-171357`, `chain.txt`): ms per ms of
+data, the fastest variant of each kind (`--fpb sweep --ept sweep`; the station kernel's variant
+for FP32 spectra and for the tensor layout chosen separately).  gpudifx today: its station
+processing (FP64 phases) and its XMAC.  10000 windows (2500 at 16 and 32 stations), 1000 at 1024
+channels:
+
+| channels | stations | gpudifx today | end-to-end + gpudifx XMAC | end-to-end + tiled | end-to-end + transpose + tensor | end-to-end writing the layout + tensor |
+|---|---|---|---|---|---|---|
+| 128 | 4 | 0.733 | 0.184 | 0.121 | 0.172 | **0.118** |
+| 128 | 10 | 2.30 | 0.926 | 0.370 | 0.458 | **0.307** |
+| 128 | 16 | 4.25 | 2.09 | 0.662 | 0.724 | **0.506** |
+| 128 | 32 | 15.8 | 11.4 | 3.19 | 1.58 | **1.17** |
+| 1024 | 10 | 2.15 | 0.914 | **0.435** | 0.497 | 0.462 |
+
+Each combined time is the sum of its parts to 2%.  At 10 stations, ms per subint:
+
+| | 128 channels (20 ms) | 1024 channels (16 ms) |
+|---|---|---|
+| end-to-end kernel, FP32 spectra | 4.06 | 3.92 |
+| end-to-end kernel writing the tensor layout | 4.89 (+0.83) | 6.43 (+2.51) |
+| transpose | 3.97 | 3.19 |
+| XMAC: tiled / tensor | 3.26 / 1.11 | 3.13 / 0.92 |
+
+- **Writing the layout beats the transpose at every shape**, by a lot at 128 channels (it adds
+  0.83 ms to the station kernel and saves the 3.97 ms transpose), by 7% at 1024 (it adds 2.5 ms).
+  With it the tensor path is the fastest chain at 128 channels from 4 stations up (a tie at 4,
+  17% ahead of tiled at 10, 63% at 32), and 7.5 times gpudifx today at 10 stations.
+- **At 1024 channels and 10 stations the tiled FP32 XMAC is still the fastest chain** (6% ahead).
+  Likely the 2070's shared memory: at 2048 points the FFT's shared memory (32 KB at 4 FFTs per
+  block) and the tile for 16 windows (72 KB), or even 8 (40 KB), do not fit in sm_75's 64 KB a
+  block, so the fastest variant writes runs of 4 windows (8-byte stores, a quarter of a sector).
+  The A100 (163 KB a block) fits the 16-window tile; `ncu-ozstar.sbatch` profiles both shapes.
+- Transpose + tensor is behind tiled at 10 stations on the 2070 (24% at 128 channels, 14% at
+  1024), because the transpose alone costs more than the tiled XMAC here; in the chain it is
+  still behind at 16 stations (9%) and well ahead at 32.
+- **The tiled XMAC slows more than in proportion to the subint length**: at 16 stations (128
+  channels) `xmacbench` takes 1.52 ms for 2500 windows but 12.3 ms for 10000, 8 times the time
+  for 4 times the data, while the transpose and the tensor XMAC scale with the windows.  So the
+  tiled column of the XMAC table above (10000 windows up to 16 stations) is probably pessimistic,
+  and where the tensor path overtakes the tiled one depends on the windows per subint.  Not yet
+  understood (open items).
 
 ### Window design
 
@@ -884,12 +949,12 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample
   correction.  cuFFTDx's shared-memory exchange (bank conflicts; the main stall on the 2070).
-- **The XMAC with the station processing** (`xmacbench` has the XMAC on its own): the fused
-  kernel writing the tensor layout directly (FP16; 16 windows of a band per block, transposed
-  through shared memory on the way out) and what that costs it; then the two stages in sequence
-  and overlapped in chunks, against the number of stations.  Chunking all antennas a range of
-  windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read and
-  write its accumulators once per chunk. With N stations, B bands, C channels and W windows per
+- **The XMAC with the station processing**: the end-to-end kernel writing the tensor layout is
+  done and measured on the 2070 ("The whole chain" above); next the same on the A100 (where the
+  16-window tile fits at 1024 channels), and the two stages overlapped in chunks, against the
+  number of stations.  Chunking all antennas a range of windows at a time keeps a chunk's
+  spectra in L2 for the XMAC, but the XMAC must then read and write its accumulators once per
+  chunk. With N stations, B bands, C channels and W windows per
   chunk, accumulator traffic over spectrum traffic is about 2N / W (FP16 spectra, FP32
   accumulators), and with W set by the L2 size, about 8 N^2 B C / L2: 1 at N ~ 70 for B C = 1024
   on the A100 (40 MB), at N ~ 17 for B C = 16384. Beyond that chunking costs more than it saves,
@@ -943,11 +1008,25 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   narrow station's bands (the input map above).  `fusebench` assumes
   one shape for every station: per-station shapes, then the two stages together with mixed
   bandwidths.  Mixed real and complex sampling works the same way.
+- **The tiled XMAC's cost against the subint length** (above): 8 times the time for 4 times
+  the windows at 16 stations on the 2070.  Sweep the windows at fixed stations, profile the
+  long case (DRAM traffic, TLB: the spectra are 2.4 GiB at 10000 windows), fix it or explain it,
+  and redo the tiled-against-tensor comparisons at a realistic subint length.
+- **More channel counts for the whole chain** (`fusebench --xmac`, `run-xmac.sh`): so far only
+  128 and 1024.  Writing the tensor layout costs the end-to-end kernel 20% at 128 channels but
+  64% at 1024 on the 2070 (shared memory: the tile for W windows grows with the channel count, so
+  W falls and the stores shrink), and that cost decides whether the tensor path beats the tiled
+  FP32 XMAC.  Sweep 64 to 16384 channels on both GPUs to find where the direct layout stops
+  paying, and how that moves with the GPU's shared memory.  This bears on two-stage
+  channelisation (next item): a second stage of short FFTs could write the layout with the
+  small tiles of a short FFT whatever the total channel count, so the sweep also says at what
+  channel count a two-stage design gains on the XMAC side as well as on the FFT side.
 - **Two-stage channelisation for high spectral resolution** (say above 512 channels): a coarse
   first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
   second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes
   inaccurate with very long windows and high fringe rates), and two short FFTs may be faster
-  than one long one (see the channel-count table). The first stage is the question: a WOLA FFT
+  than one long one (see the channel-count table), and short second-stage FFTs keep the
+  tensor-layout tile small (see the item above). The first stage is the question: a WOLA FFT
   risks artefacts at the coarse channel edges, a PFB costs complexity and computation.
 - Two kernels with WOLA through a series buffer (each sample decoded, rotated and stored once,
   as `--layout series`) rather than a buffer per window, which repeats the 12.5% overlap. That

@@ -9,9 +9,13 @@
 # data), for 4 ... 64 stations; and 1024 channels, 1000 windows (16 ms) for 10 and 32 stations.
 # On a GPU with less than 40 GB the larger station counts use 4000 windows (the times per ms of
 # data still compare).  Each run: gpudifx's XMAC kernel, the register-tiled FP32 kernel, and the
-# tensor-core kernel with the transpose into its layout (timed separately).  Logs go to
-# results-local/<host>-xmac-<stamp>/, with table.txt the summary: ms per subint and ms per ms of
-# data (below 1: faster than real time).
+# tensor-core kernel with the transpose into its layout (timed separately).  Then the whole chain
+# (fusebench --xmac: the station processing from 2-bit packed data, no window, and the XMAC) for
+# 4 ... 64 stations at 128 channels and 10 and 32 at 1024: gpudifx today (both stages), and the
+# end-to-end kernel followed by gpudifx's XMAC, the tiled one, the transpose and the tensor one, or
+# writing the tensor layout itself (the fastest variant of each kind).  Logs go to
+# results-local/<host>-xmac-<stamp>/, with table.txt (the XMAC alone) and chain.txt (the whole
+# chain) the summaries: ms per subint and ms per ms of data (below 1: faster than real time).
 
 set -u
 cd "$(dirname "$0")"
@@ -52,7 +56,40 @@ for nant in 4 6 10 16 24 32 48 64; do
 done
 run 1024 10 1000
 run 1024 32 1000
+
+# the whole chain: station processing + XMAC (fusebench --xmac), ms per ms of data
+printf "%-6s %-5s %6s %9s %10s %10s %10s %12s %12s\n" nchan nant nwin subint_ms gpudifx e2e+gdx e2e+tiled \
+    e2e+tr+tens "e2e>tens+tens" > "$OUT/chain.txt"
+chain() {   # chain <nchan> <nant> <nwin>
+    local name="chain-nchan$1-nant$2"
+    [ -x ./fusebench ] || { echo "no fusebench: skipping the chain runs"; return; }
+    ./fusebench --input packed --xmac --rotator double --fpb sweep --ept sweep --check 4 --nchan "$1" --nant "$2" \
+        --nwin "$3" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
+    local rc=$?
+    [ $rc = 0 ] || { fail=1; echo "$name: exit $rc, see $OUT/$name.log"; }
+    awk -v nchan="$1" -v nant="$2" -v nwin="$3" '
+        / -> subint / { for (i = 1; i <= NF; i++) if ($i == "subint") sub_ms = $(i + 1) }
+        function t(line) { match(line, /[0-9.]+ +\[/); return substr(line, RSTART, RLENGTH) + 0 }
+        /station \+ XMAC: gpudifx today/ { a = t($0) }
+        /station \+ XMAC: end-to-end \+ gpudifx XMAC/ { b = t($0) }
+        /station \+ XMAC: end-to-end \+ tiled/ { c = t($0) }
+        /station \+ XMAC: end-to-end \+ transpose \+ tensor/ { d = t($0) }
+        /station \+ XMAC: end-to-end -> tensor layout \+ tensor/ { e = t($0) }
+        END { if (sub_ms > 0) printf "%-6s %-5s %6s %9s %10.4f %10.4f %10.4f %12.4f %12.4f\n", nchan, nant, nwin, sub_ms,
+                  a / sub_ms, b / sub_ms, c / sub_ms, d / sub_ms, e / sub_ms }' "$OUT/$name.log" >> "$OUT/chain.txt"
+    tail -1 "$OUT/chain.txt"
+}
+for nant in 4 10 16 32 64; do
+    nwin=10000
+    [ "$MEM" -lt 40000 ] && [ $nant -gt 10 ] && nwin=2500
+    [ "$MEM" -lt 40000 ] && [ $nant -gt 32 ] && continue
+    chain 128 $nant $nwin
+done
+chain 1024 10 1000
+[ "$MEM" -lt 40000 ] || chain 1024 32 1000
 echo
 cat "$OUT/table.txt"
-echo "Results in $OUT (table.txt)"
+echo
+cat "$OUT/chain.txt"
+echo "Results in $OUT (table.txt, chain.txt)"
 [ $fail = 0 ] || { echo "SOME RUNS FAILED: see the logs" >&2; exit 1; }
