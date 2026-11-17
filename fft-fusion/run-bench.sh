@@ -16,8 +16,11 @@
 #   packed-*       from the packed data (2-bit VDIF): decode + fringe rotation as well. The
 #                  unfused pipeline is gpudifx today (its decode kernel and mpifxcorr's rotation,
 #                  FP64 phases; fixed-point with --wola, which gpudifx's decode cannot do); the
-#                  fused kernel does everything, with direct and with tiled decode; the 2-kernel
-#                  lines are decode + fringe into an FP16 or FP32 buffer, then the fused FFT
+#                  fused kernel does everything; the 2-kernel lines are decode + fringe into an
+#                  FP16 or FP32 buffer, then the fused FFT.  The decode is the lean one (per-window
+#                  work once per thread, bits per sample fixed at compile time); the *-direct runs
+#                  repeat two of them with gpudifx's per-sample decode arithmetic, for comparison
+#   packed-wola-nbit<N>  the same with 1-, 4- and 8-bit samples (2 bits: packed-wola)
 #   *-chunk<W>     the packed-data pipelines W windows at a time, each antenna on its own
 #                  stream, each antenna's part of the 2-kernel buffer reused for every chunk
 #                  (--chunk): all antennas' chunks in flight at once, 84, 21, 10.5, 5.2 and
@@ -62,8 +65,12 @@ for shape in "c128:--nchan 128 --nwin 10000:1024 256 128 64 32" "c1024:--nchan 1
     run "$tag-wola-fp16"       "${opts[@]}" --wola --input fp16 --fpb sweep --ept sweep --regcap sweep
     run "$tag-wola-fp16-hop75" "${opts[@]}" --wola --overlap 0.25 --input fp16 --ept sweep
     run "$tag-packed"          "${opts[@]}" --input packed --rotator double --fpb sweep --ept sweep
-    run "$tag-packed-tiled"    "${opts[@]}" --input packed --decode tiled --fpb sweep --ept sweep
+    run "$tag-packed-direct"   "${opts[@]}" --input packed --decode direct --fpb sweep --ept sweep
     run "$tag-packed-wola"     "${opts[@]}" --input packed --wola --fpb sweep --ept sweep --regcap sweep
+    run "$tag-packed-wola-direct" "${opts[@]}" --input packed --wola --decode direct --fpb sweep --ept sweep --regcap sweep
+    for nb in 1 4 8; do
+        run "$tag-packed-wola-nbit$nb" "${opts[@]}" --input packed --wola --nbit $nb --fpb sweep --ept sweep --regcap sweep
+    done
     run "$tag-packed-wola-ept-half" "${opts[@]}" --input packed --wola --ept half
     for w in "${chunks[@]}"; do
         run "$tag-packed-wola-chunk$w" "${opts[@]}" --input packed --wola --ept half --chunk $w --check 4

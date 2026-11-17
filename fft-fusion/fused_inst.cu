@@ -30,9 +30,10 @@ using FFTn = decltype(FFTBase() + ElementsPerThread<E>() + FFTsPerBlock<FPB>());
 // Thread (x, y) holds elements x, x + stride, x + 2 stride, ... of spectrum y, before and after
 // the FFT (natural order), which keeps the global loads and stores coalesced.
 // Pre is the pre-FFT stage (PreLoad: FP32 or FP16 storage, optional window and overlap, converted
-// to FP32 on load; PreDecode: from the packed data, decode.cuh); the FFT is FP32.  A staged Pre
-// (tiled PreDecode) first fills shared memory with the whole block, before the FFT uses it.  Post
-// is the post-FFT stage (FracRotateFixed, stages.cuh).
+// to FP32 on load; PreDecode, PreDecodeLean: from the packed data, decode.cuh), prepared once per
+// thread (all of a thread's samples belong to one spectrum); the FFT is FP32.  Post is the
+// post-FFT stage (FracRotateFixed, stages.cuh).  The launch has fewer than 2^32 spectra
+// (fusebench checks), so the index arithmetic is 32-bit.
 //
 // With CROSSPOL the cross-pol autocorrelations are formed here too: bands 2f and 2f+1 of a window
 // are spectra y and y+1 of the same block (band fastest, even nband, even FFTs per block), and
@@ -44,32 +45,28 @@ __device__ __forceinline__ void fusedBody(const Geometry& g, const Pre& pre, con
     extern __shared__ __align__(alignof(float4)) unsigned char smem[];
     constexpr unsigned N = size_of<FFT>::value;
 
-    const unsigned long long f = (unsigned long long)blockIdx.x * FFT::ffts_per_block + threadIdx.y;
+    const unsigned f = blockIdx.x * FFT::ffts_per_block + threadIdx.y;
     const bool active = f < nfft;     // the last block may be partly empty; all threads must
     int ant = ant0, win = 0, band = 0; // still take part in execute(), which synchronises
     if (active) {
-        band = f % g.nband;
-        const unsigned long long t = f / g.nband;
-        win = t % g.nwin;
-        ant = ant0 + (int)(t / g.nwin);
+        band = f % (unsigned)g.nband;
+        const unsigned t = f / (unsigned)g.nband;
+        win = t % (unsigned)g.nwin;
+        ant = ant0 + (int)(t / (unsigned)g.nwin);
     }
 
-    float* tile = reinterpret_cast<float*>(smem);
-    if constexpr (Pre::staged) {
-        pre.stage(g, ant0, (unsigned long long)blockIdx.x * FFT::ffts_per_block, nfft, N, FFT::ffts_per_block, tile);
-        __syncthreads();
-    }
+    // thread x holds samples x, x + stride, ...: all N of them, one per (x, i), so that only the
+    // last block's spare spectra need a test (once per thread, not per sample)
+    static_assert(FFT::stride * FFT::input_ept == N, "a thread's samples cover the FFT exactly");
     complex_type td[FFT::storage_size];
+    if (active) {
+        typename Pre::State st = pre.prepare(g, ant, win, band, threadIdx.x, FFT::stride);
 #pragma unroll
-    for (unsigned i = 0; i < FFT::input_ept; i++) {
-        const unsigned s = threadIdx.x + i * FFT::stride;
-        if (active && s < N) {
-            const cuFloatComplex v = pre.load(g, ant, win, band, s, threadIdx.y, N, FFT::ffts_per_block, tile);
+        for (unsigned i = 0; i < FFT::input_ept; i++) {
+            const cuFloatComplex v = pre.at(st, g, ant, win, band, threadIdx.x + i * FFT::stride);
             td[i] = complex_type{v.x, v.y};
         }
     }
-    if constexpr (Pre::staged)
-        __syncthreads();                    // the FFT reuses the tile's shared memory
 
     FFT().execute(td, smem);
 
@@ -145,9 +142,7 @@ static void launchKernel(const Geometry& g, const Pre& pre, const FracParams& p,
         else                       return fused_fft_frac_capped<FFT, Pre, Post, CROSSPOL, REGCAP>;
     }();
     constexpr unsigned xsBytes = CROSSPOL ? FFT::max_threads_per_block * sizeof(cuFloatComplex) : 0;
-    constexpr unsigned tileBytes = Pre::tileBytes(size_of<FFT>::value, FFT::ffts_per_block);
-    constexpr unsigned smem0 = FFT::shared_memory_size > xsBytes ? FFT::shared_memory_size : xsBytes;
-    constexpr unsigned smemBytes = smem0 > tileBytes ? smem0 : tileBytes;
+    constexpr unsigned smemBytes = FFT::shared_memory_size > xsBytes ? FFT::shared_memory_size : xsBytes;
     static int regs = -1;
     if (regs < 0) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
@@ -184,8 +179,14 @@ static bool launchVariant(const Geometry& g, const PreVariant& pre, const FracPa
     bool crossDone = false;
     withPre(pre, [&](auto stage) {
         using Pre = decltype(stage);
-        if (doAutocorr) crossDone = launchOne<FFT, Pre, FracRotateFixed<true>, REGCAP>(g, stage, p, out, ant0, nant, st);
-        else            crossDone = launchOne<FFT, Pre, FracRotateFixed<false>, REGCAP>(g, stage, p, out, ant0, nant, st);
+        if (!doAutocorr)
+            crossDone = launchOne<FFT, Pre, FracRotateFixed<false>, REGCAP>(g, stage, p, out, ant0, nant, st);
+        else if constexpr (Pre::withAutocorr)
+            crossDone = launchOne<FFT, Pre, FracRotateFixed<true>, REGCAP>(g, stage, p, out, ant0, nant, st);
+        else {
+            fprintf(stderr, "this pre-FFT stage is not compiled with the autocorrelations\n");
+            exit(2);
+        }
     });
     return crossDone;
 }

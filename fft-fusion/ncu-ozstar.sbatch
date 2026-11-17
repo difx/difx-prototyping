@@ -118,9 +118,13 @@ profile c128-fused-fp32            fused_fft_frac "${C128[@]}"
 profile c128-rotation-streaming    post_kernel    "${C128[@]}"
 profile c128-fused-fp16-wola       fused_fft_frac "${C128[@]}" --input fp16 --wola
 profile c128-fused-fp16-wola-ept-half fused_fft_frac "${C128[@]}" --input fp16 --wola --ept half
-# the end-to-end kernel from the packed data, at both elements-per-thread settings
+# the end-to-end kernel from the packed data, at both elements-per-thread settings (the lean
+# decode, fusebench's default; job 21038155 has the same profiles with gpudifx's per-sample
+# decode arithmetic, now --decode direct), with 40 registers, and from 8-bit data
 profile c128-packed-wola           fused_fft_frac "${C128[@]}" --input packed --wola
 profile c128-packed-wola-ept-half fused_fft_frac "${C128[@]}" --input packed --wola --ept half
+profile c128-packed-wola-ept-half-cap1536 fused_fft_frac "${C128[@]}" --input packed --wola --ept half --fpb 2 --regcap 1536
+profile c128-packed-wola-ept-half-nbit8 fused_fft_frac "${C128[@]}" --input packed --wola --ept half --nbit 8
 # the first stage of the two-kernel pipeline, and gpudifx's decode kernel (FP64 phases)
 profile c128-decode-to-fp16        decode_to      "${C128[@]}" --input packed --wola
 profile c128-gpudifx-decode        gpu_fused_fringe_tiled "${C128[@]}" --input packed --rotator double

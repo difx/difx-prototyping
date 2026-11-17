@@ -218,9 +218,31 @@ __global__ void fringe_phase_kernel(Geometry g, PackedInput d) {
                                        a < 1.0 ? __double2ull_rz(a * two64) : 0ull);
 }
 
-void launchFringePhase(const Geometry& g, const PackedInput& d, cudaStream_t st) {
+// Each window's place in the packed data (WinDesc in decode.cuh); one thread per (antenna, window).
+__global__ void window_desc_kernel(Geometry g, PackedInput d) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)g.nant * g.nwin) return;
+    const int ant = (int)(i / g.nwin);
+    const long fs = d.ms.framesamples;
+    const long gs0 = d.sampleIndex[i];
+    const long frame0 = gs0 >= 0 ? gs0 / fs : -((-gs0 + fs - 1) / fs);      // floor
+    const int sif0 = (int)(gs0 - frame0 * fs);
+    const int nf = (sif0 + g.fftchannels - 1) / (int)fs + 1;               // <= 32 (leanDecodeFits)
+    unsigned mask = 0;
+    for (int k = 0; k < nf; k++) {
+        const long f = frame0 + k;
+        if (f >= 0 && f < d.nframes && d.validFrames[(size_t)ant * d.nframes + f])
+            mask |= 1u << k;
+    }
+    d.winDesc[i] = make_int4((int)(frame0 * d.ms.framebytes + d.ms.payloadoffset), sif0, (int)mask,
+                             (int)((d.datasamples + gs0) & 1));
+}
+
+void launchPackedSetup(const Geometry& g, const PackedInput& d, cudaStream_t st) {
     const unsigned tpb = 256;
     fringe_phase_kernel<<<(unsigned)((g.spectra() + tpb - 1) / tpb), tpb, 0, st>>>(g, d);
+    if (d.winDesc)
+        window_desc_kernel<<<(unsigned)(((size_t)g.nant * g.nwin + tpb - 1) / tpb), tpb, 0, st>>>(g, d);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -290,7 +312,7 @@ void Unfused::runPre(const PreVariant& pre, cudaStream_t st) {
         return;
     }
     if (pre.packed)
-        launchFringePhase(g, pre.pk, st);
+        launchPackedSetup(g, pre.pk, st);
     const unsigned blocks = (g.perAnt() + tpb - 1) / tpb;
     withPre(pre, [&](auto stage) {
         if (stage.direct())

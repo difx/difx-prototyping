@@ -73,29 +73,32 @@ __global__ void fill_noise(T* x, size_t n, unsigned long long seed) {
 
 // The first kernel of the two-kernel pipeline (--input packed): decode + fringe rotation of all
 // antennas into a buffer per FFT window, [ant][win][band][fftchannels], in FP32 or FP16.  A block
-// per (antenna, window); its nband * fftchannels samples e are spread over the threads U at a
-// time (e = e0 + tx + k * blockDim, k < U, unrolled, so that what depends only on the window is
-// computed once per thread, as in the fused kernel), samples on consecutive lanes (coalesced
-// stores).  fftchannels is a power of two.  The window weights are left to the FFT kernel, which
-// applies them as it loads.
+// per (antenna, window), a warp per band at a time (decodeToThreads: up to 8 warps); a warp's
+// lanes take 32 consecutive samples at a time (coalesced stores), U at a time unrolled, so that
+// each lane's samples are lane, lane + 32, ... and the stage is prepared once per lane and band,
+// as in the fused kernel.  fftchannels is a multiple of 32.  The window weights are left to the
+// FFT kernel, which applies them as it loads.
 template<int U, class Pre, class T>
 __global__ void decode_to(Geometry g, Pre pre, T* out) {
     const unsigned aw = blockIdx.x;                      // ant * nwin + win
     const int ant = aw / g.nwin, win = aw % g.nwin;
-    const int shift = __ffs(g.fftchannels) - 1;
-    const int total = g.nband * g.fftchannels;
-    T* o = out + (size_t)aw * total;
-    for (int e0 = 0; e0 < total; e0 += U * blockDim.x) {
+    const int lane = threadIdx.x & 31;
+    for (int band = threadIdx.x >> 5; band < g.nband; band += blockDim.x >> 5) {
+        typename Pre::State st = pre.prepare(g, ant, win, band, lane, 32);
+        T* o = out + ((size_t)aw * g.nband + band) * g.fftchannels;
+        int s0 = 0;
+        for (; s0 + 32 * U <= g.fftchannels; s0 += 32 * U) {
 #pragma unroll
-        for (int k = 0; k < U; k++) {
-            const int e = e0 + threadIdx.x + k * blockDim.x;
-            if (e < total) {
-                const int band = e >> shift;
-                store(o, e, pre(g, ant, win, band, e - (band << shift)));
+            for (int k = 0; k < U; k++) {
+                const int s = s0 + lane + 32 * k;
+                store(o, s, pre.at(st, g, ant, win, band, s));
             }
         }
+        for (int s = s0 + lane; s < g.fftchannels; s += 32)   // the rest (fftchannels < 32 U)
+            store(o, s, pre.at(st, g, ant, win, band, s));
     }
 }
+static unsigned decodeToThreads(const Geometry& g) { return 32 * std::min(g.nband, 8); }
 
 // The exact FFT input of a few chosen spectra (the noise before rounding to the storage
 // precision, times the window), for the double-precision reference.
@@ -278,6 +281,7 @@ static ChunkView chunkView(const Geometry& g, const FracParams& p, const PreVari
         d.bigA += aw * g.nband;
         d.bigBred += aw * g.nband;
         d.fringePhase += aw * g.nband;
+        d.winDesc += aw;
     }
     return v;
 }
@@ -301,8 +305,11 @@ static void usage() {
 "                  sideband) and fringe rotation; with --rotator double the unfused pipeline runs\n"
 "                  gpudifx's decode + fringe kernel (FP64 phases), else fixed-point phases\n"
 "  --nbit N        packed: bits per sample, 1, 2 (default), 4 or 8\n"
-"  --decode D      packed, fused kernel: direct (default; each FFT thread decodes its own\n"
-"                  samples) | tiled (the block decodes into shared memory with band on the lane)\n"
+"  --decode D      packed: lean (default; what depends only on the window and band once per\n"
+"                  thread, the number of bits fixed at compile time) | direct (gpudifx's\n"
+"                  per-sample arithmetic: frame, validity and bits per sample worked out for\n"
+"                  every sample).  Both the fused kernel and the 2-kernel decode use it\n"
+"  --bad-frames F  packed: fraction of the VDIF frames flagged invalid (decoded as zeros), default 0\n"
 "  --layout L      window (default: one buffer per FFT window, mpifxcorr's layout) | series\n"
 "                  (one continuous series per antenna and band)\n"
 "  --taper F       window on the FFT input with tapers of F of the FFT length at each end,\n"
@@ -346,11 +353,11 @@ static void usage() {
 int main(int argc, char** argv) {
     Geometry g{10, 8, 10000, 0, 128};
     bool complexData = false, batched = false, singlePol = false, sweep = false, crossPolPass = false;
-    bool half = false, series = false, packed = false, tiled = false;
+    bool half = false, series = false, packed = false, lean = true;
     int nbit = 2;
     Taper shape = Taper::TUKEY;
     bool wola = false, shapeGiven = false;
-    double bw = 64.0, invalidFrac = 0.0, taper = 0.0, overlap = 0.0;
+    double bw = 64.0, invalidFrac = 0.0, badFrames = 0.0, taper = 0.0, overlap = 0.0;
     AutoMode amode = AutoMode::NONE;
     Rotator rotator = Rotator::FIXED;
     int fpb = 0, ept = 0, regcap = 0, chunk = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
@@ -377,7 +384,8 @@ int main(int argc, char** argv) {
         else if (a == "--bw") bw = std::stod(next());
         else if (a == "--input") { const int k = choose({"fp32", "fp16", "packed"}); half = k == 1; packed = k == 2; }
         else if (a == "--nbit") nbit = std::stoi(next());
-        else if (a == "--decode") tiled = choose({"direct", "tiled"}) == 1;
+        else if (a == "--decode") lean = choose({"lean", "direct"}) == 0;
+        else if (a == "--bad-frames") badFrames = std::stod(next());
         else if (a == "--layout") series = choose({"window", "series"}) == 1;
         else if (a == "--taper") taper = std::stod(next());
         else if (a == "--window") { shape = (Taper)choose({"tukey", "sine", "vorbis"}); shapeGiven = true; }
@@ -413,12 +421,17 @@ int main(int argc, char** argv) {
         overlap < 0 || overlap >= 1) { usage(); return 2; }
     if (overlap > 0 && !series && !packed) { fprintf(stderr, "--overlap needs --layout series\n"); return 2; }
     if (packed && complexData) { fprintf(stderr, "--input packed: real data only so far\n"); return 2; }
+    if (packed && g.fftchannels % 32) { fprintf(stderr, "--input packed: FFT length a multiple of 32\n"); return 2; }
     if (packed && nbit != 1 && nbit != 2 && nbit != 4 && nbit != 8) { fprintf(stderr, "--nbit: 1, 2, 4 or 8\n"); return 2; }
     if (packed && (VDIF_PAYLOAD * 8) % (g.nband * nbit) != 0) {
         fprintf(stderr, "--input packed: %d bands of %d bits do not divide a %d-byte payload\n", g.nband, nbit, VDIF_PAYLOAD);
         return 2;
     }
     if (chunk < 0 || (chunk > 0 && !packed)) { fprintf(stderr, "--chunk W: W > 0, with --input packed\n"); return 2; }
+    if (packed && lean && nbit != 2 && amode != AutoMode::NONE) {
+        fprintf(stderr, "--decode lean: the autocorrelations are compiled for 2 bits only (or use --decode direct)\n");
+        return 2;
+    }
     if (packed && rotator == Rotator::DOUBLE && taper > 0) {
         fprintf(stderr, "--rotator double with packed input runs gpudifx's decode, which has no window\n");
         return 2;
@@ -444,11 +457,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "); add it to SIZES in the Makefile\n");
         return 2;
     }
-    // shared memory: the FFT's, or the tiled decode's tile if that is larger
-    auto tileBytes = [&](unsigned f) { return packed && tiled ? PreDecode<true>::tileBytes(g.fftchannels, f) : 0u; };
     std::vector<FusedVariant> variants;
     for (const auto& v : reg->second)
-        if (std::max(v.smem, tileBytes(v.fpb)) <= prop.sharedMemPerBlockOptin && v.threads <= (unsigned)prop.maxThreadsPerBlock)
+        if (v.smem <= prop.sharedMemPerBlockOptin && v.threads <= (unsigned)prop.maxThreadsPerBlock)
             variants.push_back(v);
     std::sort(variants.begin(), variants.end(), [](const FusedVariant& a, const FusedVariant& b) {
         return a.regcap != b.regcap ? a.regcap < b.regcap : a.ept != b.ept ? a.ept > b.ept : a.fpb < b.fpb; });
@@ -482,6 +493,11 @@ int main(int argc, char** argv) {
     const int maxDelay = 64;
     const int nframes = (int)(((size_t)(g.nwin - 1) * hop + g.fftchannels + maxDelay + framesamples - 1) / framesamples);
     const size_t bytesPerAnt = (size_t)nframes * (VDIF_HEADER + VDIF_PAYLOAD);
+    if (g.spectra() >= 0x80000000ull) { fprintf(stderr, "more than 2^31 spectra in a subint\n"); return 2; }
+    if (packed && lean && !leanDecodeFits(framesamples, g.fftchannels, bytesPerAnt)) {
+        fprintf(stderr, "--decode lean: windows of up to 32 frames and less than 2 GB per antenna (use --decode direct)\n");
+        return 2;
+    }
     const double gib = 1.0 / 1073741824.0;
     const char* amodeName[] = {"none", "band", "full"};
     printf("GPU %s (sm_%d%d, %d SMs), CUDA runtime %d, cuFFT %d, cuFFTDx %d\n", prop.name, prop.major, prop.minor,
@@ -490,7 +506,7 @@ int main(int argc, char** argv) {
            g.nant, g.nband, complexData ? "complex" : "real", g.fftchannels, g.nchan, bw, subintMs);
     if (packed)
         printf("Input: packed VDIF, %d-bit, %d frames of %d samples per antenna, decode %s (fused); FFT input: ",
-               nbit, nframes, framesamples, tiled ? "tiled" : "direct");
+               nbit, nframes, framesamples, lean ? "lean" : "direct");
     else
         printf("FFT input: %s, %s layout, ", half ? "FP16" : "FP32", series ? "series" : "per-window");
     const char* shapeName[] = {"Tukey", "sine-taper", "Vorbis-taper"};
@@ -532,11 +548,12 @@ int main(int argc, char** argv) {
     pre.seriesLen = seriesLen;
     pre.window = taper > 0 ? devCopy(taperedWindow(g.fftchannels, taper, shape)) : nullptr;
     pre.packed = packed;
-    pre.tiled = tiled;
+    pre.lean = lean;
     std::vector<unsigned char> hPacked;
     std::vector<int> sampleIndex;
     std::vector<double> bigA, bigB;
     std::vector<unsigned char> decodeFlags;
+    std::vector<char> validFrames;
     const long datasamples = 1000001;          // odd: the ALTSIGN sign starts at -1
     if (packed) {
         hPacked.resize(g.nant * bytesPerAnt);
@@ -564,13 +581,21 @@ int main(int argc, char** argv) {
         d.bytesPerAnt = bytesPerAnt;
         d.ms = mark5_stream{framesamples, VDIF_HEADER + VDIF_PAYLOAD, VDIF_HEADER, nbit, g.nband, 1};
         d.nframes = nframes;
-        d.validFrames = devCopyBool(std::vector<char>((size_t)g.nant * nframes, 1));
+        validFrames.assign((size_t)g.nant * nframes, 1);
+        if (badFrames > 0) {
+            for (auto& v : validFrames) v = rng.uniform() >= badFrames;
+            printf("%zu of %zu frames flagged invalid\n", (size_t)std::count(validFrames.begin(), validFrames.end(), 0),
+                   validFrames.size());
+        }
+        d.validFrames = devCopyBool(validFrames);
         d.sampleIndex = devCopy(sampleIndex);
         d.decodeFlags = devCopy(decodeFlags);
         d.datasamples = datasamples;
         d.bigA = devCopy(bigA);
         d.bigBred = devCopy(bigB);
         d.fringePhase = devAlloc<ulonglong2>(g.spectra());
+        d.winDesc = devAlloc<int4>((size_t)g.nant * g.nwin);
+        d.fsMagic = frameMagic(framesamples);
     } else if (half) {
         __half2* in = devAlloc<__half2>(ninput);
         fill_noise<<<4096, 256>>>(in, ninput, seed);
@@ -636,7 +661,7 @@ int main(int argc, char** argv) {
     auto runFused = [&](const FusedVariant& v) {
         if (doAuto) CHECK_CUDA(cudaMemsetAsync(autoFused, 0, nauto * sizeof(cuFloatComplex), st));
         launchFixedPhase(g, pF, st);
-        if (packed) launchFringePhase(g, pre.pk, st);
+        if (packed) launchPackedSetup(g, pre.pk, st);
         bool crossDone = false;
         if (batched) crossDone = v.launch(g, pre, pF, doAuto, outFused, 0, g.nant, st);
         else for (int a = 0; a < g.nant; a++) crossDone = v.launch(g, pre, pF, doAuto, outFused, a, 1, st);
@@ -687,7 +712,8 @@ int main(int argc, char** argv) {
                     const long gs = (long)sampleIndex[(size_t)ant * g.nwin + win] + s;
                     const int frame = (int)(gs / framesamples);
                     const unsigned char* payload = &hPacked[ant * bytesPerAnt + (size_t)frame * (VDIF_HEADER + VDIF_PAYLOAD) + VDIF_HEADER];
-                    double x = hostDecode(payload, nbit, g.nband, (int)(gs - (long)frame * framesamples), band);
+                    double x = validFrames[(size_t)ant * nframes + frame]
+                             ? hostDecode(payload, nbit, g.nband, (int)(gs - (long)frame * framesamples), band) : 0.0;
                     if ((decodeFlags[(size_t)ant * g.nband + band] & GPUDECODE_BAND_ALTSIGN) && ((datasamples + gs) & 1))
                         x = -x;
                     x *= w[s];
@@ -724,8 +750,11 @@ int main(int argc, char** argv) {
             }
         }
         const Diff eu = compareHost(gu, ref), ef = compareHost(gf, ref);
-        // the fused result must be as close to the exact answer as the unfused one is
-        const bool refOk = ef.rms <= 2 * eu.rms + 1e-7;
+        // the fused result must be as close to the exact answer as the unfused one is; from the
+        // packed data (decoded exactly, nothing rounded to FP16) both must also be within 1e-5
+        // rms, which they are by a factor of 30 (a few 1e-7), so that a decode error shared by
+        // both pipelines cannot pass
+        const bool refOk = ef.rms <= 2 * eu.rms + 1e-7 && (!packed || (ef.rms < 1e-5 && eu.rms < 1e-5));
         pass &= refOk;
         printf("check: vs double-precision DFT of the exact input (%d spectra): unfused rms %.2e max %.2e, "
                "fused rms %.2e max %.2e  %s\n", nc, eu.rms, eu.max, ef.rms, ef.max, refOk ? "OK" : "FAIL");
@@ -747,7 +776,6 @@ int main(int argc, char** argv) {
     }
     PreVariant preDecode = pre;           // decode + fringe without the window
     preDecode.window = nullptr;
-    preDecode.tiled = false;
     auto runTwoStage1 = [&](const TwoKernel& tk) {
         if (tk.gpudifx) {
             Unfused tmp = unf;            // gpudifx's kernel, into twoBuf
@@ -756,9 +784,9 @@ int main(int argc, char** argv) {
             tmp.runPre(pre, st);
             return;
         }
-        launchFringePhase(g, pre.pk, st);
+        launchPackedSetup(g, pre.pk, st);
         withPre(preDecode, [&](auto stage) {
-            const unsigned tpb = std::min(g.nband * g.fftchannels / 8, 256);
+            const unsigned tpb = decodeToThreads(g);
             const unsigned nb = (unsigned)g.nant * g.nwin;
             if (tk.half) decode_to<8><<<nb, tpb, 0, st>>>(g, stage, (__half2*)twoBuf);
             else         decode_to<8><<<nb, tpb, 0, st>>>(g, stage, (float2*)twoBuf);
@@ -818,7 +846,7 @@ int main(int argc, char** argv) {
     }
     auto runChunked = [&](const Chunked& c) {
         launchFixedPhase(g, pF, st);
-        launchFringePhase(g, pre.pk, st);
+        launchPackedSetup(g, pre.pk, st);
         CHECK_CUDA(cudaEventRecord(forked, st));             // the antennas' streams start after these
         for (int a = 0; a < g.nant; a++) CHECK_CUDA(cudaStreamWaitEvent(sa[a], forked, 0));
         for (int w0 = 0; w0 < g.nwin; w0 += chunk)
@@ -834,7 +862,7 @@ int main(int argc, char** argv) {
                 void* buf = c.kind == 1 ? (void*)((__half2*)twoBuf + a * chunkElems)
                                         : (void*)((float2*)twoBuf + a * chunkElems);
                 withPre(v.pre, [&](auto stage) {
-                    const unsigned tpb = std::min(g.nband * g.fftchannels / 8, 256);
+                    const unsigned tpb = decodeToThreads(g);
                     if (c.kind == 1) decode_to<8><<<nw, tpb, 0, sa[a]>>>(v.g, stage, (__half2*)buf);
                     else             decode_to<8><<<nw, tpb, 0, sa[a]>>>(v.g, stage, (float2*)buf);
                 });
