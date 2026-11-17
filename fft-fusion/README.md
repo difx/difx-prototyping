@@ -626,6 +626,73 @@ above, lean decode):
 Against yesterday's sweep on this card the end-to-end kernel is 24-38% faster at every channel
 count, and now ahead of the 2 kernels at all of them.
 
+### The lean decode: A100-SXM4-80GB (OzSTAR, gina15)
+
+`fusebench-ozstar.sbatch`, SLURM job 21049107, commit 6712c95, all 38 runs and the channel-count
+sweep passing their checks; Nsight Compute `ncu-ozstar.sbatch`, job 21049108 on gina9.  Best
+variant of each line (register caps included), ms per subint:
+
+| pipeline | 128 ch | 128 ch, WOLA | 1024 ch | 1024 ch, WOLA |
+|---|---|---|---|---|
+| end-to-end, before today (gina4, job 21042592) | 2.85 | 3.03 | 2.48 | 2.76 |
+| end-to-end, direct decode (today's kernel) | 2.34 | 2.58 | 2.17 | 2.43 |
+| **end-to-end, lean decode** | **1.51** | **1.73** | **1.50** | **1.68** |
+| 2 kernels -> FP16, lean decode | 1.59 + 1.28 = 2.87 | 1.79 + 1.45 = 3.24 | 1.11 + 1.16 = 2.28 | 1.25 + 1.34 = 2.58 |
+| 2 kernels -> FP16, direct decode | 1.76 + 1.28 = 3.03 | 1.98 + 1.45 = 3.42 | 1.25 + 1.16 = 2.41 | 1.41 + 1.34 = 2.75 |
+| 2 kernels -> FP32, lean decode | 2.89 | 3.33 | 2.40 | 2.75 |
+
+- **The end-to-end kernel is 39-47% faster than this morning.**  Testing a thread's spectrum once
+  rather than per sample took 12-18% off (the direct-decode row), and the lean decode 31-36% off
+  that.  With WOLA it now runs at 11.6x real time at 128 channels and 11.9x
+  at 1024 for this array (10 antennas, 8 x 64 MHz bands, this stage alone).
+- **The 2 kernels now take 1.5-1.9 times as long** (0.98-1.19 times this morning): the end-to-end
+  kernel is the one to build.  Its decode costs little: per launch it takes 187 µs against 160
+  µs for the fused FFT reading a ready FP32 buffer and 142 µs reading FP16 (Nsight Compute, 128
+  channels, WOLA, base clock).
+- **cuFFTDx's own elements per thread is now the fastest on the A100 too** (16; half of it: 1.84
+  and 1.81 ms with WOLA), and the register caps no longer help: 40 registers at half (yesterday's
+  best) gives 1.82 ms at 128 channels; a cap of 64 at cuFFTDx's setting gains 1.5% at 1024
+  channels and nothing at 128.  The lean end-to-end kernel needs only 48-56 registers at 16
+  elements per thread (72 with the direct decode).
+- **What limits it now is arithmetic issue**: 69% of issue slots used, the FMA pipe 66% busy
+  (the FFT's own arithmetic and the integer multiply-adds; the fused FFT of an FP16 buffer: 70%),
+  the special-function unit (sincos, conversions) 28%; DRAM 22%.  The main stalls are waiting for
+  an issue slot and for the arithmetic pipes, no longer for loads.
+- **The number of bits costs little** (end-to-end with WOLA, best variant):
+
+  | bits | 128 ch | 1024 ch |
+  |---|---|---|
+  | 1 | 1.69 | 1.65 |
+  | 2 | 1.73 | 1.68 |
+  | 4 | 1.80 | 1.72 |
+  | 8 | 1.76 | 1.67 |
+
+  8-bit data, 4 times the bytes of 2-bit, costs no more; 4-bit is the slowest, by 2-4%.
+- **Chunks**: the end-to-end kernel loses nothing in chunks down to 21 MB in flight (128
+  channels: 1.80-1.82 ms against 1.84 whole; 1024: 1.76-1.78 against 1.81) and 0-5% at 10.5 MB;
+  below that the launches dominate (128 channels in chunks of 64 windows: 1790 launches per
+  subint, 3.75 ms).  Keeping the 2-kernel buffer in L2 still does not pay (21 MB: 3.35 against
+  3.32 ms at 128 channels, 2.97 against 2.76 at 1024).
+
+Channel count (`run-nchan.sh`), lean decode, ms per subint:
+
+| nchan | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 | end-to-end, WOLA | 2 kernels FP16, WOLA | end-to-end vs 128 ch |
+|---|---|---|---|---|---|---|
+| 32 | 1.45 | 3.52 | 3.97 | 1.68 | 3.99 | 0.96 |
+| 64 | 1.53 | 2.47 | 3.02 | 1.75 | 2.82 | 1.02 |
+| 128 | 1.51 | 2.87 | 2.88 | 1.73 | 3.23 | 1 |
+| 256 | 1.62 | 2.81 | 2.86 | 1.87 | 3.19 | 1.08 |
+| 512 | 1.74 | 2.95 | 2.98 | 2.00 | 3.40 | 1.16 |
+| 1024 | 1.84 | 2.81 | 2.95 | 2.11 | 3.19 | 1.22 |
+| 2048 | 2.14 | 2.98 | 2.99 | 2.43 | 3.43 | 1.42 |
+| 4096 | 2.65 | 3.62 | 3.60 | 3.01 | 4.17 | 1.76 |
+| 8192 | 3.10 | 4.23 | 4.20 | 3.64 | 5.07 | 2.06 |
+
+The end-to-end kernel is ahead of the 2 kernels at every channel count now (this morning they
+passed it from 2048 channels up), and the step at 512 channels has gone: with the lean decode,
+16 elements per thread at 1024 points needs 48 registers (72 before) and is the fastest.  Longer FFTs
+still cost more: +42% at 2048 channels, twice the time at 8192.
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -698,11 +765,10 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **The lean decode on the A100** (`fusebench-ozstar.sbatch`, `ncu-ozstar.sbatch`): how much of
-  the issue-bound end-to-end kernel it removes there, the bit depths, and which elements per
-  thread and register cap are then fastest. A quarter of cuFFTDx's elements per thread as a
-  variant (512 channels). Then the FFT's shared-memory exchange (bank conflicts, the main stall on
-  the 2070 now).
+- **The end-to-end kernel is now arithmetic-bound on the A100** (FMA pipe 66%, special-function
+  unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
+  a sincos per sample for the fringe phase and one per channel for the fractional-sample
+  correction.  cuFFTDx's shared-memory exchange (bank conflicts; the main stall on the 2070).
 - **An XMAC stage in the benchmark**, to measure what the spectra being in L2 is worth to the
   cross-multiply, and how that scales with the number of stations. Chunking all antennas a range
   of windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read
