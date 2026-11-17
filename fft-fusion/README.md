@@ -321,7 +321,7 @@ uncapped kernel's `__launch_bounds__(threads)` to `__launch_bounds__(threads, 1)
 mean the same thing, but the compiler then gave the kernel more registers (A100: 86-96 instead
 of 64-72 at cuFFTDx's elements per thread; 2070: 92-96 instead of 64-80), and some variants
 became up to 38% slower on the A100 (56% with the tiled decode). The 2070 tables of that commit
-and the A100 run of it (gina303, below) have the slower uncapped kernels. The uncapped kernel
+and the A100 run of it (gina303) have the slower uncapped kernels. The uncapped kernel
 is now declared as before, and its registers and times are back to those of 501bc92 (within 2%
 on the 2070). In a few cases the extra registers had been faster (2070, 2 kernels FP16, WOLA:
 10.11 vs 10.44 ms at 128 channels).
@@ -388,25 +388,95 @@ registers there. That changes nothing at half of cuFFTDx's elements per thread (
 registers either way). At cuFFTDx's setting it takes some variants from 72-80 registers to 64,
 which moves their times by -6% to +5%; none of them is the fastest variant.
 
-### Register caps and the first chunks: A100-SXM4-80GB (OzSTAR, gina303)
+### Channel count, chunks and register caps: A100-SXM4-80GB (OzSTAR, gina4)
 
-`fusebench-ozstar.sbatch`, SLURM job 21021335, and `ncu-ozstar.sbatch`, job 21021345, commit
-36f5b28, all checks passing. The uncapped kernels of this run have the extra registers described
-above, so its uncapped and 2-kernel times and its channel-count sweep are to be repeated. The
-capped kernels were not affected: their registers are the same in the corrected build.
+`fusebench-ozstar.sbatch`, SLURM job 21042592, commit 89b4dfb (the corrected uncapped kernel and
+the concurrent chunks), all 30 runs and the channel-count sweep passing their checks; Nsight
+Compute `ncu-ozstar.sbatch`, job 21038155 on gina304, commit d74abd3. The uncapped and 2-kernel
+times agree with those of job 21016518 (gina10, below) within 0.1%, so that table stands. An
+earlier run of the register caps (jobs 21021335 and 21021345, gina303, commit 36f5b28) had the
+slower uncapped kernel described above; its capped times agree with these.
 
-- **Capping the registers pays on the A100.** At half of cuFFTDx's elements per thread, a cap of
-  40 registers (`--regcap 1536`) gives the fastest end-to-end kernel with WOLA: 3.03 ms at 128
-  channels (2 FFTs per block) and 2.76 ms at 1024, against 3.24 and 2.83 ms uncapped (48-56
-  registers) in job 21016518. At cuFFTDx's elements per thread, a cap of 64 registers is 0-5%
-  slower than those, and a cap of 40 much slower (5.10 ms at 128 channels). With an FP16
-  buffer (`wola-fp16`) the caps change nothing at 128 channels. Nsight Compute: at 64 registers
-  occupancy is 47-48%.
-- **One antenna at a time, chunking only costs.** Each launch of a chunk cost 6-11 µs (launch,
-  and a grid too small to fill the GPU): the end-to-end kernel took 3.30 ms for the whole
-  subint, 3.48 ms in chunks of 4096 windows and 7.39 ms in chunks of 256 (128 channels, WOLA).
-  The chunked 2-kernel pipelines were slower than the unchunked ones at every chunk size. This
-  is why `--chunk` now runs the antennas together (above); the A100 run of that is to come.
+**Channel count** (`run-nchan.sh`), as for the 2070: 20 ms of data per antenna and band, from
+the packed data, best variant of each pipeline (no register caps), ms per subint.
+
+| nchan | windows | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 | end-to-end, WOLA | 2 kernels FP16, WOLA | end-to-end vs 128 ch |
+|---|---|---|---|---|---|---|---|
+| 32 | 40000 | 2.58 | 3.08 | 3.36 | 2.95 | 3.78 | 0.90 |
+| 64 | 20000 | 2.90 | 3.11 | 3.35 | 3.30 | 3.83 | 1.02 |
+| 128 | 10000 | 2.86 | 3.03 | 3.30 | 3.24 | 3.79 | 1 |
+| 256 | 5000 | 2.86 | 2.93 | 3.21 | 3.25 | 3.45 | 1.00 |
+| 512 | 2500 | 3.28 | 3.36 | 3.28 | 3.75 | 3.89 | 1.15 |
+| 1024 | 1250 | 3.07 | 3.01 | 3.10 | 3.51 | 3.68 | 1.08 |
+| 2048 | 625 | 3.70 | 3.31 | 3.29 | 4.15 | 4.09 | 1.30 |
+| 4096 | 312 | 4.14 | 3.93 | 4.82 | 4.77 | 4.60 | 1.45 |
+| 8192 | 156 | 4.44 | 4.81 | 4.85 | 5.26 | 5.60 | 1.56 |
+
+- **The step at 512 channels comes from the variants built, not the GPU.** At 1024 points
+  cuFFTDx suggests 32 elements per thread (127 registers), so the sweep's choices there are 32
+  and 16 (72 registers); at 256 and 1024 channels the fastest variant uses 8. Building a quarter
+  of cuFFTDx's elements per thread as well would probably put 512 channels near 2.9 ms. (The
+  sweep of the buggy build had 3.83 ms here.)
+- **As on the 2070, nothing argues for a minimum channel count**, and longer FFTs cost more:
+  +30% at 2048 channels, +56% at 8192, less steep than the 2070's +34% and +80%.
+- **From 1024 channels up the 2 kernels catch the end-to-end kernel**, and with an FP16 buffer
+  pass it at 2048 and 4096, with or without WOLA (2048 channels, no window: 3.31 against 3.70
+  ms); at 8192 the end-to-end kernel is ahead again. Below 512 channels it takes 2-16% less time
+  than the 2 kernels without a window and 6-22% less with WOLA.
+
+**Chunks** (`--chunk W`, all antennas' chunks in flight at once, as for the 2070): WOLA, half of
+cuFFTDx's elements per thread, ms per subint. The whole-subint times of the ten runs agree
+within 0.1%.
+
+| chunk (windows) | in flight, FP16 | end-to-end | 2 kernels, FP16 | 2 kernels, FP32 |
+|---|---|---|---|---|
+| 128 channels: whole subint | | 3.30 | 3.60 | 4.02 |
+| 1024 | 84 MB | 3.27 | 3.69 | 4.23 |
+| 256 | 21 MB | 3.46 | 3.87 | 4.60 |
+| 128 | 10.5 MB | 3.64 | 3.74 | 4.04 |
+| 64 | 5.2 MB | 4.17 | 7.11 | 7.13 |
+| 32 | 2.6 MB | 9.87 | 19.08 | 16.33 |
+| 1024 channels: whole subint | | 2.83 | 3.02 | 3.14 |
+| 128 | 84 MB | 2.77 | 3.01 | 3.22 |
+| 32 | 21 MB | 2.85 | 3.60 | 3.94 |
+| 16 | 10.5 MB | 2.93 | 5.15 | 5.43 |
+| 8 | 5.2 MB | 4.23 | 9.33 | 9.32 |
+| 4 | 2.6 MB | 8.03 | 17.30 | 17.06 |
+
+**Keeping the 2-kernel buffer in L2 does not pay.** With chunks that fit the 40 MB L2 (21 MB
+and less in FP16), the 2-kernel pipeline is 4-7% slower than without chunks at 128 channels and
+19% or more at 1024, never faster. Below about 10 MB the launches dominate. The 2 kernels are
+not limited by memory bandwidth to begin with (Nsight Compute: the decode kernel uses 24% of the
+DRAM bandwidth, the fused FFT reading FP16 43%), so taking the buffer's round trip out of DRAM
+saves little; their deficit is the work of a second pass. Chunking the pre-processing for its
+own sake is not worth it; any case for chunks has to come from the XMAC. The end-to-end kernel
+loses nothing in chunks of 84 MB and 1-5% at 21 MB.
+
+**Register caps** (`--regcap`, packed data with WOLA, ms per subint; `wola-fp16` is the fused FFT
+reading an FP16 buffer):
+
+| | 128 ch | 1024 ch |
+|---|---|---|
+| end-to-end, cuFFTDx's elements per thread: uncapped (72 reg) / cap 64 reg | 3.54 / 3.36 | 3.06 / 2.97 |
+| end-to-end, half of them: uncapped (48-56 reg) / **cap 40 reg** | 3.24 / **3.03** | 2.83 / **2.76** |
+| `wola-fp16`, half: uncapped (48 reg) / cap 54 reg (1024) / cap 40 reg (1536) | 1.70 / 1.79 / 1.97 | |
+
+(best FFTs per block of each row.) Capping pays only where the decode is in the kernel: 40
+registers at half of cuFFTDx's elements per thread gives the fastest end-to-end kernel, 6.5%
+ahead of uncapped at 128 channels and 2.4% at 1024. A cap of 64 at cuFFTDx's setting gains 3-5%
+but stays behind. For the fused FFT on its own the caps cost time (a cap of 40 at cuFFTDx's
+setting: 3.92 against 1.85 ms).
+
+What Nsight Compute shows now (job 21038155; ncu runs the GPU at its base clock):
+- The corrected uncapped kernels have 64-72 registers and 40-47% occupancy at cuFFTDx's
+  elements per thread (86-96 and 28-30% in the buggy build), and run 5-17% faster per launch
+  than they did there (end-to-end, 128 channels, WOLA: 390 against 472 µs).
+- **The end-to-end kernel is limited by instruction issue, not memory.** It uses 9-13% of the
+  DRAM bandwidth and 55-68% of its issue slots, and executes 3.1-3.4x the instructions of the
+  fused FFT reading an FP32 buffer (116-126M against 37M per antenna at 128 channels). At 1024
+  channels with half of cuFFTDx's elements per thread (61% occupancy), the stalls for an issue
+  slot (not selected) and for the arithmetic pipes (math pipe throttle) are rising towards the
+  load stalls (long scoreboard). Fewer decode instructions per sample is the lever.
 
 ### From the packed data: A100-SXM4-80GB (OzSTAR, gina10)
 
@@ -527,11 +597,10 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **The A100 runs with the corrected uncapped kernel and the concurrent chunks**
-  (`fusebench-ozstar.sbatch`, `ncu-ozstar.sbatch`): the channel-count sweep, and whether chunks
-  that fit the A100's L2 bring the 2-kernel pipeline level with the end-to-end kernel. Fewer
-  instructions per sample in the decode. The register cap as part of the production kernel's
-  choice of variant (40 registers at half of cuFFTDx's elements per thread on the A100).
+- **Fewer instructions per sample in the decode**: the end-to-end kernel is issue-bound on the
+  A100. The register cap as part of the production kernel's choice of variant (40 registers at
+  half of cuFFTDx's elements per thread on the A100). A quarter of cuFFTDx's elements per thread
+  as a variant (512 channels).
 - **An XMAC stage in the benchmark**, to measure what the spectra being in L2 is worth to the
   cross-multiply, and how that scales with the number of stations. Chunking all antennas a range
   of windows at a time keeps a chunk's spectra in L2 for the XMAC, but the XMAC must then read
