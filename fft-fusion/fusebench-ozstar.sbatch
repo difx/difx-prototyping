@@ -8,13 +8,14 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G                 # the build: up to ~4 GB per ptxas (N=8192 and up), eight at once
 #SBATCH --tmp=8G                  # job-local disk ($JOBFS) for nvcc's intermediate files
-#SBATCH --time=1:00:00            # estimate: build ~25 min on a gina node (5 min on a desktop), the three scripts ~10 min
+#SBATCH --time=1:30:00            # estimate: build ~25 min on a gina node (5 min on a desktop), the four scripts ~20 min
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #
 # fusebench on one OzSTAR GPU node (an A100 on the gina nodes): builds fusebench and xmacbench for
 # the GPU the job got, then runs the standard set (run-bench.sh), the channel-count sweep
-# (run-nchan.sh) and the XMAC stage against the number of stations (run-xmac.sh).  See README.md.
+# (run-nchan.sh), the XMAC stage against the number of stations (run-xmac.sh) and the staged XMAC's
+# super-block sizes against the number of stations (run-staged.sh).  See README.md.
 #
 # The build environment comes from DIFX_SETUP, a file this job sources: your gpudifx setup (module
 # loads, then gpudifx's setup.bash), which sets CUDAROOT or puts nvcc on PATH.  Default:
@@ -27,8 +28,8 @@
 #     sbatch fusebench-ozstar.sbatch
 # Submit from fft-fusion (or set BENCHDIR).  The SLURM log fusebench.<jobid>.log is written there
 # and holds the summary.  The logs of every run are in results-local/<host>-<stamp>/ (run-bench.sh),
-# results-local/<host>-nchan-<stamp>/ (run-nchan.sh) and results-local/<host>-xmac-<stamp>/
-# (run-xmac.sh), each also packed into a .tgz next to it at the end: send those and the SLURM log
+# results-local/<host>-nchan-<stamp>/ (run-nchan.sh), results-local/<host>-xmac-<stamp>/
+# (run-xmac.sh) and results-local/<host>-staged-<stamp>/ (run-staged.sh), each also packed into a .tgz next to it at the end: send those and the SLURM log
 # back.
 #
 # Other settings, through the environment:
@@ -104,4 +105,5 @@ run() {
 run run-bench.sh
 run run-nchan.sh
 run run-xmac.sh
+run run-staged.sh
 exit $rc

@@ -70,6 +70,7 @@ make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everythin
 ./run-nchan.sh                                                       # cost against channel count
 ./xmacbench --nant 10                                                # the XMAC stage, 10 stations
 ./run-xmac.sh                                                        # XMAC against the number of stations
+./run-staged.sh                                                      # the staged XMAC's super-blocks, 4-128 stations
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
 ```
@@ -77,7 +78,7 @@ python3 plot_windows.py                                              # the plots
 On OzSTAR: run `make mathdx` on a login node, then `sbatch fusebench-ozstar.sbatch` from
 `fft-fusion`. The job sources your gpudifx setup (`DIFX_SETUP`, default
 `$HOME/setup_difx.claude`: module loads, then `setup.bash`), builds for the GPU it gets and runs
-`run-bench.sh`, `run-nchan.sh` and `run-xmac.sh`. Its header has the details.
+`run-bench.sh`, `run-nchan.sh`, `run-xmac.sh` and `run-staged.sh`. Its header has the details.
 `ncu-ozstar.sbatch`, submitted the same way, profiles the kernels with Nsight Compute (`--set
 full`) and packs the reports.
 

@@ -12,7 +12,7 @@
 # tensor-core kernel with the transpose into its layout (timed separately), and the staged
 # tensor-core kernel from FP16 spectra (reshuffling them itself).  Then the whole chain
 # (fusebench --xmac: the station processing from 2-bit packed data, no window, and the XMAC) for
-# 4 ... 64 stations at 128 channels and 10 and 32 at 1024: gpudifx today (both stages), and the
+# 4 ... 64 stations at 128 channels (and 100, 4000 windows, on a GPU with 40 GB or more) and 10 and 32 at 1024: gpudifx today (both stages), and the
 # end-to-end kernel followed by gpudifx's XMAC, the tiled one, the transpose and the tensor one,
 # writing the tensor layout itself + the tensor one, or writing FP16 spectra + the staged tensor
 # one (the fastest variant of each kind).  Logs go to
@@ -91,6 +91,7 @@ for nant in 4 10 16 32 64; do
     [ "$MEM" -lt 40000 ] && [ $nant -gt 32 ] && continue
     chain 128 $nant $nwin
 done
+[ "$MEM" -lt 40000 ] || chain 128 100 4000
 chain 1024 10 1000
 [ "$MEM" -lt 40000 ] || chain 1024 32 1000
 echo
