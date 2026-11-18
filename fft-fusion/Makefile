@@ -48,13 +48,15 @@ ifeq ($(origin SM),undefined)
   SM := $(firstword $(SM))
   SM_FROM := NVCCFLAGS
   ifeq ($(SM),)
-    SM := $(subst .,,$(firstword $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null)))
+    # only a compute capability: without a GPU (a login node) nvidia-smi prints an error message
+    SM := $(subst .,,$(firstword $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                                          | grep -E '^[0-9]+\.[0-9]+$$')))
     SM_FROM := nvidia-smi
   endif
   ifeq ($(SM),)
     SM := 75
     SM_FROM := default
-    $(warning No SM given, no -arch=sm_NN in NVCCFLAGS and no GPU from nvidia-smi: building for sm_75)
+    $(warning No SM given, no -arch=sm_NN in NVCCFLAGS and no GPU from nvidia-smi: building for sm_75 (give SM=80 for an A100))
   endif
 else
   SM_FROM := $(origin SM)
