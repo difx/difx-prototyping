@@ -94,6 +94,8 @@ static void usage() {
 "  --only V      run only gpudifx | tiled | tensor | staged (default all)\n"
 "  --staged-tile K  the staged XMAC's super-blocks of 16 K receivers, K = 1, 2 (8 channels a block)\n"
 "                or 4 (4 channels a block) (default: its own choice, printed)\n"
+"  --staged-impl I  the staged XMAC's version: mma (mma.sync, (re, im) interleaved; the default) or\n"
+"                wmma (the WMMA version, real and imaginary planes), for comparison\n"
 "  --reps N      timed repetitions, default 20 (median and minimum reported)\n"
 "  --warmup N    untimed repetitions first, default 3\n"
 "  --check N     (frequency, channel) pairs checked against a double-precision reference, default 4\n"
@@ -109,6 +111,7 @@ int main(int argc, char** argv) {
     unsigned long long seed = 1;
     std::string only;
     int stagedTile = 0;
+    std::string stagedImpl = "mma";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -125,6 +128,7 @@ int main(int argc, char** argv) {
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--only") only = next();
         else if (a == "--staged-tile") stagedTile = std::stoi(next());
+        else if (a == "--staged-impl") stagedImpl = next();
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
         else if (a == "--check") ncheck = std::stoi(next());
@@ -142,6 +146,8 @@ int main(int argc, char** argv) {
     bool runS = only.empty() || only == "staged";
     if (stagedTile != 0 && stagedTile != 1 && stagedTile != 2 && stagedTile != 4) { usage(); return 2; }
     xmacTensorStagedSetTile(stagedTile);
+    if (stagedImpl != "mma" && stagedImpl != "wmma") { usage(); return 2; }
+    xmacTensorStagedSetImpl(stagedImpl == "wmma" ? 1 : 0);
 
     CHECK_CUDA(cudaSetDevice(device));
     if (runS && !xmacTensorStagedFits(s)) {
@@ -150,7 +156,8 @@ int main(int argc, char** argv) {
         if (only == "staged") return 2;
         runS = false;
     }
-    if (runS) printf("staged tensor XMAC: super-blocks of %d x 16 receivers\n", xmacTensorStagedTile(s));
+    if (runS) printf("staged tensor XMAC (%s): super-blocks of %d x 16 receivers\n", stagedImpl.c_str(),
+                     xmacTensorStagedTile(s));
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     const int sms = prop.multiProcessorCount;

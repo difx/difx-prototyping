@@ -1,5 +1,6 @@
 // xmac.cu - the three XMAC versions of xmac.cuh.
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 #include <mma.h>
 #include "xmac.cuh"
@@ -315,7 +316,7 @@ struct StagedCfg {
 
 template<int KS, int CH>
 __global__ void __launch_bounds__(StagedCfg<KS, CH>::NW * 32, StagedCfg<KS, CH>::MINB)
-xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, const int2* __restrict__ superPairs,
+xmac_staged_wmma_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, const int2* __restrict__ superPairs,
                    int nsp, int srows, int nchunk) {
     using namespace nvcuda;
     using C = StagedCfg<KS, CH>;
@@ -450,11 +451,268 @@ xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, c
     }
 }
 
-// The plan for a shape: KS, channels a block, the super-blocks, the stage's rows, the shared memory
-// a block.
-struct StagedPlan { int ks, ch, nsuper, srows, nw; size_t smem; };
+// ---- staged tensor, mma.sync: the default ------------------------------------------------------
+// The same blocks, super-blocks and items as the WMMA version above, with three changes:
+//  - The stage holds the spectra as the station kernel wrote them, (re, im) interleaved: a row (one
+//    receiver, one channel) is 16 windows x (re, im) FP16, 64 bytes, nothing rearranged.  With the
+//    pairs along the sum dimension (32 values: re_0, im_0, re_1, ...), one product over a row gives
+//    sum(re1 re2 + im1 im2), the real part of X1 X2^*; the imaginary part, sum(im1 re2 - re1 im2),
+//    is the product with A's pairs turned into (im, -re), one byte permute and one sign flip per
+//    register.  The same four tensor-core multiplies per 16 windows as before.
+//  - PTX: ldmatrix and mma.sync.m16n8k16 (on sm_75, two m16n8k8), whose register layouts are
+//    documented: each 32-bit register of a fragment holds one (re, im) pair.  Each warp loads each
+//    of its A and B fragments once per 8 windows and uses it for every item that needs it, and its
+//    sums go to vis straight from the accumulator registers.
+//  - The copy into the stage: a task is (channel quad, window, row), 16 bytes from global memory, 4
+//    channels of one window, going to 4 channels' stages, 4 bytes each.  On sm_80 and later 4
+//    cp.async a task (zero-filled past the last window), with no registers in between, into two
+//    stages: the next 16 windows load while the tensor cores work on these, one barrier per 16
+//    windows.  On sm_75 (no cp.async) a 16-byte load and 4 stores, one stage, two barriers.  (4 bytes
+//    a task, its own address arithmetic each, ran 2.3x the instructions and was 1.1-1.6x slower on the
+//    2070.)
+// A row's four 16-byte chunks (4 windows each) are XOR-swizzled by its row (chunk q at q ^ ((row >> 1)
+// & 3)), so that ldmatrix's 8 rows of a phase fall in 8 different bank groups without padding; the
+// channels' stages are 16 bytes apart beyond a multiple of 128, so that the copy's stores (lanes:
+// quad fastest, then window) fall in different banks too.
+constexpr int SROW = 64;                                                // bytes a stage row
+static __host__ __device__ int stagedChannelBytes(int srows) { return srows * SROW + 16; }
+__device__ __forceinline__ int stagedChunk(int row, int q) { return row * SROW + ((q ^ ((row >> 1) & 3)) << 4); }
+
+__device__ __forceinline__ void ldsm4(uint32_t r[4], const unsigned char* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+// d (16 x 8, FP32) += a (16 x 16, FP16, row-major) b (16 x 8, FP16, column-major)
+__device__ __forceinline__ void mma16816(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+                 "{%0, %1, %2, %3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
+}
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void cpAsync4(unsigned char* dst, const void* src, bool valid) {   // zero-fill if !valid
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 :: "r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src), "r"(valid ? 4 : 0));
+}
+__device__ __forceinline__ void cpCommit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cpWaitAll() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+#endif
+
+template<int KS, int CH>
+struct MmaCfg {
+    static constexpr int NW = CH == 8 ? 8 : 16;          // warps a block
+    static constexpr int WPC = NW / CH;                  // warps a channel: 1, or KS (each its own j)
+    static constexpr int NJ = WPC == 1 ? KS : 1;         // J blocks a warp
+    static constexpr int MINB = NW == 8 ? 2 : 1;         // blocks an SM, for the register budget
+    static constexpr int NQ = CH / 4;                    // channel quads a block
+    static constexpr int RSTEP = NW * 32 / (NQ * 16);    // copy: rows between a thread's tasks
+    static constexpr int MAXR = 32 * KS / RSTEP;         // copy: tasks a thread, at most
+    static_assert(WPC == 1 || WPC == KS, "a warp per channel, or one per J block");
+};
+
+template<int KS, int CH>
+__global__ void __launch_bounds__(MmaCfg<KS, CH>::NW * 32, MmaCfg<KS, CH>::MINB)
+xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, const int2* __restrict__ superPairs,
+                   int nsp, int srows, int nbuf, int nchunk) {
+    using C = MmaCfg<KS, CH>;
+    constexpr int NJ = C::NJ;
+    extern __shared__ __align__(32) unsigned char smraw[];
+    const int CSb = stagedChannelBytes(srows), BUFb = CH * CSb;
+    const __half2** rowSrc = reinterpret_cast<const __half2**>(smraw + nbuf * BUFb);
+    const int R = s.nrecv(), nb = (R + 15) / 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int ncg = (s.nchan + CH - 1) / CH;
+    const int sp = blockIdx.x / ncg, c0 = (blockIdx.x % ncg) * CH;      // channel group fastest
+    const int f = blockIdx.y;
+    const int2 AB = superPairs[sp];
+    const bool diag = AB.x == AB.y;
+    const int used = diag ? 16 * KS : 32 * KS;                          // stage rows in use
+    const int ntb = (s.nwin + 15) / 16;
+    const int per = (ntb + nchunk - 1) / nchunk;
+    const int tb0 = blockIdx.z * per, tb1 = min(ntb, tb0 + per);
+    auto recvOf = [&](int row) {                                        // stage row -> receiver, or -1
+        const int r = row < 16 * KS ? AB.x * 16 * KS + row : AB.y * 16 * KS + row - 16 * KS;
+        return r < R ? r : -1;
+    };
+
+    // each stage row's spectra (this block's channels, window 0), or none past the last receiver; those
+    // rows are zeroed once, in every stage and channel
+    for (int row = threadIdx.x; row < used; row += blockDim.x) {
+        const int r = recvOf(row);
+        rowSrc[row] = r >= 0 ? spec + s.halfIndex(r >> 1, 0, 2 * f + (r & 1), c0) : nullptr;
+    }
+    for (int u = threadIdx.x; u < nbuf * CH * used * 16; u += blockDim.x) {
+        const int word = u % 16, row = (u / 16) % used, bc = u / (16 * used);
+        if (recvOf(row) < 0) *reinterpret_cast<uint32_t*>(smraw + bc * CSb + row * SROW + 4 * word) = 0u;
+    }
+    __syncthreads();
+
+    // the copy tasks: (channel quad q, window w, row), q fastest then w; a thread's q and w are fixed,
+    // its rows row0, row0 + RSTEP, ...
+    const int q = threadIdx.x % C::NQ, w = (threadIdx.x / C::NQ) % 16, row0 = threadIdx.x / (C::NQ * 16);
+    const size_t wstride = (size_t)s.nband() * s.nchan;                // __half2 from one window to the next
+    const bool quadOk = c0 + 4 * q < s.nchan;                          // (nchan is a multiple of 4)
+    auto copy = [&](int tb, int buf) {
+        const int wg = tb * 16 + w;
+        const bool ok = quadOk && wg < s.nwin;
+        const size_t off = (size_t)wg * wstride + 4 * q;
+        unsigned char* d0 = smraw + buf * BUFb + 4 * q * CSb + ((w & 3) << 2);
+#if __CUDA_ARCH__ >= 800
+#pragma unroll
+        for (int k = 0; k < C::MAXR; k++) {
+            const int row = row0 + k * C::RSTEP;
+            if (row >= used) break;
+            const __half2* p = rowSrc[row];
+            if (!p) continue;
+            const __half2* src = ok ? p + off : spec;
+            unsigned char* d = d0 + stagedChunk(row, w >> 2);
+#pragma unroll
+            for (int cq = 0; cq < 4; cq++) cpAsync4(d + cq * CSb, src + (ok ? cq : 0), ok);
+        }
+#else
+        constexpr int NB = C::MAXR < 4 ? C::MAXR : 4;                  // 16-byte loads in flight, then their stores
+#pragma unroll
+        for (int k0 = 0; k0 < C::MAXR; k0 += NB) {
+            uint4 v[NB];
+#pragma unroll
+            for (int k = 0; k < NB; k++) {
+                const int row = row0 + (k0 + k) * C::RSTEP;
+                const __half2* p = row < used ? rowSrc[row] : nullptr;
+                v[k] = p && ok ? __ldg(reinterpret_cast<const uint4*>(p + off)) : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int k = 0; k < NB; k++) {
+                const int row = row0 + (k0 + k) * C::RSTEP;
+                if (row >= used || !rowSrc[row]) continue;
+                unsigned char* d = d0 + stagedChunk(row, w >> 2);
+                *reinterpret_cast<uint32_t*>(d) = v[k].x;
+                *reinterpret_cast<uint32_t*>(d + CSb) = v[k].y;
+                *reinterpret_cast<uint32_t*>(d + 2 * CSb) = v[k].z;
+                *reinterpret_cast<uint32_t*>(d + 3 * CSb) = v[k].w;
+            }
+        }
+#endif
+    };
+
+    // the warp's items: its channel; I blocks i = 0 .. KS - 1 of super-block A, J blocks j of B (every
+    // j with a warp per channel, else j = sub); i <= j when A == B
+    const int cw = warp % CH, sub = warp / CH;
+    const int c = c0 + cw;
+    bool on[KS][NJ], anyI[KS], anyJ[NJ];
+#pragma unroll
+    for (int jj = 0; jj < NJ; jj++) anyJ[jj] = false;
+#pragma unroll
+    for (int i = 0; i < KS; i++) {
+        anyI[i] = false;
+#pragma unroll
+        for (int jj = 0; jj < NJ; jj++) {
+            const int j = NJ == KS ? jj : sub;
+            on[i][jj] = c < s.nchan && (!diag || i <= j) && AB.x * KS + i < nb && AB.y * KS + j < nb;
+            anyI[i] |= on[i][jj];
+            anyJ[jj] |= on[i][jj];
+        }
+    }
+    float acc[KS][NJ][2][2][4];                                         // [i][jj][re, im][n half][4]
+#pragma unroll
+    for (int i = 0; i < KS; i++)
+#pragma unroll
+        for (int jj = 0; jj < NJ; jj++)
+#pragma unroll
+            for (int q = 0; q < 16; q++) (&acc[i][jj][0][0][0])[q] = 0.f;
+    // ldmatrix lane addresses within a 16-row block: A's four 8 x 8 matrices are (rows 0-7, 8-15) x
+    // (first, second 8 values), B's (rows 0-7: first, second 8 values), then rows 8-15
+    const int aRow = lane & 15, aHalf = lane >> 4;
+    const int bRow = (lane & 7) + ((lane >> 4) << 3), bHalf = (lane >> 3) & 1;
+    auto compute = [&](int buf) {
+        const unsigned char* base = smraw + buf * BUFb + cw * CSb;
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {                                // windows 8 ks .. 8 ks + 7
+            uint32_t Bf[NJ][4];
+#pragma unroll
+            for (int jj = 0; jj < NJ; jj++) {
+                if (!anyJ[jj]) continue;
+                const int j = NJ == KS ? jj : sub;
+                const int row = (diag ? 0 : 16 * KS) + 16 * j + bRow;
+                ldsm4(Bf[jj], base + stagedChunk(row, 2 * ks + bHalf));
+            }
+#pragma unroll
+            for (int i = 0; i < KS; i++) {
+                if (!anyI[i]) continue;
+                uint32_t Af[4];
+                ldsm4(Af, base + stagedChunk(16 * i + aRow, 2 * ks + aHalf));
+#pragma unroll
+                for (int jj = 0; jj < NJ; jj++) {                       // real parts
+                    if (!on[i][jj]) continue;
+                    mma16816(acc[i][jj][0][0], Af, Bf[jj][0], Bf[jj][1]);
+                    mma16816(acc[i][jj][0][1], Af, Bf[jj][2], Bf[jj][3]);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; e++) Af[e] = __byte_perm(Af[e], 0, 0x1032) ^ 0x80000000u;   // (re, im) -> (im, -re)
+#pragma unroll
+                for (int jj = 0; jj < NJ; jj++) {                       // imaginary parts
+                    if (!on[i][jj]) continue;
+                    mma16816(acc[i][jj][1][0], Af, Bf[jj][0], Bf[jj][1]);
+                    mma16816(acc[i][jj][1][1], Af, Bf[jj][2], Bf[jj][3]);
+                }
+            }
+        }
+    };
+
+#if __CUDA_ARCH__ >= 800
+    if (tb0 < tb1) { copy(tb0, 0); cpCommit(); }
+    for (int tb = tb0; tb < tb1; tb++) {
+        const int buf = (tb - tb0) & 1;
+        cpWaitAll();
+        __syncthreads();                         // this stage is in; every warp is done with the other one
+        if (tb + 1 < tb1) { copy(tb + 1, buf ^ 1); cpCommit(); }
+        compute(buf);
+    }
+#else
+    for (int tb = tb0; tb < tb1; tb++) {
+        copy(tb, 0);
+        __syncthreads();
+        compute(0);
+        __syncthreads();                         // done with the stage
+    }
+#endif
+
+    // the sums out, from the accumulators: register e of n half h is row g + 8 (e >> 1), column
+    // 8 h + 2 t + (e & 1) of the 16 x 16 tile
+    const int g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int i = 0; i < KS; i++)
+#pragma unroll
+        for (int jj = 0; jj < NJ; jj++) {
+            if (!on[i][jj]) continue;
+            const int I = AB.x * KS + i, J = AB.y * KS + (NJ == KS ? jj : sub);
+#pragma unroll
+            for (int h = 0; h < 2; h++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int r1 = I * 16 + g + 8 * (e >> 1), r2 = J * 16 + 8 * h + 2 * t + (e & 1);
+                    if (r1 >= R || r2 >= R || (r1 >> 1) >= (r2 >> 1)) continue;
+                    const int bl = baselineIndex(r1 >> 1, r2 >> 1, s.nant);
+                    addVis((cuFloatComplex*)vis, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), acc[i][jj][0][h][e],
+                           acc[i][jj][1][h][e], nchunk > 1);
+                }
+        }
+}
+
+// The plan for a shape: KS, channels a block, the super-blocks, the stage's rows, the warps, and the
+// shared memory a block (the version's own).
+struct StagedPlan { int ks, ch, nsuper, srows, nw, nbuf; size_t smem; };
 static int stagedForcedKS = 0;                 // xmacTensorStagedSetTile; 0: stagedPlan chooses
+static int stagedImpl = 0;                     // xmacTensorStagedSetImpl: 0 mma.sync, 1 WMMA
 void xmacTensorStagedSetTile(int ks) { stagedForcedKS = ks; }
+void xmacTensorStagedSetImpl(int impl) { stagedImpl = impl; }
 
 static int deviceAttr(cudaDeviceAttr a) {
     int dev, v;
@@ -464,6 +722,8 @@ static int deviceAttr(cudaDeviceAttr a) {
 }
 static StagedPlan stagedPlan(const XmacShape& s) {
     const int nb = (s.nrecv() + 15) / 16;
+    static int major = 0;
+    if (!major) major = deviceAttr(cudaDevAttrComputeCapabilityMajor);
     auto plan = [&](int ks) {
         StagedPlan p;
         p.ks = ks;
@@ -471,7 +731,14 @@ static StagedPlan stagedPlan(const XmacShape& s) {
         p.nw = p.ch == 8 ? 8 : 16;
         p.nsuper = (nb + ks - 1) / ks;
         p.srows = (p.nsuper == 1 ? 16 : 32) * ks;
-        p.smem = std::max((size_t)p.ch * stagedChannelStride(p.srows) * sizeof(__half), (size_t)p.nw * 512 * sizeof(float));
+        if (stagedImpl == 1) {                                          // WMMA: one stage, planes, padded rows
+            p.nbuf = 1;
+            p.smem = std::max((size_t)p.ch * stagedChannelStride(p.srows) * sizeof(__half),
+                              (size_t)p.nw * 512 * sizeof(float));
+        } else {                                                        // mma.sync: two stages from sm_80
+            p.nbuf = major >= 8 ? 2 : 1;
+            p.smem = (size_t)p.nbuf * p.ch * stagedChannelBytes(p.srows) + (size_t)p.srows * sizeof(void*);
+        }
         return p;
     };
     if (stagedForcedKS) return plan(stagedForcedKS);
@@ -489,21 +756,28 @@ bool xmacTensorStagedFits(const XmacShape& s) {
 template<int KS, int CH>
 static void launchStaged(const XmacShape& s, const StagedPlan& P, const __half2* spec, cuFloatComplex* vis, int sms,
                          cudaStream_t st) {
-    static size_t smemSet = 0;
-    if (P.smem > smemSet) {
-        CHECK_CUDA(cudaFuncSetAttribute(xmac_staged_kernel<KS, CH>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)P.smem));
-        smemSet = P.smem;
+    static size_t smemSet[2] = {0, 0};
+    auto kernel = stagedImpl == 1 ? nullptr : xmac_staged_kernel<KS, CH>;
+    auto kernelW = xmac_staged_wmma_kernel<KS, CH>;
+    size_t& set = smemSet[stagedImpl == 1];
+    if (P.smem > set) {
+        if (kernel) CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P.smem));
+        else CHECK_CUDA(cudaFuncSetAttribute(kernelW, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P.smem));
+        set = P.smem;
     }
     int nsp;
     const int2* superPairs = tilePairs(P.nsuper, nsp);
-    const int threads = StagedCfg<KS, CH>::NW * 32;
+    const int threads = P.nw * 32;
     const unsigned nx = (unsigned)((s.nchan + CH - 1) / CH * nsp);
     const int ntb = (s.nwin + 15) / 16;
     const int nchunk = windowChunks((long long)nx * s.nfreq * threads, ntb, 4, sms);
     CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
-    xmac_staged_kernel<KS, CH><<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, spec, (float2*)vis, superPairs,
-                                                                                 nsp, P.srows, nchunk);
+    if (kernel)
+        kernel<<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, spec, (float2*)vis, superPairs, nsp, P.srows,
+                                                                    P.nbuf, nchunk);
+    else
+        kernelW<<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, spec, (float2*)vis, superPairs, nsp, P.srows,
+                                                                     nchunk);
     CHECK_CUDA(cudaGetLastError());
 }
 

@@ -106,4 +106,5 @@ void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* v
                       cudaStream_t st);
 int xmacTensorStagedTile(const XmacShape& s);
 void xmacTensorStagedSetTile(int ks);
+void xmacTensorStagedSetImpl(int impl);       // 0: mma.sync (the default), 1: the WMMA version, for comparison
 bool xmacTensorStagedFits(const XmacShape& s);

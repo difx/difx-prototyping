@@ -1108,6 +1108,46 @@ chain times match job 21060735's (gina4) to 0.1%.  `results-local/gina302-staged
   4 from 24 (KS 2 ties at 24 and is 8% faster at 48); KS 4 is 1.2-1.4x faster than KS 2 from 64
   stations up, and KS 1 is 1.4-3.3x slower than the choice from 24 up.
 
+#### Why the staged XMAC trails on the A100, and the mma.sync version
+
+Nsight Compute on the A100 (`ncu-ozstar.sbatch` with `CASES='^x'`, job 21142001 on gina10,
+`results-local/ncu-gina10-20261118-172739`; base clocks):
+
+| | staged, 10 stations (KS 2) | tensor, 10 | staged, 64 (KS 4) | staged, 64 (KS 2) | tensor, 64 |
+|---|---|---|---|---|---|
+| duration | 0.70 ms | 0.36 ms | 8.66 ms | 10.7 ms | 3.93 ms |
+| warps active (of 64) | 24% | 40% | 25% | 25% | 41% |
+| instructions | 139 M | | 1.11 G | | 0.71 G |
+| DRAM / L2 hit rate | 31% / 67% | 58% / 41% | 30% / 71% | 59% / 62% | 40% / 72% |
+| stalls per instruction issued | global loads 3.7, barrier 1.1 | | global loads 6.6, barrier 3.5 | | global loads 13.5 |
+
+It was latency-bound, not limited by bandwidth (the re-reads came from L2): a quarter of the
+warps, each waiting on its global loads and then at the barriers of its load, barrier, products,
+barrier cycle with no other block to fill the gaps, and 1.6x the tensor XMAC's instructions (the
+rearranging in registers).  At 10-16 stations KS 2 also spilled at its 128-register cap (CUDA 12.8).
+
+So the staged XMAC is now written with PTX `mma.sync` (`xmac_staged_kernel`; the WMMA version stays
+as `--staged-impl wmma` for comparison).  The same super-blocks, items and plan; what changes:
+- **The stage holds the spectra as written, (re, im) interleaved**: a row is 16 windows x (re, im),
+  64 bytes, rearranged nowhere.  Along the sum, (re, im) pairs: one product gives re1 re2 + im1 im2,
+  the real part of X1 X2*; the imaginary part, im1 re2 - re1 im2, is the product with A's pairs
+  turned into (im, -re), a byte permute and a sign flip per register, which `mma.sync`'s documented
+  fragment layout (a (re, im) pair per register) allows and WMMA's does not.  The same four
+  tensor-core multiplies per 16 windows.  A row's 16-byte chunks are XOR-swizzled, so `ldmatrix`
+  reads without bank conflicts and without padding: 33 KB a stage at KS 4 instead of 49.
+- **Each warp loads each A and B fragment once per 8 windows** and uses it for all its items; the
+  sums go to the visibilities from the accumulator registers.
+- **The copy**: 16 bytes (4 channels of one window) a task, 4 bytes into each channel's stage.  On
+  sm_80 and later by `cp.async`, into two stages, so that the next 16 windows load while the
+  tensor cores work (one barrier per 16 windows); on sm_75 by loads and stores, one stage.
+- Registers: 104, 107 and 56 (KS 4, 2, 1) on sm_80 instead of 112, 128 and 63, no spills.
+
+Checked against double precision from 2 to 100 stations (odd counts, 1020 channels, 17 and 1001
+windows, flagged windows, each KS): the same errors as the WMMA version.  On the 2070 (no
+`cp.async`) it is level with the WMMA version (11% faster at 4 stations, 0-7% slower elsewhere);
+a first version copying 4 bytes a task, each with its own address arithmetic, ran 2.3x the
+instructions and was 1.1-1.6x slower.  The A100 decides it.
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,

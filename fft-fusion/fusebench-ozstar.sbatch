@@ -36,6 +36,7 @@
 #     sbatch --export=ALL,DIFX_SETUP=<file> fusebench-ozstar.sbatch
 #     sbatch --export=ALL,MATHDX=<MathDx dir> fusebench-ozstar.sbatch    # a MathDx you already have
 #     sbatch --export=ALL,EXTRA="--reps 50" fusebench-ozstar.sbatch      # extra fusebench options
+#     sbatch --export=ALL,SCRIPTS="run-xmac.sh run-staged.sh" fusebench-ozstar.sbatch   # only some scripts
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
@@ -102,8 +103,7 @@ run() {
         echo "Packed: $BENCHDIR/$results.tgz"
     fi
 }
-run run-bench.sh
-run run-nchan.sh
-run run-xmac.sh
-run run-staged.sh
+for script in ${SCRIPTS:-run-bench.sh run-nchan.sh run-xmac.sh run-staged.sh}; do
+    run "$script"
+done
 exit $rc
