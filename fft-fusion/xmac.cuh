@@ -97,14 +97,16 @@ void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFl
                 cudaStream_t st);
 
 // The staged tensor version: FP16 spectra (halfIndex; windows past the subint need not exist) ->
-// vis.  Each block stages 8 channels of the receivers it multiplies: every receiver up to 32, else
-// two super-blocks of 16 KS receivers (KS 1 or 2), so the shared memory a block needs (at most 49
-// KB) does not grow with the number of stations.  xmacTensorStagedTile is the KS it uses for a
-// shape; xmacTensorStagedSetTile(1 or 2) forces it (0: choose again), for comparisons;
+// vis.  Each block stages a few channels of the receivers it multiplies: every receiver up to 32 (8
+// channels), else two super-blocks of 64 receivers (KS 4, 4 channels), so the shared memory a block
+// needs (at most 33 KB a stage) does not grow with the number of stations.  xmacTensorStagedTile is
+// the KS it uses for a shape, xmacTensorStagedStages its number of stages (1, or 2 where they cost
+// no occupancy); xmacTensorStagedSetTile(1, 2 or 4) forces KS (0: choose again), for comparisons;
 // xmacTensorStagedFits says whether the plan fits a block on this device.
 void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int multiprocessors,
                       cudaStream_t st);
 int xmacTensorStagedTile(const XmacShape& s);
+int xmacTensorStagedStages(const XmacShape& s);
 void xmacTensorStagedSetTile(int ks);
 void xmacTensorStagedSetImpl(int impl);       // 0: mma.sync (the default), 1: the WMMA version, for comparison
 bool xmacTensorStagedFits(const XmacShape& s);

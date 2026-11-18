@@ -1137,16 +1137,56 @@ as `--staged-impl wmma` for comparison).  The same super-blocks, items and plan;
   reads without bank conflicts and without padding: 33 KB a stage at KS 4 instead of 49.
 - **Each warp loads each A and B fragment once per 8 windows** and uses it for all its items; the
   sums go to the visibilities from the accumulator registers.
-- **The copy**: 16 bytes (4 channels of one window) a task, 4 bytes into each channel's stage.  On
-  sm_80 and later by `cp.async`, into two stages, so that the next 16 windows load while the
-  tensor cores work (one barrier per 16 windows); on sm_75 by loads and stores, one stage.
-- Registers: 104, 107 and 56 (KS 4, 2, 1) on sm_80 instead of 112, 128 and 63, no spills.
+- **The copy**: a task is 4 windows of 4 channels of one receiver, four 16-byte loads, transposed
+  in registers into four 16-byte stores, one per channel, each exactly one chunk of the row.  The
+  next 16 windows load into registers while the tensor cores work on these and are stored after:
+  into the other of two stages where two stages cost no blocks an SM (the occupancy calculator
+  decides: on the A100 always, on the 2070 at KS 4 with one super-block), with one barrier per 16
+  windows; else into the one stage, with two.  On the 2070 two stages halve the blocks an SM at
+  KS 2 (64 KB of shared memory an SM) and were 1.15-1.35x slower there than one.
+- Registers: 119, 128 and 63 (KS 4, 2, 1; KS 1 capped at 64 for 4 blocks an SM), no spills.
 
 Checked against double precision from 2 to 100 stations (odd counts, 1020 channels, 17 and 1001
-windows, flagged windows, each KS): the same errors as the WMMA version.  On the 2070 (no
-`cp.async`) it is level with the WMMA version (11% faster at 4 stations, 0-7% slower elsewhere);
-a first version copying 4 bytes a task, each with its own address arithmetic, ran 2.3x the
-instructions and was 1.1-1.6x slower.  The A100 decides it.
+windows, flagged windows, each KS): the same errors as the WMMA version.
+
+On the 2070 (`run-staged.sh`, `results-local/ar313-adeller-staged-20261118-191617`, every check
+passing), ms per subint:
+
+| channels | stations | tensor XMAC alone | transpose + tensor | staged, mma.sync | staged, WMMA | WMMA / mma.sync |
+|---|---|---|---|---|---|---|
+| 128 | 4 | 0.418 | 2.03 | 0.444 | 0.466 | 1.05 |
+| 128 | 6 | 0.623 | 3.04 | 0.619 | 0.655 | 1.06 |
+| 128 | 10 | 1.11 | 5.12 | 1.47 | 1.61 | 1.09 |
+| 128 | 16 | 2.11 | 7.84 | 1.97 | 2.30 | 1.16 |
+| 128 | 24 | 1.49 | 4.96 | 1.77 | 2.06 | 1.17 |
+| 128 | 32 | 3.25 | 7.87 | **2.58** | 2.99 | 1.16 |
+| 128 | 48 | 6.38 | 13.3 | 6.69 | 8.28 | 1.24 |
+| 128 | 64 | 8.99 | 18.2 | 9.47 | 11.7 | 1.23 |
+| 128 | 100 | 9.23 | 16.5 | 14.2 | 17.1 | 1.20 |
+| 128 | 128 | 14.3 | 23.4 | 19.0 | 23.2 | 1.22 |
+| 1024 | 10 | 0.915 | 4.17 | 1.63 | 1.88 | 1.15 |
+| 1024 | 32 | 3.44 | 12.7 | 7.62 | 7.63 | 1.00 |
+| 1024 | 64 | 6.85 | 15.7 | 17.0 | 18.9 | 1.11 |
+| 1024 | 100 | 23.2 | 30.7 | 28.3 | 30.4 | 1.07 |
+
+(24-128 stations at 4000 or 2000 windows, 1024 channels at 1000 to 250: compare along a row.)  The
+mma.sync version is level with or faster than WMMA everywhere, 1.05-1.24x.  Against the tensor XMAC
+alone (which needs the layout written by the station kernel): within 6% at 4-6 stations, ahead at
+16 and 32, 1.05x behind at 48-64, 1.2-1.3x at 10 and 24, 1.3-1.5x at 100-128 and 1.8-2.5x at 1024
+channels from 10 to 64 stations.  Faster than transpose + tensor at every shape.  Its own KS choice
+is within 4% of the best forced one at every row (the same configuration differed by up to 7%
+between runs, at 32 stations).
+
+The first version's copy took a task as one window (16 bytes, 4 channels), with 4-byte writes
+into the four channels' stages: on sm_75 a load and four stores, level with WMMA on the 2070; on
+sm_80 four 4-byte `cp.async` into two stages, with no registers in between.  On the A100 that
+was 1.3-1.6x slower than the WMMA version wherever KS 4 is used (24 stations up: 12.5 against
+8.0 ms at 64 stations, 2.84 against 2.08 at 1024 channels and 32 stations) and level to 1.2x slower
+below (job 21143266 on gina1, commit 378af9e, `results-local/gina1-staged-20261118-181811`).  A
+`cp.async` cannot split 16 bytes across four stages, so each of the four reads the same 32
+sectors (one a lane: the lanes are 16 windows of 2 rows) for 4 bytes of each, four times the L1
+traffic of one 16-byte load; KS 4, with one channel quad a block, has no neighbouring lane in the
+same sector to share it.
 
 ### Window design
 

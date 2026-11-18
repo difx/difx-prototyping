@@ -156,8 +156,8 @@ int main(int argc, char** argv) {
         if (only == "staged") return 2;
         runS = false;
     }
-    if (runS) printf("staged tensor XMAC (%s): super-blocks of %d x 16 receivers\n", stagedImpl.c_str(),
-                     xmacTensorStagedTile(s));
+    if (runS) printf("staged tensor XMAC (%s): super-blocks of %d x 16 receivers, %d stage%s\n", stagedImpl.c_str(),
+                     xmacTensorStagedTile(s), xmacTensorStagedStages(s), xmacTensorStagedStages(s) > 1 ? "s" : "");
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     const int sms = prop.multiProcessorCount;
