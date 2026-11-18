@@ -1188,6 +1188,46 @@ sectors (one a lane: the lanes are 16 windows of 2 rows) for 4 bytes of each, fo
 traffic of one 16-byte load; KS 4, with one channel quad a block, has no neighbouring lane in the
 same sector to share it.
 
+#### The mma.sync staged XMAC on the A100 (OzSTAR, gina302)
+
+`fusebench-ozstar.sbatch` with `SCRIPTS="run-xmac.sh run-staged.sh"`, SLURM job 21148710, commit
+4a08705, every check passing; two stages at every shape (the registers limit the blocks an SM
+first).  `results-local/gina302-staged-20261118-200436` (`table.txt`) and
+`gina302-xmac-20261118-200210` (`chain.txt`), ms per ms of data, 10000 windows at 128 channels,
+1000 at 1024 (the chain at 100 stations: 4000):
+
+| channels | stations | XMAC: tensor (from its layout) | XMAC: staged, mma.sync | staged / tensor | staged, WMMA / mma.sync | gpudifx today, chain | layout + tensor, chain | FP16 spectra + staged, chain | chain gain over gpudifx today |
+|---|---|---|---|---|---|---|---|---|---|
+| 128 | 4 | 0.0065 | 0.0095 | 1.46 | 1.04 | 0.167 | 0.0428 | **0.0404** | 4.1x |
+| 128 | 6 | 0.0087 | 0.0114 | 1.31 | 1.04 | | | | |
+| 128 | 10 | 0.0180 | 0.0234 | 1.30 | 1.39 | 0.590 | 0.107 | **0.0996** | 5.9x |
+| 128 | 16 | 0.0230 | 0.0328 | 1.42 | 1.28 | 1.20 | 0.166 | **0.155** | 7.8x |
+| 128 | 24 | 0.0392 | 0.0712 | 1.82 | 1.40 | | | | |
+| 128 | 32 | 0.0578 | 0.0927 | 1.60 | 1.34 | 4.05 | 0.343 | **0.336** | 12x |
+| 128 | 48 | 0.109 | 0.241 | 2.22 | 1.29 | | | | |
+| 128 | 64 | 0.183 | 0.317 | 1.73 | 1.26 | 14.5 | **0.752** | 0.801 | 18x |
+| 128 | 100 | 0.444 | 0.918 | 2.07 | 1.25 | 32.8 | **1.41** | 1.76 | 19x |
+| 128 | 128 | 0.664 | 1.16 | 1.75 | 1.22 | | | | |
+| 1024 | 10 | 0.0201 | 0.0277 | 1.38 | 1.37 | 0.571 | 0.173 (tiled 0.146) | **0.121** | 4.7x |
+| 1024 | 32 | 0.0641 | 0.111 | 1.73 | 1.17 | 3.46 | 0.563 (transpose + tensor 0.489) | **0.408** | 8.5x |
+| 1024 | 64 | 0.210 | 0.424 | 2.02 | 1.10 | | | | |
+| 1024 | 100 | 0.518 | 1.31 | 2.53 | 1.08 | | | | |
+
+- **The mma.sync version is 1.1-1.4x faster than WMMA from 10 stations up** (4% at 4-6), where
+  the cp.async first version was 1.3-1.6x slower.  Against the WMMA run of job 21141283 (a790ec0,
+  above) the staged XMAC alone gains 1.5x at 10 stations, 1.3x at 16-32, 1.25x at 64-128.
+- **FP16 spectra + the staged XMAC is now the fastest chain from 4 to 32 stations and at 1024
+  channels**: 6% ahead of the layout path at 4 stations, 7% at 10 and 16, 2% at 32, and 17% ahead
+  of the next best at 1024 channels (10 and 32 stations).  It trails the layout path by 6% at 64
+  stations and 25% at 100 (was 17% and 41%).
+- **The staged XMAC alone is still 1.3-2.5x the tensor XMAC from its layout**; what remains from
+  24 stations up is mostly KS 4's re-reads (each receiver once per super-block: 2 at 64 stations,
+  4 at 100 and 128, 2 at 1024 channels and 64 stations), and the A100 keeps one block of 16
+  warps an SM at KS 4 (119 registers).  Its 164 KB of shared memory would hold 128-receiver
+  super-blocks (KS 8, about 65 KB a stage at 4 channels), halving the re-reads from 100 stations,
+  with the items split differently among the warps (a KS 4 warp's sums already take 64
+  registers).
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -1260,15 +1300,27 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **One XMAC path: the staged one** ("The staged XMAC split by receiver", 2070 and A100).  It is
-  the fastest chain or level with it up to 16 stations on both GPUs and at 1024 channels, and
-  works at any station count, but trails the layout path from 32 stations: on the A100 by 7% at
-  32, 17% at 64 and 41% at 100 (the staged XMAC alone is 1.3-2.9x the tensor XMAC from its layout
-  at every station count there).  Next: profile it on the A100 (`ncu-ozstar.sbatch`, at 10 and 64
-  stations) to see whether occupancy is the limit (25% of the warps), and if so let more blocks
-  share an SM (fewer registers up to 16 stations; the A100's 164 KB of shared memory would hold
-  three or four stages).  Then retire the transpose, the layout output of the station kernel, the
-  tensor XMAC from that layout and the tiled one.
+- **One XMAC path: the staged one, decided (2026-11-18).**  With the mma.sync version FP16 spectra
+  + the staged XMAC is the fastest chain from 4 to 32 stations on both GPUs and at 1024 channels,
+  and works at any station count ("The mma.sync staged XMAC on the A100", and the 2070 table
+  before it).  For general-purpose DiFX that is the path.  Next: retire the transpose, the layout
+  output of the station kernel, the tensor XMAC from that layout, the tiled XMAC and the staged
+  WMMA version (keeping gpudifx's XMAC as the reference in the benchmarks).
+- **Large N (about 100 stations and up): an XMAC-focused optimisation.**  There the staged path
+  trails the layout path by 25% in the chain on the A100 (6% at 64 stations), and the staged
+  XMAC alone is 1.75-2.5x the tensor XMAC from its layout: the XMAC, not the station processing,
+  dominates, and each receiver is re-read once per super-block it is paired with (4 times at 100
+  stations).  Candidates: larger super-blocks where the shared memory allows (KS 8 on the A100,
+  half the re-reads, with the items split differently among the warps for the registers); more
+  output per stage load (bigger tiles per warp, more blocks an SM); and the XMAC literature for
+  large N (e.g. the tensor-core correlators built for LOFAR-class arrays).  Not needed for
+  DiFX's usual arrays.
+- **A wider test matrix**: so far the chain is measured at 128 and 1024 channels, 8 bands (4
+  dual-polarisation frequencies), 2 bits a sample (`fusebench --xmac` takes only `--nbit 2`), and
+  4-128 stations.  Sweep the combinations of channel count (e.g. 64-16384, and not powers of two),
+  band count (1-16 and more, single and dual polarisation), bits a sample (1, 2, 4, 8: the decode
+  and `--xmac` need the other widths) and station count, on both GPUs, checking every run, to find
+  shapes where the staged path or the plan's choices (KS, channels a block, stages) do badly.
 - **The end-to-end kernel is now arithmetic-bound on the A100** (FMA pipe 66%, special-function
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample
@@ -1332,17 +1384,8 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   narrow station's bands (the input map above).  `fusebench` assumes
   one shape for every station: per-station shapes, then the two stages together with mixed
   bandwidths.  Mixed real and complex sampling works the same way.
-- **The reshuffle into the tensor layout in the XMAC** (being prototyped): an FFT produces all
-  channels of a window and the tensor XMAC wants 16 windows of a channel, and turning one into
-  the other on chip needs room for channels x 16 windows wherever it is done.  In the station
-  kernel that grows with the channel count (above); a separate transpose costs a DRAM round trip.
-  Instead the station kernel writes FP16 spectra in its own order (full-sector stores, no tile,
-  the FP32 kernel's occupancy, half its output), and each tensor-XMAC block loads a few channels
-  x all receivers x 16 windows into shared memory (contiguous along the channels) and runs the
-  tensor cores from there: about 1 KB a receiver for 16 channels, so 20 KB at 10 stations and
-  128 KB at 64 (beyond that a loop over receiver tiles), growing with the stations, not the
-  channels, and in the cheaper stage.  Compare with writing the layout and transpose + tensor
-  at 128 and 1024 channels on both GPUs, and in the channel-count sweep below.
+- **The reshuffle into the tensor layout in the XMAC**: done, the staged XMAC (above, and
+  "One XMAC path").
 - **The tiled XMAC's cost against the subint length** (above): 8 times the time for 4 times
   the windows at 16 stations on the 2070.  Sweep the windows at fixed stations, profile the
   long case (DRAM traffic, TLB: the spectra are 2.4 GiB at 10000 windows), fix it or explain it,
