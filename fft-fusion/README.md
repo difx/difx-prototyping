@@ -127,7 +127,7 @@ Each run checks:
 | `unfused.cu` | the copied production kernel, cuFFT plans as `GPUMode` makes them, the kernel that materialises a pre-FFT stage, the generic rotation kernel, the fixed-point phase precompute, and for packed input the fringe phases and window descriptors (`launchPackedSetup`) |
 | `fused_inst.cu` | the fused kernel, compiled per FFT length; each length registers its variants (FFTs per block, and cuFFTDx's elements per thread or half of it) at start-up; three outputs: FP32 spectra, FP16 spectra in the same order (for the staged tensor XMAC), and the tensor XMAC's layout |
 | `fusebench.cu` | data, window, checks, timing, options |
-| `xmac.cuh`, `xmac.cu` | the XMAC stage: the shapes and layouts, the four versions (gpudifx's, tiled FP32, tensor from its layout, staged tensor from FP16 spectra) and the transpose |
+| `xmac.cuh`, `xmac.cu` | the XMAC stage: the shapes and layouts, the four versions (gpudifx's, tiled FP32, tensor from its layout, staged tensor from FP16 spectra, split by receiver) and the transpose |
 | `xmac_copy.cuh` | gpudifx's XMAC kernel, copied verbatim, and its launch geometry as GPUCore sets it |
 | `xmacbench.cu` | the XMAC benchmark: station spectra with a common signal, the double-precision check, timing |
 | `window_response.py` | sensitivity and spectral response of window designs |
@@ -218,9 +218,10 @@ XMAC (`table.txt`), ms per ms of data, 128 channels (10000 windows, 4000 from 24
 with the station processing for context, scaled by the number of stations as in the 215 W table
 ("The XMAC stage" below): `run-bench.sh` `c128-packed` at 10 stations, gpudifx 31.4 ms, the
 end-to-end kernel 4.54, the 2 kernels with an FP16 buffer 7.38 per 20 ms.  "Staged" is the tensor
-XMAC from FP16 spectra in the station kernel's own order, which it reshuffles itself.
+XMAC from FP16 spectra in the station kernel's own order, which it reshuffles itself, in its first
+version: superseded by the version split by receiver below.
 
-| stations | station: gpudifx | station: end-to-end kernel | station: 2 kernels, FP16 | XMAC: gpudifx | XMAC: tiled | XMAC: tensor | transpose | XMAC: tensor + transpose | XMAC: staged |
+| stations | station: gpudifx | station: end-to-end kernel | station: 2 kernels, FP16 | XMAC: gpudifx | XMAC: tiled | XMAC: tensor | transpose | XMAC: tensor + transpose | XMAC: staged, first version |
 |---|---|---|---|---|---|---|---|---|---|
 | 4 | 0.628 | 0.091 | 0.148 | 0.103 | 0.040 | 0.021 | 0.075 | 0.100 | 0.041 |
 | 6 | 0.943 | 0.136 | 0.221 | 0.278 | 0.066 | 0.031 | 0.125 | 0.162 | 0.048 |
@@ -237,7 +238,7 @@ XMAC from FP16 spectra in the station kernel's own order, which it reshuffles it
 Whole chain (`chain.txt`), ms per ms of data, the fastest variant of each kind; 10000 windows
 (2500 at 16 and 32 stations), 1000 at 1024 channels:
 
-| channels | stations | gpudifx today | end-to-end + gpudifx XMAC | end-to-end + tiled | end-to-end + transpose + tensor | end-to-end writing the layout + tensor | end-to-end writing FP16 spectra + staged |
+| channels | stations | gpudifx today | end-to-end + gpudifx XMAC | end-to-end + tiled | end-to-end + transpose + tensor | end-to-end writing the layout + tensor | end-to-end writing FP16 spectra + staged, first version |
 |---|---|---|---|---|---|---|---|
 | 128 | 4 | 0.753 | 0.211 | 0.136 | 0.196 | **0.134** | 0.136 |
 | 128 | 10 | 2.41 | 1.05 | 0.423 | 0.510 | 0.349 | **0.332** |
@@ -245,23 +246,73 @@ Whole chain (`chain.txt`), ms per ms of data, the fastest variant of each kind; 
 | 128 | 32 | 16.5 | 11.9 | 3.28 | 1.73 | **1.29** | 1.52 |
 | 1024 | 10 | 2.29 | 1.05 | 0.486 | 0.556 | 0.512 | **0.409** |
 
-**The staged tensor XMAC on the 2070** (its first measurements here; the 2026-11-17 run that
-would have measured it was cut off by the reset):
-- **It does not fit above 32 stations.**  It needs 2 KB of shared memory per receiver, rounded up
-  to 16 receivers: 74 KB at 48 stations, more than sm_75's 64 KB a block.  `xmacbench` now skips
-  it there with a note; `fusebench --xmac` still exits, but on an 8 GB card `run-xmac.sh` runs the
-  chain only up to 32 stations.
-- **Alone it costs 1.2-2.0x the tensor XMAC from its layout** at 128 channels up to 32 stations
-  (it reshuffles the spectra itself), and **5x at 1024 channels and 32 stations** (20.9 ms
-  against 4.1; 2.3x at 10 stations).  Not yet understood (open items).
-- **In the chain it wins wherever writing the layout costs the station kernel more than the
-  reshuffle costs the XMAC.**  Writing FP16 spectra costs the end-to-end kernel no more than FP32
-  ones (10 stations: 4.70 against 4.81 ms at 128 channels, 4.45 against 4.67 at 1024), while
-  writing the layout costs 5.68 and 7.10 ms.  At 1024 channels and 10 stations that makes the
-  staged path the fastest chain, 16% less time than tiled (6.54 ms against 7.78, and 8.20 for
-  the layout), the first tensor path ahead of tiled at 1024 channels on this card.  At 128 channels
-  it is 5% ahead of the layout path at 10 stations, level at 4 and 16, and 18% behind at 32,
-  where the XMAC's own cost dominates.
+**The staged tensor XMAC on the 2070, first version** (the 2026-11-17 run that would have
+measured it was cut off by the reset).  Its stage held 8 channels of *every* receiver, about 770
+bytes per receiver: it did not fit in sm_75's 64 KB a block above 40 stations, and alone it cost
+1.2-2.0x the tensor XMAC from its layout at 128 channels and 5x at 1024 channels and 32 stations.
+Even so it already made the fastest chain at 10 stations (128 and 1024 channels), because writing
+FP16 spectra costs the end-to-end kernel no more than FP32 ones (10 stations: 4.70 against 4.81 ms
+at 128 channels, 4.45 against 4.67 at 1024), while writing the tensor layout costs 5.68 and 7.10
+ms.  Nsight Compute (`results-local/ncu-ar313-adeller-20261118-160023-staged`) showed why it
+fell behind from 24 stations up: above 32 receivers its items no longer fitted one block, and
+the 2-3 blocks of a channel group each staged every receiver again, two of them only half of
+each 32-byte sector, so it read 3.1x the FP16 input from DRAM at 32 stations (1.15x at 16); and
+at 37 KB and more only one block fitted on an SM.  At 1024 channels the same bytes moved at half
+the bandwidth (36% of peak, 30 cycles a load waiting against 10).
+
+#### The staged XMAC split by receiver
+
+The second version (`xmac.cu`, "staged tensor") stages only the receivers a block multiplies.
+The receivers are grouped in super-blocks of KS x 16; a block takes a pair of super-blocks and a
+few channels, and its stage holds just those two super-blocks.  Up to 16 stations there is one
+super-block, every receiver, 8 channels a block, as before; above that, super-blocks of 64
+receivers (KS 4) with 4 channels and 16 warps a block: 49 KB at most, whatever the number of
+stations, at the cost of reading each receiver once per super-block it is paired with.  Two more
+changes: two neighbouring lanes now load the two halves of each 32-byte sector, with every load
+of a block of windows issued before its stores into the stage (1.1-1.2x at 10-16 stations); and
+the channel groups are fastest in the launch, so that blocks reading neighbouring parts of a
+window run together (1.3-1.5x from 32 stations up).  Super-blocks of 16 (KS 1) or 32 (KS 2, 8
+channels) were 1.9-3.5x and 1.1-2.0x slower than KS 4 from 24 stations up (`xmacbench
+--staged-tile`, `results-local/ar313-adeller-staged-20261118-160542`).  Checked against double
+precision from 2 to 100 stations, including odd counts, and 1020 channels.
+
+`run-xmac.sh` (`results-local/ar313-adeller-xmac-20261118-163053`, every check passing), ms per
+ms of data; 100 stations and 1024 channels at 64 from `xmacbench` alone (2000 and 500 windows):
+
+| channels | stations | XMAC: tensor (from its layout) | XMAC: staged, first version | XMAC: staged, split by receiver |
+|---|---|---|---|---|
+| 128 | 4 | 0.021 | 0.041 | 0.028 |
+| 128 | 6 | 0.031 | 0.048 | 0.034 |
+| 128 | 10 | 0.055 | 0.088 | 0.086 |
+| 128 | 16 | 0.106 | 0.126 | 0.117 |
+| 128 | 24 | 0.186 | 0.367 | 0.269 |
+| 128 | 32 | 0.407 | 0.658 | **0.382** |
+| 128 | 48 | 0.799 | does not fit | 1.04 |
+| 128 | 64 | 1.10 | does not fit | 1.47 |
+| 128 | 100 | 2.27 | does not fit | 4.28 |
+| 1024 | 10 | 0.057 | 0.129 | 0.119 |
+| 1024 | 32 | 0.260 | 1.31 | 0.476 |
+| 1024 | 64 | 1.02 | does not fit | 2.35 |
+
+Whole chain (`chain.txt`, the same run):
+
+| channels | stations | gpudifx today | end-to-end + tiled | end-to-end + transpose + tensor | end-to-end writing the layout + tensor | end-to-end writing FP16 spectra + staged |
+|---|---|---|---|---|---|---|
+| 128 | 4 | 0.737 | 0.133 | 0.192 | 0.131 | **0.122** |
+| 128 | 10 | 2.37 | 0.419 | 0.502 | 0.343 | **0.328** |
+| 128 | 16 | 4.46 | 0.766 | 0.810 | 0.560 | **0.547** |
+| 128 | 32 | 16.7 | 3.29 | 1.72 | 1.27 | **1.20** |
+| 1024 | 10 | 2.26 | 0.477 | 0.550 | 0.505 | **0.396** |
+
+- **FP16 spectra + the staged XMAC is now the fastest chain at every shape measured**: 7% ahead of
+  the layout path at 4 stations, 2-6% at 10-32, and 22% at 1024 channels and 10 stations (17% ahead
+  of tiled there).  It needs no tile in the station kernel and no transpose.
+- **Beyond 32 stations it trails the tensor XMAC alone**: 1.3x at 48 and 64 stations, 1.9x at 100,
+  1.8-2.3x at 1024 channels.  Counting the station kernel (no chain runs past 32 stations fit in
+  8 GB; estimated from the 10-station chain runs): about level with the layout path at 64
+  stations and 128 channels, about 7% behind at 1024 channels and 64 stations, about 30% behind
+  at 100 stations and 128 channels.  The re-reads are the cost: each receiver is read once per
+  super-block, 4 times at 100 stations, partly from DRAM (the 2070's L2 is 4 MB).
 
 ### RTX 2070 SUPER, 215 W (before 2026-11-18)
 
@@ -1084,10 +1135,13 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **The staged tensor XMAC on the 2070** ("RTX 2070 SUPER at the 150 W cap"): 5x the tensor
-  XMAC from its layout at 1024 channels and 32 stations (2.3x at 10, 1.2-2.0x at 128 channels),
-  and no fit above 32 stations in sm_75's 64 KB a block.  Profile the 1024-channel case, and see
-  whether sm_75 needs a smaller stage.  `fusebench --xmac` still exits where it does not fit.
+- **One XMAC path: the staged one** ("The staged XMAC split by receiver").  It is the fastest
+  chain wherever the 2070 can run the chain (up to 32 stations), and works at any station count,
+  but trails the tensor XMAC from its layout by 1.3x at 48-64 stations, 1.9x at 100 and about 2x
+  at 1024 channels from 32 stations.  Next: profile KS 4 at 64-100 stations (the re-reads, and
+  how much comes from DRAM), measure it on the A100 (40 MB of L2 should absorb the re-reads; its
+  164 KB of shared memory a block would allow bigger super-blocks), and then retire the transpose,
+  the layout output of the station kernel, the tensor XMAC from that layout and the tiled one.
 - **The end-to-end kernel is now arithmetic-bound on the A100** (FMA pipe 66%, special-function
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample

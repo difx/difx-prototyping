@@ -92,6 +92,8 @@ static void usage() {
 "  --rho R       correlation of the common signal between stations, default 0.1\n"
 "  --invalid F   fraction of (station, window) flagged invalid, default 0\n"
 "  --only V      run only gpudifx | tiled | tensor | staged (default all)\n"
+"  --staged-tile K  the staged XMAC's super-blocks of 16 K receivers, K = 1, 2 (8 channels a block)\n"
+"                or 4 (4 channels a block) (default: its own choice, printed)\n"
 "  --reps N      timed repetitions, default 20 (median and minimum reported)\n"
 "  --warmup N    untimed repetitions first, default 3\n"
 "  --check N     (frequency, channel) pairs checked against a double-precision reference, default 4\n"
@@ -106,6 +108,7 @@ int main(int argc, char** argv) {
     int reps = 20, warmup = 3, ncheck = 4, device = 0;
     unsigned long long seed = 1;
     std::string only;
+    int stagedTile = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -121,6 +124,7 @@ int main(int argc, char** argv) {
         else if (a == "--rho") rho = std::stod(next());
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--only") only = next();
+        else if (a == "--staged-tile") stagedTile = std::stoi(next());
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
         else if (a == "--check") ncheck = std::stoi(next());
@@ -136,6 +140,8 @@ int main(int argc, char** argv) {
     const bool runG = only.empty() || only == "gpudifx", runT = only.empty() || only == "tiled",
                runC = only.empty() || only == "tensor";
     bool runS = only.empty() || only == "staged";
+    if (stagedTile != 0 && stagedTile != 1 && stagedTile != 2 && stagedTile != 4) { usage(); return 2; }
+    xmacTensorStagedSetTile(stagedTile);
 
     CHECK_CUDA(cudaSetDevice(device));
     if (runS && !xmacTensorStagedFits(s)) {
@@ -144,6 +150,7 @@ int main(int argc, char** argv) {
         if (only == "staged") return 2;
         runS = false;
     }
+    if (runS) printf("staged tensor XMAC: super-blocks of %d x 16 receivers\n", xmacTensorStagedTile(s));
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     const int sms = prop.multiProcessorCount;

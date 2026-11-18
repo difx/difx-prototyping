@@ -10,8 +10,8 @@
 //            transposed copy of the spectra (per channel, blocks of 16 windows with the receivers
 //            as rows: TensorLayout), made by a transpose kernel that is timed separately
 //   staged   the same tensor-core products from FP16 spectra in the station kernel's own order
-//            (halfIndex), each block reshuffling its channels into the tensor layout in shared
-//            memory: no transpose, and no tile in the station kernel
+//            (halfIndex), each block reshuffling its channels of the receivers it multiplies into
+//            the tensor layout in shared memory: no transpose, and no tile in the station kernel
 #pragma once
 #include <cuda_fp16.h>
 #include "common.cuh"
@@ -97,8 +97,13 @@ void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFl
                 cudaStream_t st);
 
 // The staged tensor version: FP16 spectra (halfIndex; windows past the subint need not exist) ->
-// vis.  Exits with a message if the shared memory it needs (2 KB per receiver, rounded up to 16
-// receivers) is more than a block may have: xmacTensorStagedFits says whether it fits on this device.
+// vis.  Each block stages 8 channels of the receivers it multiplies: every receiver up to 32, else
+// two super-blocks of 16 KS receivers (KS 1 or 2), so the shared memory a block needs (at most 49
+// KB) does not grow with the number of stations.  xmacTensorStagedTile is the KS it uses for a
+// shape; xmacTensorStagedSetTile(1 or 2) forces it (0: choose again), for comparisons;
+// xmacTensorStagedFits says whether the plan fits a block on this device.
 void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int multiprocessors,
                       cudaStream_t st);
+int xmacTensorStagedTile(const XmacShape& s);
+void xmacTensorStagedSetTile(int ks);
 bool xmacTensorStagedFits(const XmacShape& s);
