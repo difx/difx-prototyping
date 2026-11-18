@@ -1064,6 +1064,50 @@ At 10 stations, ms per subint (the fastest variant of each):
   sixteenth of a sector each, left to L2 to merge).  Writing the layout from the station kernel
   does not scale with the channel count; see the open items for the alternatives.
 
+### The staged XMAC split by receiver: A100-SXM4-80GB (OzSTAR, gina302)
+
+`fusebench-ozstar.sbatch`, SLURM job 21141283, commit a790ec0, every check passing (`run-bench.sh`
+38, `run-nchan.sh`, `run-xmac.sh` 10 + 8 chain runs, `run-staged.sh` 14 x 5 runs).  gpudifx today's
+chain times match job 21060735's (gina4) to 0.1%.  `results-local/gina302-staged-20261118-171734`
+(`table.txt`) and `gina302-xmac-20261118-171514` (`chain.txt`), ms per ms of data, 10000 windows at
+128 channels, 1000 at 1024 (the chain at 100 stations: 4000):
+
+| channels | stations | XMAC: tensor (from its layout) | XMAC: transpose + tensor | XMAC: staged | staged / tensor | gpudifx today, chain | layout + tensor, chain | FP16 spectra + staged, chain |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 4 | 0.0065 | 0.0236 | 0.0099 | 1.5 | 0.167 | 0.0429 | **0.0409** |
+| 128 | 6 | 0.0087 | 0.0352 | 0.0112 | 1.3 | | | |
+| 128 | 10 | 0.0172 | 0.0604 | 0.0351 | 2.0 | 0.590 | **0.107** | 0.109 |
+| 128 | 16 | 0.0236 | 0.0911 | 0.0420 | 1.8 | 1.20 | 0.166 | **0.164** |
+| 128 | 24 | 0.0392 | 0.137 | 0.0997 | 2.5 | | | |
+| 128 | 32 | 0.0579 | 0.189 | 0.125 | 2.2 | 4.04 | **0.344** | 0.368 |
+| 128 | 48 | 0.108 | 0.304 | 0.313 | 2.9 | | | |
+| 128 | 64 | 0.183 | 0.443 | 0.398 | 2.2 | 14.5 | **0.756** | 0.884 |
+| 128 | 100 | 0.448 | 0.854 | 1.15 | 2.6 | 32.9 | **1.41** | 1.98 |
+| 128 | 128 | 0.670 | 1.19 | 1.41 | 2.1 | | | |
+| 1024 | 10 | 0.0202 | 0.0641 | 0.0380 | 1.9 | 0.572 | 0.173 (tiled 0.146) | **0.131** |
+| 1024 | 32 | 0.0641 | 0.194 | 0.130 | 2.0 | 3.46 | 0.564 (transpose + tensor 0.490) | **0.427** |
+| 1024 | 64 | 0.210 | 0.468 | 0.468 | 2.2 | | | |
+| 1024 | 100 | 0.518 | 0.922 | 1.41 | 2.7 | | | |
+
+- **Up to 16 stations the staged path is level with the best chain or ahead of it**: 5% ahead of
+  the layout path at 4 stations, 2% behind at 10, 1% ahead at 16.  At 1024 channels it is the
+  fastest chain by 10-13% (24% ahead of the layout path, which writes its tile at low occupancy
+  here).  Against gpudifx today: 4.1x at 4 stations, 5.4x at 10, 7.3x at 16, 11x at 32, 16x at 64
+  and 100; 4.4x and 8.1x at 1024 channels.
+- **From 32 stations it falls behind the layout path**: 7% at 32, 17% at 64, 41% at 100.  The
+  staged XMAC alone beats transpose + tensor up to 64 stations (and at 1024 channels up to 32), and
+  trails it at 100-128.
+- **The A100's 40 MB of L2 does not close the gap; the staging itself is the cost here.**  The
+  staged XMAC is 1.3-2.9x the tensor XMAC at every station count, and 1.5x already at 4 stations,
+  where it reads every receiver once.  Against the 2070 the tensor XMAC gains 3.2x at 10 stations,
+  the staged one 2.3x.  Probably its occupancy (not yet profiled on the A100): KS 2 and KS 4 use
+  128 and 112 registers a thread (sm_75 build), which allows 16 warps an SM, a quarter of the
+  A100's 64; and the stores into the stage have 2-way bank conflicts, with two barriers per 16
+  windows.
+- **The automatic choice holds within 4% except at 48 stations**: KS 1 at 4-6 stations, 2 at 10-16,
+  4 from 24 (KS 2 ties at 24 and is 8% faster at 48); KS 4 is 1.2-1.4x faster than KS 2 from 64
+  stations up, and KS 1 is 1.4-3.3x slower than the choice from 24 up.
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -1136,13 +1180,15 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **One XMAC path: the staged one** ("The staged XMAC split by receiver").  It is the fastest
-  chain wherever the 2070 can run the chain (up to 32 stations), and works at any station count,
-  but trails the tensor XMAC from its layout by 1.3x at 48-64 stations, 1.9x at 100 and about 2x
-  at 1024 channels from 32 stations.  Next: profile KS 4 at 64-100 stations (the re-reads, and
-  how much comes from DRAM), measure it on the A100 (40 MB of L2 should absorb the re-reads; its
-  164 KB of shared memory a block would allow bigger super-blocks), and then retire the transpose,
-  the layout output of the station kernel, the tensor XMAC from that layout and the tiled one.
+- **One XMAC path: the staged one** ("The staged XMAC split by receiver", 2070 and A100).  It is
+  the fastest chain or level with it up to 16 stations on both GPUs and at 1024 channels, and
+  works at any station count, but trails the layout path from 32 stations: on the A100 by 7% at
+  32, 17% at 64 and 41% at 100 (the staged XMAC alone is 1.3-2.9x the tensor XMAC from its layout
+  at every station count there).  Next: profile it on the A100 (`ncu-ozstar.sbatch`, at 10 and 64
+  stations) to see whether occupancy is the limit (25% of the warps), and if so let more blocks
+  share an SM (fewer registers up to 16 stations; the A100's 164 KB of shared memory would hold
+  three or four stages).  Then retire the transpose, the layout output of the station kernel, the
+  tensor XMAC from that layout and the tiled one.
 - **The end-to-end kernel is now arithmetic-bound on the A100** (FMA pipe 66%, special-function
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample
