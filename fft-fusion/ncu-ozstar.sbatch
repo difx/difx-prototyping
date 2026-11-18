@@ -26,6 +26,10 @@
 # performance counters are restricted to administrators, ncu fails with ERR_NVGPUCTRPERM; the job
 # then stops and says so.  ncu locks the GPU to its base clock while it profiles (the A100's
 # 1095 MHz rather than 1410), so its durations are longer than fusebench's.
+#
+# CASES=<extended regex> profiles only the cases whose names match, e.g. the xmacbench ones alone
+# (a few minutes once built):
+#     sbatch --export=ALL,CASES='^x' ncu-ozstar.sbatch
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
@@ -87,14 +91,16 @@ C128=(--nchan 128 --nwin 10000)
 C1024=(--nchan 1024 --nwin 1000)
 fail=0
 
-# profile <case> <kernel regex> <fusebench options...>: the first launch of the kernel
-profile() {
-    local name=$1 kernel=$2
-    shift 2
-    echo "== $name: $kernel in fusebench $*"
+# run_profile <program> <case> <kernel regex> <options...>: the first launch of the kernel; only the
+# cases whose names match $CASES (an extended regex) when it is set
+run_profile() {
+    local prog=$1 name=$2 kernel=$3
+    shift 3
+    [ -n "${CASES:-}" ] && ! [[ $name =~ $CASES ]] && return
+    echo "== $name: $kernel in $prog $*"
     local t0=$(date +%s)
     "$NCU" --set full --import-source yes -k "regex:$kernel" -c 1 -f -o "$OUT/$name" \
-        ./fusebench "$@" "${QUICK[@]}" > "$OUT/$name.run.log" 2>&1
+        "./$prog" "$@" "${QUICK[@]}" > "$OUT/$name.run.log" 2>&1
     local rc=$?
     if grep -q ERR_NVGPUCTRPERM "$OUT/$name.run.log"; then
         echo "ERROR: ncu may not read this GPU's performance counters (ERR_NVGPUCTRPERM): profiling" \
@@ -111,6 +117,8 @@ profile() {
         "$OUT/$name.txt" | head -8 | cut -c1-150
     echo "   ($(( $(date +%s) - t0 )) s)"
 }
+profile() { run_profile fusebench "$@"; }     # profile <case> <kernel regex> <fusebench options...>
+profilex() { run_profile xmacbench "$@"; }    # profilex <case> <kernel regex> <xmacbench options...>
 
 # the fused kernel with an FP32 and an FP16 buffer as input; a plain streaming kernel (the
 # fixed-point rotation, post_kernel) for comparison
@@ -148,6 +156,18 @@ profile c128-half-out-fpb4         fused_fft_half "${C128[@]}" --input packed --
 profile c1024-half-out-fpb1        fused_fft_half "${C1024[@]}" --input packed --xmac --fpb 1 --ept 16
 profile c128-xmac-staged           xmac_staged_kernel "${C128[@]}" --input packed --xmac --fpb 4 --ept 16
 profile c1024-xmac-staged          xmac_staged_kernel "${C1024[@]}" --input packed --xmac --fpb 1 --ept 16
+
+# the staged tensor XMAC alone (xmacbench, its own spectra), at each super-block size it chooses
+# (KS 1 at 4 stations, 2 at 10, 4 from 24), KS 2 forced at 64 for comparison, and the tensor XMAC
+# from its layout at 10 and 64 stations: why the staged one is 1.3-2.9x the tensor one on the A100
+profilex xstaged-c128-n4           xmac_staged_kernel --nchan 128 --nwin 10000 --nant 4 --only staged
+profilex xstaged-c128-n10          xmac_staged_kernel --nchan 128 --nwin 10000 --nant 10 --only staged
+profilex xstaged-c128-n64          xmac_staged_kernel --nchan 128 --nwin 10000 --nant 64 --only staged
+profilex xstaged-c128-n64-ks2      xmac_staged_kernel --nchan 128 --nwin 10000 --nant 64 --only staged --staged-tile 2
+profilex xstaged-c128-n100         xmac_staged_kernel --nchan 128 --nwin 10000 --nant 100 --only staged
+profilex xstaged-c1024-n32         xmac_staged_kernel --nchan 1024 --nwin 1000 --nant 32 --only staged
+profilex xtensor-c128-n10          xmac_tensor_kernel --nchan 128 --nwin 10000 --nant 10 --only tensor
+profilex xtensor-c128-n64          xmac_tensor_kernel --nchan 128 --nwin 10000 --nant 64 --only tensor
 
 tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"

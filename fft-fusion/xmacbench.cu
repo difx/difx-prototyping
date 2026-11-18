@@ -255,6 +255,7 @@ int main(int argc, char** argv) {
     bool pass = true;
     std::vector<float2> hv(s.visCount());
     for (const auto& v : variants) {
+        if (picks.empty()) break;                                              // --check 0: nothing to check
         CHECK_CUDA(cudaMemset(vis, 0xff, s.visCount() * sizeof(float2)));     // NaN: anything unwritten shows
         v.run();
         CHECK_CUDA(cudaStreamSynchronize(st));
@@ -276,7 +277,7 @@ int main(int argc, char** argv) {
         printf("check: %s vs double: rms %.2e, max %.2e (relative to rms; limits %.0e, %.0e)  %s\n", v.name, rms, mx,
                v.tol, 30 * v.tol, ok ? "OK" : "FAIL");
     }
-    printf("check: %s\n", pass ? "PASS" : "FAIL");
+    printf("check: %s\n", picks.empty() ? "none (--check 0)" : pass ? "PASS" : "FAIL");
 
     // ---- timing ----
     printf("\ntiming per subint, median [min] of %d, ms:\n", reps);
