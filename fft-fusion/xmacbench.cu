@@ -30,6 +30,16 @@ __device__ static inline float2 gauss(unsigned long long seed, unsigned long lon
 // Station spectra: in each band, a signal common to all stations (correlation rho between any two
 // stations, the same polarisation) plus each station's own noise; the polarisations are
 // independent.  The channels past nchan, and invalid windows, are zero.
+// The FP32 spectra as the staged tensor XMAC's FP16 input (halfIndex), standing in for the station
+// kernel's FP16 output; not timed.
+__global__ void to_half_spectra(XmacShape s, const float2* spec, __half2* h) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < s.halfCount(); i += (size_t)gridDim.x * blockDim.x) {
+        const int c = (int)(i % s.nchan);
+        const size_t t = i / s.nchan;             // (ant, win, band)
+        h[i] = __float22half2_rn(spec[t * s.fftchannels + c]);
+    }
+}
+
 __global__ void make_spectra(XmacShape s, unsigned long long seed, float rho, const bool* valid, float2* spec) {
     const size_t n = (size_t)s.nant * s.nwin * s.nband() * s.fftchannels;
     const float a = sqrtf(rho), b = sqrtf(1.f - rho);
@@ -81,7 +91,7 @@ static void usage() {
 "  --bw MHz      bandwidth per band, for the real-time figure, default 64\n"
 "  --rho R       correlation of the common signal between stations, default 0.1\n"
 "  --invalid F   fraction of (station, window) flagged invalid, default 0\n"
-"  --only V      run only gpudifx | tiled | tensor (default all)\n"
+"  --only V      run only gpudifx | tiled | tensor | staged (default all)\n"
 "  --reps N      timed repetitions, default 20 (median and minimum reported)\n"
 "  --warmup N    untimed repetitions first, default 3\n"
 "  --check N     (frequency, channel) pairs checked against a double-precision reference, default 4\n"
@@ -120,18 +130,28 @@ int main(int argc, char** argv) {
     }
     s.fftchannels = complexData ? s.nchan : 2 * s.nchan;
     if (s.nant < 2 || s.nfreq < 1 || s.nchan < 1 || s.nwin < 16 || reps < 1 || rho < 0 || rho > 1 ||
-        (!only.empty() && only != "gpudifx" && only != "tiled" && only != "tensor")) { usage(); return 2; }
+        (!only.empty() && only != "gpudifx" && only != "tiled" && only != "tensor" && only != "staged")) {
+        usage(); return 2;
+    }
     const bool runG = only.empty() || only == "gpudifx", runT = only.empty() || only == "tiled",
                runC = only.empty() || only == "tensor";
+    bool runS = only.empty() || only == "staged";
 
     CHECK_CUDA(cudaSetDevice(device));
+    if (runS && !xmacTensorStagedFits(s)) {
+        printf("staged tensor XMAC: skipped, its shared memory for %d receivers is more than a block may have here\n",
+               s.nrecv());
+        if (only == "staged") return 2;
+        runS = false;
+    }
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     const int sms = prop.multiProcessorCount;
     const TensorLayout L = tensorLayout(s);
     const size_t nspec = (size_t)s.nant * s.nwin * s.nband() * s.fftchannels;
     const double gib = 1.0 / 1073741824.0;
-    const double specBytes = nspec * sizeof(float2), hBytes = runC ? L.count(s) * sizeof(__half) : 0;
+    const double specBytes = nspec * sizeof(float2), hBytes = runC ? L.count(s) * sizeof(__half) : 0,
+                 halfBytes = runS ? s.halfCount() * sizeof(__half2) : 0;
     const double subintMs = (double)s.nwin * s.fftchannels / (complexData ? bw : 2 * bw) / 1000.0;
     printf("GPU %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, sms);
     printf("%d stations x %d frequencies x 2 polarisations, %d channels, %d windows (subint %.3f ms); "
@@ -141,7 +161,7 @@ int main(int argc, char** argv) {
            "%.2f GiB (FP16, %d receivers)\n", specBytes * gib, s.fftchannels, hBytes * gib, s.nrecv());
     size_t freeMem, totalMem;
     CHECK_CUDA(cudaMemGetInfo(&freeMem, &totalMem));
-    if (specBytes + hBytes + 2 * s.visCount() * sizeof(float2) > 0.95 * freeMem) {
+    if (specBytes + hBytes + halfBytes + 2 * s.visCount() * sizeof(float2) > 0.95 * freeMem) {
         fprintf(stderr, "not enough GPU memory (%.2f GiB free): use fewer --nwin\n", freeMem * gib);
         return 2;
     }
@@ -162,6 +182,12 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMalloc(&h, L.count(s) * sizeof(__half)));
         CHECK_CUDA(cudaMemset(h, 0, L.count(s) * sizeof(__half)));     // the slack at the end
     }
+    __half2* hs = nullptr;
+    if (runS) {
+        CHECK_CUDA(cudaMalloc(&hs, s.halfCount() * sizeof(__half2)));
+        to_half_spectra<<<4096, 256>>>(s, (const float2*)spec, hs);
+        CHECK_CUDA(cudaGetLastError());
+    }
     cuFloatComplex* vis;
     CHECK_CUDA(cudaMalloc(&vis, s.visCount() * sizeof(float2)));
     cudaStream_t st;
@@ -177,6 +203,8 @@ int main(int argc, char** argv) {
     if (runC) variants.push_back({"tensor (FP16 in, FP32 sums): transpose + XMAC", 1e-3, [&] {
         xmacTranspose(s, L, spec, h, st);
         xmacTensor(s, L, h, vis, sms, st); }});
+    if (runS) variants.push_back({"staged tensor (FP16 spectra, reshuffled in the XMAC)", 1e-3,
+                                  [&] { xmacTensorStaged(s, hs, vis, sms, st); }});
 
     // ---- reference: the (frequency, channel) pairs checked, in double ----
     struct Pick { int f, c; };

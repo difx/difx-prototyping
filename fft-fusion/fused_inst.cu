@@ -37,12 +37,33 @@ using FFTn = decltype(FFTBase() + ElementsPerThread<E>() + FFTsPerBlock<FPB>());
 // post-FFT stage (FracRotateFixed, stages.cuh).  The launch has fewer than 2^32 spectra
 // (fusebench checks), so the index arithmetic is 32-bit.
 //
+// Out is where the spectra go: OutF32 (FP32, Geometry::index; an invalid window's spectrum is
+// written unrotated, and the XMAC skips it by its flag) or OutHalf (FP16, scaled, in the same
+// order with nchan channels a spectrum, XmacShape::halfIndex; invalid windows as zeros), each
+// store of consecutive channels by consecutive threads.
+//
 // With CROSSPOL the cross-pol autocorrelations are formed here too: bands 2f and 2f+1 of a window
 // are spectra y and y+1 of the same block (band fastest, even nband, even FFTs per block), and
 // thread (x, y) and (x, y+1) hold the same channels, so they swap values through shared memory.
-template<class FFT, class Pre, class Post, bool CROSSPOL>
+struct OutF32 {
+    cuFloatComplex* p;
+    __device__ __forceinline__ void put(const Geometry& g, int ant, int win, int band, unsigned k, cuFloatComplex v,
+                                        bool) const {
+        p[g.index(ant, win, band, k)] = v;
+    }
+};
+struct OutHalf {
+    HalfOut o;
+    __device__ __forceinline__ void put(const Geometry&, int ant, int win, int band, unsigned k, cuFloatComplex v,
+                                        bool valid) const {
+        o.h[o.s.halfIndex(ant, win, band, k)] = valid ? __floats2half2_rn(v.x * o.scale, v.y * o.scale)
+                                                      : __float2half2_rn(0.f);
+    }
+};
+
+template<class FFT, class Pre, class Post, bool CROSSPOL, class Out>
 __device__ __forceinline__ void fusedBody(const Geometry& g, const Pre& pre, const Post& post,
-                                          cuFloatComplex* out, int ant0, unsigned long long nfft) {
+                                          const Out& out, int ant0, unsigned long long nfft) {
     using complex_type = typename FFT::value_type;
     extern __shared__ __align__(alignof(float4)) unsigned char smem[];
     constexpr unsigned N = size_of<FFT>::value;
@@ -80,7 +101,7 @@ __device__ __forceinline__ void fusedBody(const Geometry& g, const Pre& pre, con
             cuFloatComplex v = make_cuFloatComplex(td[i].x, td[i].y);
             if (valid)
                 v = post.apply(g, ant, win, band, k, v);
-            out[g.index(ant, win, band, k)] = v;
+            out.put(g, ant, win, band, k, v, valid);
             if (CROSSPOL)
                 td[i] = complex_type{v.x, v.y};
         }
@@ -246,7 +267,14 @@ template<class FFT, class Pre, class Post, bool CROSSPOL>
 __launch_bounds__(FFT::max_threads_per_block)
 __global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* out,
                                int ant0, unsigned long long nfft) {
-    fusedBody<FFT, Pre, Post, CROSSPOL>(g, pre, post, out, ant0, nfft);
+    fusedBody<FFT, Pre, Post, CROSSPOL>(g, pre, post, OutF32{out}, ant0, nfft);
+}
+
+// The same writing FP16 spectra (HalfOut) for the staged tensor XMAC.
+template<class FFT, class Pre, class Post>
+__launch_bounds__(FFT::max_threads_per_block)
+__global__ void fused_fft_half(Geometry g, Pre pre, Post post, OutHalf out, int ant0, unsigned long long nfft) {
+    fusedBody<FFT, Pre, Post, false>(g, pre, post, out, ant0, nfft);
 }
 
 // The same with the registers capped (--regcap): REGCAP is a number of threads per SM to make
@@ -266,7 +294,7 @@ template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
 __launch_bounds__(FFT::max_threads_per_block, minBlocks(REGCAP, FFT::max_threads_per_block))
 __global__ void fused_fft_frac_capped(Geometry g, Pre pre, Post post, cuFloatComplex* out,
                                       int ant0, unsigned long long nfft) {
-    fusedBody<FFT, Pre, Post, CROSSPOL>(g, pre, post, out, ant0, nfft);
+    fusedBody<FFT, Pre, Post, CROSSPOL>(g, pre, post, OutF32{out}, ant0, nfft);
 }
 
 template<class FFT, class Pre, class Post, bool CROSSPOL, unsigned REGCAP>
@@ -326,6 +354,36 @@ static bool launchVariant(const Geometry& g, const PreVariant& pre, const FracPa
     return crossDone;
 }
 
+template<class FFT>
+static void launchHalfVariant(const Geometry& g, const PreVariant& pre, const FracParams& p, const HalfOut& o,
+                              int ant0, int nant, cudaStream_t st) {
+    withPre(pre, [&](auto stage) {
+        using Pre = decltype(stage);
+        if constexpr (std::is_same<Pre, PreDecodeLean<2>>::value) {
+            using Post = FracRotateFixed<false>;
+            auto kernel = fused_fft_half<FFT, Pre, Post>;
+            constexpr unsigned smemBytes = FFT::shared_memory_size;
+            static int regs = -1;
+            if (regs < 0) {
+                CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
+                cudaFuncAttributes attr;
+                CHECK_CUDA(cudaFuncGetAttributes(&attr, kernel));
+                regs = attr.numRegs;
+            }
+            fusedLastRegisters = regs;
+            Post post;
+            post.p = p;
+            const unsigned long long nfft = (unsigned long long)nant * g.nwin * g.nband;
+            const unsigned long long blocks = (nfft + FFT::ffts_per_block - 1) / FFT::ffts_per_block;
+            kernel<<<(unsigned)blocks, FFT::block_dim, smemBytes, st>>>(g, stage, post, OutHalf{o}, ant0, nfft);
+            CHECK_CUDA(cudaGetLastError());
+        } else {
+            fprintf(stderr, "the FP16 output is compiled for the 2-bit lean decode only\n");
+            exit(2);
+        }
+    });
+}
+
 template<unsigned E, unsigned FPB, unsigned REGCAP = 0>
 static void addVariant(std::vector<FusedVariant>& v) {
     // only FFTs-per-block counts that fit in a block of 1024 threads
@@ -336,10 +394,12 @@ static void addVariant(std::vector<FusedVariant>& v) {
             if (e.fpb == FPB && e.ept == E && e.regcap == REGCAP) return;
         void (*tensor)(const Geometry&, const PreVariant&, const FracParams&, const TensorOut&, int, int,
                        cudaStream_t) = nullptr;
-        if constexpr (REGCAP == 0) tensor = &launchTensorVariant<FFT>;
+        void (*half)(const Geometry&, const PreVariant&, const FracParams&, const HalfOut&, int, int,
+                     cudaStream_t) = nullptr;
+        if constexpr (REGCAP == 0) { tensor = &launchTensorVariant<FFT>; half = &launchHalfVariant<FFT>; }
         v.push_back({FPB, E, FFT::max_threads_per_block, FFT::shared_memory_size,
                      E == E0 && FPB == FFTBase::suggested_ffts_per_block && REGCAP == 0, REGCAP,
-                     &launchVariant<FFT, REGCAP>, tensor});
+                     &launchVariant<FFT, REGCAP>, tensor, half});
     }
 }
 

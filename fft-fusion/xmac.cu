@@ -262,3 +262,205 @@ void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFl
     xmac_tensor_kernel<<<dim3(nb, s.nfreq, nchunk), 128, 0, st>>>(s, L, h, (float2*)vis, pairs, npairs, nchunk);
     CHECK_CUDA(cudaGetLastError());
 }
+
+// ---- staged tensor ---------------------------------------------------------------------------
+// The tensor-core XMAC from FP16 spectra in the station kernel's order (halfIndex), each block
+// doing the reshuffle into the tensor layout itself, in shared memory.  Block: SK = 8 consecutive
+// channels of one frequency, 8 warps; its work items are (channel, pair of 16-receiver blocks
+// I <= J), pair fastest, up to SIPW a warp (warp w takes items w, w + 8, ...), their sums kept in
+// registers over the whole window loop.  When a channel group has more items than one block takes,
+// they are split over several blocks (grid y), each loading only the channel quads its items use.
+//
+// Per block of 16 windows the block loads its channels for every receiver into a stage in shared
+// memory, [channel][plane][receiver][window] (TensorLayout for one channel; the rows up to the
+// next multiple of 16 stay zero, so the spare products are of zeros), then each warp runs its
+// items' WMMA products from there.  A load task is (pair of windows, receiver): for each of the
+// block's channel quads (one or two) two 16-byte loads, 4 channels of window w and of w + 1, so a
+// lane reads whole 32-byte sectors; written as __half2 (real or imaginary parts of the two
+// windows, per channel).  Lanes take the 8 window pairs fastest, then 4 receivers, so a warp's
+// stores fall in 32 different banks.  Load, barrier, products, barrier: the other block on the SM
+// (at most 128 registers a thread for two) runs while this one waits.  (Loading the next block of
+// windows into registers during the products, with two stages, needed more registers than that:
+// it spilled, and was slower.)
+// The stage's rows are LD = 24 halves apart (48 bytes): with 16 (32 bytes) WMMA's loads from it had
+// 4-way bank conflicts.
+constexpr int SK = 8, SW = 8, SIPW = 4, LD = 24;
+static __host__ __device__ int stagedRows(int R) { return (R + 15) / 16 * 16; }
+static __host__ __device__ int stagedChannelStride(int rows) { return 2 * rows * LD + 16; }     // halves
+
+template<int MAXT>
+__global__ void __launch_bounds__(SW * 32, 2) xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec,
+                                                              float2* vis, const int2* __restrict__ pairs,
+                                                              int npairs, int ngroup, int nchunk) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smraw[];
+    const int R = s.nrecv(), rows = stagedRows(R), CS = stagedChannelStride(rows);
+    __half* stage = reinterpret_cast<__half*>(smraw);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int c0 = blockIdx.x * SK;
+    const int f = blockIdx.y / ngroup, group = blockIdx.y % ngroup;
+    const int ntb = (s.nwin + 15) / 16;
+    const int per = (ntb + nchunk - 1) / nchunk;
+    const int tb0 = blockIdx.z * per, tb1 = min(ntb, tb0 + per);
+    const int nitems = SK * npairs;
+    const int item0 = group * SW * SIPW;
+    // the channel quads this block's items use
+    const int q0 = (item0 / npairs) / 4, q1 = (min(nitems, item0 + SW * SIPW) - 1) / npairs / 4;
+
+    // the spare rows (R .. rows - 1) of every channel and plane: zero once
+    for (int u = threadIdx.x; u < SK * 2 * (rows - R) * 16; u += blockDim.x) {
+        const int t = u % 16, r = R + (u / 16) % (rows - R), cp = u / (16 * (rows - R));
+        stage[(cp >> 1) * CS + (cp & 1) * rows * LD + r * LD + t] = __float2half(0.f);
+    }
+
+    // the load tasks: (window pair wp, receiver r), wp fastest; a thread's tasks are fixed
+    const size_t wstride = (size_t)s.nband() * s.nchan / 4;            // uint4 from one window to the next
+    bool quad[2];                                                      // the block's quads that exist
+#pragma unroll
+    for (int q = 0; q < 2; q++) quad[q] = q >= q0 && q <= q1 && c0 + 4 * q < s.nchan;
+    const uint4* src[MAXT];
+    int dst[MAXT], wofs[MAXT];
+    bool live[MAXT];
+#pragma unroll
+    for (int i = 0; i < MAXT; i++) {
+        const int t = threadIdx.x + i * SW * 32;
+        const int wp = t % 8, r = t / 8;
+        live[i] = r < R;
+        wofs[i] = 2 * wp;
+        src[i] = reinterpret_cast<const uint4*>(spec + s.halfIndex(live[i] ? r >> 1 : 0, 0,
+                                                                   2 * f + (r & 1), c0)) + 2 * wp * wstride;
+        dst[i] = r * LD + 2 * wp;
+    }
+    // one block of 16 windows into the stage
+    auto load = [&](int tb) {
+        const uint4 z = make_uint4(0, 0, 0, 0);
+#pragma unroll
+        for (int i = 0; i < MAXT; i++) {
+            if (!live[i]) continue;
+            const int w = tb * 16 + wofs[i];
+            const uint4* p = src[i] + (size_t)tb * 16 * wstride;
+            const bool okA = w < s.nwin, okB = w + 1 < s.nwin;
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+                if (!quad[q]) continue;
+                const uint4 va = okA ? __ldg(p + q) : z, vb = okB ? __ldg(p + wstride + q) : z;
+                const __half2* a = reinterpret_cast<const __half2*>(&va);
+                const __half2* b = reinterpret_cast<const __half2*>(&vb);
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    __half* d = stage + dst[i] + (4 * q + k) * CS;
+                    *reinterpret_cast<__half2*>(d) = __lows2half2(a[k], b[k]);                 // real parts
+                    *reinterpret_cast<__half2*>(d + rows * LD) = __highs2half2(a[k], b[k]);    // imaginary parts
+                }
+            }
+        }
+    };
+
+    int cl[SIPW];
+    int2 IJ[SIPW];
+    bool on[SIPW];
+#pragma unroll
+    for (int j = 0; j < SIPW; j++) {
+        const int it = item0 + warp + SW * j;
+        cl[j] = it / npairs;
+        on[j] = it < nitems && c0 + cl[j] < s.nchan;
+        IJ[j] = on[j] ? pairs[it % npairs] : make_int2(0, 0);
+    }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> vr[SIPW], vi[SIPW];
+#pragma unroll
+    for (int j = 0; j < SIPW; j++) { wmma::fill_fragment(vr[j], 0.f); wmma::fill_fragment(vi[j], 0.f); }
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> ar, ai;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> br, bi;
+
+    for (int tb = tb0; tb < tb1; tb++) {
+        load(tb);
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < SIPW; j++) {
+            if (!on[j]) continue;
+            const __half* p = stage + cl[j] * CS;
+            wmma::load_matrix_sync(ar, p + IJ[j].x * 16 * LD, LD);
+            wmma::load_matrix_sync(ai, p + rows * LD + IJ[j].x * 16 * LD, LD);
+            wmma::load_matrix_sync(br, p + IJ[j].y * 16 * LD, LD);
+            wmma::load_matrix_sync(bi, p + rows * LD + IJ[j].y * 16 * LD, LD);
+            wmma::mma_sync(vr[j], ar, br, vr[j]);
+            wmma::mma_sync(vr[j], ai, bi, vr[j]);
+            wmma::mma_sync(vi[j], ai, br, vi[j]);
+#pragma unroll
+            for (int e = 0; e < ar.num_elements; e++) ar.x[e] = __hneg(ar.x[e]);
+            wmma::mma_sync(vi[j], ar, bi, vi[j]);
+        }
+        __syncthreads();                                    // done with the stage
+    }
+
+    // the sums out, through a 2 KB scratch per warp (the stage is free once all warps are here)
+    __syncthreads();
+    float* sm = reinterpret_cast<float*>(smraw) + warp * 512;
+#pragma unroll
+    for (int j = 0; j < SIPW; j++) {
+        if (!on[j]) continue;
+        wmma::store_matrix_sync(sm, vr[j], 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(sm + 256, vi[j], 16, wmma::mem_row_major);
+        __syncwarp();
+        const int c = c0 + cl[j];
+        for (int e = lane; e < 256; e += 32) {
+            const int r1 = IJ[j].x * 16 + (e >> 4), r2 = IJ[j].y * 16 + (e & 15);
+            if (r1 >= R || r2 >= R || (r1 >> 1) >= (r2 >> 1)) continue;
+            const int bl = baselineIndex(r1 >> 1, r2 >> 1, s.nant);
+            addVis((cuFloatComplex*)vis, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), sm[e], sm[256 + e],
+                   nchunk > 1);     // the groups take different items: only window chunks share sums
+        }
+        __syncwarp();
+    }
+}
+
+// the staged XMAC's shared memory per block, and the most a block may have on this device
+static size_t stagedSmem(const XmacShape& s) {
+    const size_t stageBytes = (size_t)SK * stagedChannelStride(stagedRows(s.nrecv())) * sizeof(__half);
+    return std::max(stageBytes, (size_t)SW * 512 * sizeof(float));
+}
+static int maxBlockSmem() {
+    int dev, maxSmem;
+    CHECK_CUDA(cudaGetDevice(&dev));
+    CHECK_CUDA(cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    return maxSmem;
+}
+
+bool xmacTensorStagedFits(const XmacShape& s) { return stagedSmem(s) <= (size_t)maxBlockSmem(); }
+
+template<int MAXT>
+static void launchStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, const int2* pairs, int npairs,
+                         int ngroup, int sms, cudaStream_t st) {
+    static int maxSmem = 0;
+    static size_t smemSet = 0;
+    if (!maxSmem) maxSmem = maxBlockSmem();
+    const size_t smem = stagedSmem(s);
+    if (smem > (size_t)maxSmem) {
+        fprintf(stderr, "staged tensor XMAC: %zu bytes of shared memory for %d receivers, more than a block's %d\n",
+                smem, s.nrecv(), maxSmem);
+        exit(2);
+    }
+    if (smem > smemSet) {
+        CHECK_CUDA(cudaFuncSetAttribute(xmac_staged_kernel<MAXT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        smemSet = smem;
+    }
+    const unsigned cg = (s.nchan + SK - 1) / SK;
+    const int ntb = (s.nwin + 15) / 16;
+    const int nchunk = windowChunks((long long)cg * s.nfreq * ngroup * SW * 32, ntb, 4, sms);
+    CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
+    xmac_staged_kernel<MAXT><<<dim3(cg, s.nfreq * ngroup, nchunk), SW * 32, smem, st>>>(
+        s, spec, (float2*)vis, pairs, npairs, ngroup, nchunk);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int sms, cudaStream_t st) {
+    if (s.nchan % 4) { fprintf(stderr, "staged tensor XMAC: the channel count must be a multiple of 4\n"); exit(2); }
+    int npairs;
+    const int2* pairs = tilePairs(stagedRows(s.nrecv()) / 16, npairs);
+    const int ngroup = (SK * npairs + SW * SIPW - 1) / (SW * SIPW);
+    const int tasks = 8 * s.nrecv();                              // (window pair, receiver)
+    if (tasks <= SW * 32) launchStaged<1>(s, spec, vis, pairs, npairs, ngroup, sms, st);
+    else if (tasks <= 2 * SW * 32) launchStaged<2>(s, spec, vis, pairs, npairs, ngroup, sms, st);
+    else if (tasks <= 4 * SW * 32) launchStaged<4>(s, spec, vis, pairs, npairs, ngroup, sms, st);
+    else launchStaged<8>(s, spec, vis, pairs, npairs, ngroup, sms, st);
+}

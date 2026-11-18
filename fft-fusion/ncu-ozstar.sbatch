@@ -142,6 +142,12 @@ profile c1024-tensor-out-fpb4      fused_fft_tensor "${C1024[@]}" --input packed
 profile c128-xmac-tensor           xmac_tensor_kernel "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
 profile c128-xmac-tiled            xmac_tiled_kernel "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
 profile c128-xmac-gpudifx          gpu_fuse_xmac_and_average "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
+# the end-to-end kernel writing FP16 spectra in its own order, and the staged tensor XMAC that
+# reshuffles them itself (at the variants fastest on the A100 for the FP32 output)
+profile c128-half-out-fpb4         fused_fft_half "${C128[@]}" --input packed --xmac --fpb 4 --ept 16
+profile c1024-half-out-fpb1        fused_fft_half "${C1024[@]}" --input packed --xmac --fpb 1 --ept 16
+profile c128-xmac-staged           xmac_staged_kernel "${C128[@]}" --input packed --xmac --fpb 4 --ept 16
+profile c1024-xmac-staged          xmac_staged_kernel "${C1024[@]}" --input packed --xmac --fpb 1 --ept 16
 
 tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"

@@ -19,7 +19,7 @@ cd "$(dirname "$0")"
 OUT=results-local/$(hostname -s)-nchan-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
-  nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap --format=csv,noheader
+  nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap,enforced.power.limit,power.default_limit --format=csv,noheader
 } > "$OUT/system.txt"
 cat "$OUT/system.txt"
 

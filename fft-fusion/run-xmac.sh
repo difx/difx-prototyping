@@ -9,11 +9,13 @@
 # data), for 4 ... 64 stations; and 1024 channels, 1000 windows (16 ms) for 10 and 32 stations.
 # On a GPU with less than 40 GB the larger station counts use 4000 windows (the times per ms of
 # data still compare).  Each run: gpudifx's XMAC kernel, the register-tiled FP32 kernel, and the
-# tensor-core kernel with the transpose into its layout (timed separately).  Then the whole chain
+# tensor-core kernel with the transpose into its layout (timed separately), and the staged
+# tensor-core kernel from FP16 spectra (reshuffling them itself).  Then the whole chain
 # (fusebench --xmac: the station processing from 2-bit packed data, no window, and the XMAC) for
 # 4 ... 64 stations at 128 channels and 10 and 32 at 1024: gpudifx today (both stages), and the
-# end-to-end kernel followed by gpudifx's XMAC, the tiled one, the transpose and the tensor one, or
-# writing the tensor layout itself (the fastest variant of each kind).  Logs go to
+# end-to-end kernel followed by gpudifx's XMAC, the tiled one, the transpose and the tensor one,
+# writing the tensor layout itself + the tensor one, or writing FP16 spectra + the staged tensor
+# one (the fastest variant of each kind).  Logs go to
 # results-local/<host>-xmac-<stamp>/, with table.txt (the XMAC alone) and chain.txt (the whole
 # chain) the summaries: ms per subint and ms per ms of data (below 1: faster than real time).
 
@@ -23,15 +25,15 @@ cd "$(dirname "$0")"
 OUT=results-local/$(hostname -s)-xmac-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
-  nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap --format=csv,noheader
+  nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,compute_cap,enforced.power.limit,power.default_limit --format=csv,noheader
 } > "$OUT/system.txt"
 cat "$OUT/system.txt"
 MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 
 EXTRA=("$@")
 fail=0
-printf "%-6s %-5s %6s %9s %9s %9s %9s %10s %9s %11s %11s\n" nchan nant nwin subint_ms gpudifx tiled tensor transpose tensor_x \
-    tiled/ms tensor_x/ms > "$OUT/table.txt"
+printf "%-6s %-5s %6s %9s %9s %9s %9s %10s %9s %9s %11s %11s %11s\n" nchan nant nwin subint_ms gpudifx tiled tensor transpose \
+    tensor_x staged tiled/ms tensor_x/ms staged/ms > "$OUT/table.txt"
 run() {   # run <nchan> <nant> <nwin>
     local name="nchan$1-nant$2"
     ./xmacbench --nchan "$1" --nant "$2" --nwin "$3" --check 2 "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
@@ -45,8 +47,10 @@ run() {   # run <nchan> <nant> <nwin>
         /^  tensor/ { te = t($0) }
         /of which the transpose/ { tr = t($0) }
         /of which the tensor-core XMAC/ { tx = t($0) }
-        END { printf "%-6s %-5s %6s %9s %9s %9s %9s %10s %9s %11.4f %11.4f\n", nchan, nant, nwin, sub_ms, g, ti, te, tr, tx,
-                     (sub_ms > 0 ? ti / sub_ms : 0), (sub_ms > 0 ? tx / sub_ms : 0) }' "$OUT/$name.log" >> "$OUT/table.txt"
+        /^  staged/ { sg = t($0) }
+        END { printf "%-6s %-5s %6s %9s %9s %9s %9s %10s %9s %9s %11.4f %11.4f %11.4f\n", nchan, nant, nwin, sub_ms, g, ti, te,
+                     tr, tx, (sg == "" ? "-" : sg), (sub_ms > 0 ? ti / sub_ms : 0), (sub_ms > 0 ? tx / sub_ms : 0),
+                     (sub_ms > 0 ? sg / sub_ms : 0) }' "$OUT/$name.log" >> "$OUT/table.txt"
     tail -1 "$OUT/table.txt"
 }
 for nant in 4 6 10 16 24 32 48 64; do
@@ -58,8 +62,8 @@ run 1024 10 1000
 run 1024 32 1000
 
 # the whole chain: station processing + XMAC (fusebench --xmac), ms per ms of data
-printf "%-6s %-5s %6s %9s %10s %10s %10s %12s %12s\n" nchan nant nwin subint_ms gpudifx e2e+gdx e2e+tiled \
-    e2e+tr+tens "e2e>tens+tens" > "$OUT/chain.txt"
+printf "%-6s %-5s %6s %9s %10s %10s %10s %12s %12s %12s\n" nchan nant nwin subint_ms gpudifx e2e+gdx e2e+tiled \
+    e2e+tr+tens "e2e>tens+tens" "e2e>16+stag" > "$OUT/chain.txt"
 chain() {   # chain <nchan> <nant> <nwin>
     local name="chain-nchan$1-nant$2"
     [ -x ./fusebench ] || { echo "no fusebench: skipping the chain runs"; return; }
@@ -75,8 +79,10 @@ chain() {   # chain <nchan> <nant> <nwin>
         /station \+ XMAC: end-to-end \+ tiled/ { c = t($0) }
         /station \+ XMAC: end-to-end \+ transpose \+ tensor/ { d = t($0) }
         /station \+ XMAC: end-to-end -> tensor layout \+ tensor/ { e = t($0) }
-        END { if (sub_ms > 0) printf "%-6s %-5s %6s %9s %10.4f %10.4f %10.4f %12.4f %12.4f\n", nchan, nant, nwin, sub_ms,
-                  a / sub_ms, b / sub_ms, c / sub_ms, d / sub_ms, e / sub_ms }' "$OUT/$name.log" >> "$OUT/chain.txt"
+        /station \+ XMAC: end-to-end -> FP16 spectra \+ staged tensor/ { h = t($0) }
+        END { if (sub_ms > 0) printf "%-6s %-5s %6s %9s %10.4f %10.4f %10.4f %12.4f %12.4f %12.4f\n", nchan, nant, nwin,
+                  sub_ms, a / sub_ms, b / sub_ms, c / sub_ms, d / sub_ms, e / sub_ms, h / sub_ms }' "$OUT/$name.log" \
+        >> "$OUT/chain.txt"
     tail -1 "$OUT/chain.txt"
 }
 for nant in 4 10 16 32 64; do

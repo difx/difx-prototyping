@@ -9,6 +9,9 @@
 //   tensor   FP16 in, FP32 accumulation on the tensor cores (WMMA 16 x 16 x 16), from a
 //            transposed copy of the spectra (per channel, blocks of 16 windows with the receivers
 //            as rows: TensorLayout), made by a transpose kernel that is timed separately
+//   staged   the same tensor-core products from FP16 spectra in the station kernel's own order
+//            (halfIndex), each block reshuffling its channels into the tensor layout in shared
+//            memory: no transpose, and no tile in the station kernel
 #pragma once
 #include <cuda_fp16.h>
 #include "common.cuh"
@@ -35,6 +38,11 @@ struct XmacShape {
     __host__ __device__ size_t specIndex(int ant, int win, int band, int c) const {
         return (((size_t)ant * nwin + win) * nband() + band) * fftchannels + c;
     }
+    // the FP16 spectra for the staged tensor XMAC: [ant][win][band][nchan] __half2 (re, im)
+    __host__ __device__ size_t halfIndex(int ant, int win, int band, int c) const {
+        return (((size_t)ant * nwin + win) * nband() + band) * nchan + c;
+    }
+    __host__ __device__ size_t halfCount() const { return (size_t)nant * nwin * nband() * nchan; }
     // complex multiply-accumulates per subint (the work, for throughput figures)
     double cmacs() const { return (double)nfreq * nchan * nwin * nbaseline() * 4; }
 };
@@ -87,3 +95,10 @@ void xmacTranspose(const XmacShape& s, const TensorLayout& L, const cuFloatCompl
                    cudaStream_t st);
 void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFloatComplex* vis, int multiprocessors,
                 cudaStream_t st);
+
+// The staged tensor version: FP16 spectra (halfIndex; windows past the subint need not exist) ->
+// vis.  Exits with a message if the shared memory it needs (2 KB per receiver, rounded up to 16
+// receivers) is more than a block may have: xmacTensorStagedFits says whether it fits on this device.
+void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int multiprocessors,
+                      cudaStream_t st);
+bool xmacTensorStagedFits(const XmacShape& s);

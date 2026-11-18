@@ -57,6 +57,14 @@ struct TensorOut {
     TensorLayout L;
     float scale;
 };
+// The fused kernel's third output (FusedVariant::launchHalf): the spectra as FP16 in the kernel's own
+// order, [ant][win][band][nchan] __half2 (XmacShape::halfIndex), scaled as TensorOut; invalid
+// windows as zeros.  The staged tensor XMAC (xmacTensorStaged) reshuffles it into its layout itself.
+struct HalfOut {
+    __half2* h;
+    XmacShape s;
+    float scale;
+};
 
 struct FusedVariant {
     unsigned fpb;          // FFTs per block
@@ -73,6 +81,9 @@ struct FusedVariant {
     // 2-bit lean decode, no autocorrelations, uncapped variants only (else nullptr)
     void (*launchTensor)(const Geometry& g, const PreVariant& pre, const FracParams& p, const TensorOut& out,
                          int ant0, int nant, cudaStream_t st);
+    // the same writing HalfOut (same conditions)
+    void (*launchHalf)(const Geometry& g, const PreVariant& pre, const FracParams& p, const HalfOut& out,
+                       int ant0, int nant, cudaStream_t st);
 };
 // registers per thread of the last fused kernel launched (for the report)
 extern int fusedLastRegisters;
