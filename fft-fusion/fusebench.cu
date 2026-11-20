@@ -338,7 +338,7 @@ static void usage() {
 "  --regcap R      registers capped (__launch_bounds__) to fit R threads per SM: 0 (default, no\n"
 "                  cap) | 1024 | 1536 (1, 2 and 4 FFTs per block only) | sweep (all three)\n"
 "  --batched       one launch for all antennas (one cuFFT plan; one fused kernel)\n"
-"  --xmac          packed input (2-bit, lean decode, dual pol, --invalid 0): also run the XMAC\n"
+"  --xmac          packed input (1, 2 or 4 bits, lean decode, dual pol, --invalid 0): also run the XMAC\n"
 "                  after the station processing: gpudifx's XMAC, the tiled FP32 one, the tensor-core\n"
 "                  one through the transpose, the tensor-core one from the end-to-end kernel\n"
 "                  writing its layout directly (FP16), and the staged tensor-core one from FP16\n"
@@ -435,8 +435,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (chunk < 0 || (chunk > 0 && !packed)) { fprintf(stderr, "--chunk W: W > 0, with --input packed\n"); return 2; }
-    if (xmac && (!packed || !lean || nbit != 2 || amode != AutoMode::NONE || g.nband % 2 || singlePol || invalidFrac > 0)) {
-        fprintf(stderr, "--xmac: with --input packed, --nbit 2, --decode lean, --autocorr none, dual polarisation "
+    if (xmac && (!packed || !lean || nbit == 8 || amode != AutoMode::NONE || g.nband % 2 || singlePol || invalidFrac > 0)) {
+        fprintf(stderr, "--xmac: with --input packed, --nbit 1, 2 or 4, --decode lean, --autocorr none, dual polarisation "
                 "(even --nband) and --invalid 0\n");
         return 2;
     }

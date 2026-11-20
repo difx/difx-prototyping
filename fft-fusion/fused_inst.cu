@@ -227,12 +227,18 @@ __global__ void fused_fft_tensor(Geometry g, Pre pre, Post post, TensorOut o, in
     tensorBody<FFT, Pre, Post>(g, pre, post, o, ant0);
 }
 
+// The pre-FFT stages the XMAC outputs (tensor layout, FP16 spectra) are compiled for: the lean decode
+// of 1-, 2- and 4-bit data (each one more kernel per variant and FFT length, so not 8 bits).
+template<class Pre> constexpr bool xmacDecode = std::is_same<Pre, PreDecodeLean<1>>::value ||
+                                                std::is_same<Pre, PreDecodeLean<2>>::value ||
+                                                std::is_same<Pre, PreDecodeLean<4>>::value;
+
 template<class FFT>
 static void launchTensorVariant(const Geometry& g, const PreVariant& pre, const FracParams& p, const TensorOut& o,
                                 int ant0, int nant, cudaStream_t st) {
     withPre(pre, [&](auto stage) {
         using Pre = decltype(stage);
-        if constexpr (std::is_same<Pre, PreDecodeLean<2>>::value) {
+        if constexpr (xmacDecode<Pre>) {
             using Post = FracRotateFixed<false>;
             auto kernel = fused_fft_tensor<FFT, Pre, Post>;
             using TP = TensorPlan<FFT>;
@@ -252,7 +258,7 @@ static void launchTensorVariant(const Geometry& g, const PreVariant& pre, const 
             kernel<<<(unsigned)nant * g.nband * nwb, FFT::block_dim, smemBytes, st>>>(g, stage, post, o, ant0);
             CHECK_CUDA(cudaGetLastError());
         } else {
-            fprintf(stderr, "the tensor-layout output is compiled for the 2-bit lean decode only\n");
+            fprintf(stderr, "the tensor-layout output is compiled for the 1-, 2- and 4-bit lean decode only\n");
             exit(2);
         }
     });
@@ -359,7 +365,7 @@ static void launchHalfVariant(const Geometry& g, const PreVariant& pre, const Fr
                               int ant0, int nant, cudaStream_t st) {
     withPre(pre, [&](auto stage) {
         using Pre = decltype(stage);
-        if constexpr (std::is_same<Pre, PreDecodeLean<2>>::value) {
+        if constexpr (xmacDecode<Pre>) {
             using Post = FracRotateFixed<false>;
             auto kernel = fused_fft_half<FFT, Pre, Post>;
             constexpr unsigned smemBytes = FFT::shared_memory_size;
@@ -378,7 +384,7 @@ static void launchHalfVariant(const Geometry& g, const PreVariant& pre, const Fr
             kernel<<<(unsigned)blocks, FFT::block_dim, smemBytes, st>>>(g, stage, post, OutHalf{o}, ant0, nfft);
             CHECK_CUDA(cudaGetLastError());
         } else {
-            fprintf(stderr, "the FP16 output is compiled for the 2-bit lean decode only\n");
+            fprintf(stderr, "the FP16 output is compiled for the 1-, 2- and 4-bit lean decode only\n");
             exit(2);
         }
     });

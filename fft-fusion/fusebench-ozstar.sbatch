@@ -37,6 +37,8 @@
 #     sbatch --export=ALL,MATHDX=<MathDx dir> fusebench-ozstar.sbatch    # a MathDx you already have
 #     sbatch --export=ALL,EXTRA="--reps 50" fusebench-ozstar.sbatch      # extra fusebench options
 #     sbatch --export=ALL,SCRIPTS="run-xmac.sh run-staged.sh" fusebench-ozstar.sbatch   # only some scripts
+#     sbatch --export=ALL,SCRIPTS="run-wide.sh" fusebench-ozstar.sbatch   # the wider shapes (bits, bands):
+#         not in the default set; results-local/<host>-wide-<stamp>/
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"

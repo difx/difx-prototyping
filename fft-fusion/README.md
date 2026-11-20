@@ -177,6 +177,16 @@ slows the kernels that compute hardest, not only the tensor cores: the end-to-en
 from packed data by 9-14%. The scripts record the limit in force in `system.txt`
 (`nvidia-smi --query-gpu=enforced.power.limit --format=csv`): check it before trusting a 2070 run.
 
+**From 2026-11-20 the 2070's SM clock is also locked at 1500 MHz** (`nvidia-smi -lgc 300,1500`, in
+the same service), on top of the 150 W cap.  The cap only limits the power averaged over about a
+second: between kernels the clock rebounded to 1875-1950 MHz, and the next load step hit the PSU
+at full boost voltage, which tripped it again at 150 W (2026-11-18 21:17, during `run-wide.sh`).
+The lock bounds the peak at every instant.  **No 2070 result from 2026-11-18 or 2026-11-19 (150 W
+only) compares directly with one from 2026-11-20 on (150 W + 1500 MHz)**, nor with the 215 W ones;
+compare within a run, or against a baseline from the same settings.  The scripts now also record
+the lock in `system.txt` ("SM clock locked: GPU_MAX_CLOCK=1500", from `gpu-powercap.service`:
+`nvidia-smi` does not report it).
+
 `run-bench.sh`: 10 antennas, 8 bands, real data, 64 MHz bands, no autocorrelations. Median of
 20 subints, ms per subint for all 10 antennas. Fused times are for the best FFTs-per-block
 setting, with cuFFTDx's suggested setting in brackets where it differs. "vs mpifxcorr" is
@@ -1228,6 +1238,49 @@ first).  `results-local/gina302-staged-20261118-200436` (`table.txt`) and
   with the items split differently among the warps (a KS 4 warp's sums already take 64
   registers).
 
+### Wider shapes, bits and subbands: RTX 2070 SUPER at 150 W + 1500 MHz (2026-11-20)
+
+`run-wide.sh` (new): the whole chain (`fusebench --xmac`, every variant timed, every check) for 1,
+2 and 4 bits a sample x 1, 4 and 32 dual-polarisation subbands (2, 8, 64 bands) x 128 channels at
+4, 10 and 32 stations and 1024 channels at 10.  The end-to-end kernel's tensor-layout and FP16
+outputs are now compiled for the 1- and 4-bit lean decode as well as 2 bits (`fused_inst.cu`,
+`xmacDecode`), and `--xmac` takes `--nbit 1`, `2` or `4`.  The windows scale with the bands
+(10000 at 128 channels and up to 8 bands, 1250 at 64; a quarter of that at 32 stations; at 1024
+channels 1000 and 125).  `results-local/ar313-adeller-wide-20261120-115150` (`wide.txt`), all 36
+runs passing, commit 4ba1d8c plus these changes; the first attempt (18 Nov, 150 W only) cut the
+power to the box during it (see the note on the clock lock above).
+
+FP16 spectra + staged, ms per ms of data, and in brackets its time over the best other chain
+(end-to-end + tiled, + transpose + tensor, or writing the layout + tensor; below 1: the staged
+path is the fastest):
+
+| bits | subbands (bands) | 128 ch, 4 stations | 128 ch, 10 | 128 ch, 32 | 1024 ch, 10 |
+|---|---|---|---|---|---|
+| 1 | 1 (2) | 0.0331 (0.90) | 0.0914 (0.99) | 0.365 (1.07) | 0.104 (0.87) |
+| 1 | 4 (8) | 0.123 (0.89) | 0.338 (0.95) | 1.23 (0.94) | 0.391 (0.80) |
+| 1 | 32 (64) | 0.997 (0.90) | 2.77 (0.96) | 10.7 (1.03) | 3.36 (0.87) |
+| 2 | 1 (2) | 0.0338 (0.91) | 0.0949 (0.98) | 0.372 (1.05) | 0.104 (0.85) |
+| 2 | 4 (8) | 0.126 (0.90) | 0.344 (0.95) | 1.26 (0.93) | 0.399 (0.81) |
+| 2 | 32 (64) | 1.04 (0.91) | 2.86 (0.92) | 11.0 (0.98) | 3.55 (0.86) |
+| 4 | 1 (2) | 0.0342 (0.90) | 0.0941 (0.94) | 0.376 (1.01) | 0.105 (0.85) |
+| 4 | 4 (8) | 0.127 (0.88) | 0.349 (0.86) | 1.27 (0.86) | 0.404 (0.81) |
+| 4 | 32 (64) | 1.09 (0.89) | 3.00 (0.83) | 11.5 (0.84) | 4.01 (0.87) |
+
+- **The staged path is the fastest chain in 32 of the 36 shapes**, by 1-20% (9-12% at 4 stations,
+  13-20% at 1024 channels).  It is behind only at 32 stations with 1 subband (by 7%, 5% and 1% at 1,
+  2 and 4 bits) and with 32 subbands at 1 bit (3%), each time behind writing the layout + tensor.
+  Probably the launch: with one frequency and one 64-receiver super-block, 4 channels a block
+  give just 32 blocks before window chunks, so the staged XMAC leans on the chunks' atomics there
+  (not profiled).
+- **More bits favour the staged path**: the layout path's station kernel slows more with the
+  4-bit decode (writing the layout + tensor: 1.32 ms/ms at 1 bit, 1.48 at 4, 4 subbands at 32
+  stations; FP16 spectra + staged: 1.23 and 1.27), so at 4 bits the staged path leads at 32
+  stations by 14-16% with 4 or 32 subbands.
+- **The band count changes little else**: per band of data the times scale nearly linearly from
+  1 to 32 subbands, and the staged path's lead holds within a few percent across them.
+- **Against gpudifx today: 5.4-13.8x** (6-8x up to 10 stations, 10-14x at 32, 5.4-6.9x at 1024
+  channels).
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -1315,12 +1368,11 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   output per stage load (bigger tiles per warp, more blocks an SM); and the XMAC literature for
   large N (e.g. the tensor-core correlators built for LOFAR-class arrays).  Not needed for
   DiFX's usual arrays.
-- **A wider test matrix**: so far the chain is measured at 128 and 1024 channels, 8 bands (4
-  dual-polarisation frequencies), 2 bits a sample (`fusebench --xmac` takes only `--nbit 2`), and
-  4-128 stations.  Sweep the combinations of channel count (e.g. 64-16384, and not powers of two),
-  band count (1-16 and more, single and dual polarisation), bits a sample (1, 2, 4, 8: the decode
-  and `--xmac` need the other widths) and station count, on both GPUs, checking every run, to find
-  shapes where the staged path or the plan's choices (KS, channels a block, stages) do badly.
+- **A wider test matrix**: 1, 2 and 4 bits x 1, 4 and 32 dual-polarisation subbands x 4-32
+  stations at 128 and 1024 channels done on the 2070 ("Wider shapes, bits and subbands",
+  `run-wide.sh`; the A100 adds 64 stations and 1024 channels at 32).  Still open: channel counts
+  from 64 to 16384 and not powers of two, single polarisation, 8 bits (not compiled for the XMAC
+  outputs), and 32 stations with one subband, where the layout path still leads by 1-7%.
 - **The end-to-end kernel is now arithmetic-bound on the A100** (FMA pipe 66%, special-function
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample
