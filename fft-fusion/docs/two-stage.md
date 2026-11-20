@@ -5,13 +5,29 @@ from `plot_two_stage.py` (`python3 two_stage.py`, `python3 plot_two_stage.py`, f
 
 ## In short
 
+- **When (the direction, 2026-11-20).**  One stage whenever possible.  Two stages, with a moderate
+  number of PFB coarse channels, only where one stage cannot do it:
+  - **The resolution needs more channels per subband than one cuFFTDx FFT gives.**  The fused
+    kernel is built up to 16384 points, so 8192 channels per real-sampled subband.  This is a
+    limit on channels per subband, not on the channel width: recording narrower subbands reaches
+    finer channels within it.
+  - **The delay rate makes the fractional-sample correction lose.**  One stage loses 0.5% in its
+    top channel at about 18k channels per subband at Earth-rotation rates (3 µs/s), so it is fine
+    up to the cuFFTDx limit.  But it loses that at 1.8k channels per subband at 30 µs/s and 550 at
+    100 µs/s (spacecraft VLBI).
+  - **The size of the PFB:** 16 points (8 coarse channels of real data) already keeps the
+    fractional-sample loss under 0.2% in the worst fine channel (Delay accuracy).  In practice the
+    stage-2 FFT sets the number: Nc of at least O × (channels per subband) / 16384.
+
 - **Why.** The fractional-sample correction uses one delay per FFT window (its middle), in
   fft-fusion and in mpifxcorr.
   Across a window channel j's phase then drifts by 2π j × (delay rate), whatever the bandwidth.
   At an Earth-rotation delay rate (3 µs/s) that costs 6% of the top channel's coherence at 65536
-  channels, and nearly all of it at 2^18 and beyond.  A coarse first stage lets the delay be
-  corrected at the coarse cadence, which leaves a drift up to 2 × (coarse channels) times smaller.
-  It also replaces one long FFT (the fused kernel stops at 16384 points) with short ones.
+  channels per subband, and nearly all of it at 2^18 and beyond; at spacecraft rates, from a few
+  thousand channels per subband.  A coarse first stage with an integer shift per coarse window
+  leaves only the fractional part within a coarse channel, under 0.2% loss with a 16-point PFB,
+  whatever the rate.  It also replaces one long FFT (the fused kernel stops at 16384 points) with
+  short ones.
 - **Should the first stage be WOLA and the second not?**  The second stage needs no overlap.  It
   runs on each coarse channel's continuous series, and back-to-back windows use every coarse sample
   once, so they lose no sensitivity.  A taper there only buys fine-channel leakage, the same trade
@@ -48,7 +64,7 @@ Real-sampled band of B MHz (2B samples/s); the final channel count nchan; Nc coa
 |---|---|---|
 | 1 (coarse kernel) | decode, integer delay shift, fringe rotation (per sample, as now); WOLA window (P = 1) or PFB weights on P × L1 samples, folded to L1 = 2 Nc; real FFT of L1 points; per coarse channel the oversampling derotation and the delay's phase at the channel's centre | coarse window: every H samples, O = L1 / H |
 | DRAM | the coarse series, FP16, `[ant][band][coarse channel][coarse sample]` | |
-| 2 (fine kernel) | N2-point FFT of N2 consecutive coarse samples; keep the central K = N2 / O bins; the residual delay phase per fine channel; scale | stage-2 window = the XMAC's window |
+| 2 (fine kernel) | N2-point FFT of N2 consecutive coarse samples; keep the central K = N2 / O bins; optionally the residual delay phase's window mean per fine channel; scale | stage-2 window = the XMAC's window |
 | DRAM | FP16 spectra in the staged XMAC's order (`halfIndex`), as the end-to-end kernel writes them now | |
 | XMAC | the staged XMAC, unchanged | |
 
@@ -60,12 +76,22 @@ Real-sampled band of B MHz (2B samples/s); the final channel count nchan; Nc coa
   and Nc both powers of two, K is one too, so O must be a power of two: O = 2 (or 1, which
   aliases).  O = 4/3 makes K, and so nchan, a multiple of 3 (3072, 12288, 49152, …); O = 8/7 a
   multiple of 7.
-- **Where the delay is corrected.**  One integer-sample shift per stage-2 window, as now.  Within
-  the window, the coarse stage multiplies coarse channel c's sample n by e^{−2πi f_c (τ(t_n) −
-  int)}: the delay's whole change during the window, exactly, at the channel's centre f_c.
-  Stage 2 applies the rest, 2π (f − f_c)(τ(t_mid) − int), per fine channel.  The only error left is
-  (f − f_c) times the delay's drift, and |f − f_c| is at most half a coarse channel.
-  The fringe rotation (the LO term) stays per sample, before stage 1.
+- **Where the delay is corrected.**
+  - **Stage 1:** an integer-sample shift per coarse window, and the fractional part δ at each coarse
+    channel's centre f_c.  Coarse channel c's sample n is multiplied by e^{−2πi f_c δ(t_n)}.
+  - **The residual:** fine channel u coarse channels from the centre (|u| ≤ ½) is left a phase
+    2π u δ / L1, with |δ| ≤ ½ sample.  It is bounded whatever the delay rate or the channel count
+    (Delay accuracy).
+  - **Stage 2 (optional):** can remove the residual's mean over each window, per fine channel.
+  - **The fringe rotation** (the LO term) stays per sample, before stage 1.
+- **A PFB does not affect the correction's correctness.**  It is a linear, time-invariant filter,
+  the same at every station, so a delay is a phase e^{−2πi f δ} after it as before it, and the
+  phase applied is exact at each channel's centre.
+  - **Checked by simulation:** a two-stage PFB on a delayed signal leaves exactly 2π u δ / L1
+    (to a few mrad) and full coherence for a static delay.
+  - **The one rule:** a coarse sample's time is the centre of the whole P × L1-sample PFB window,
+    its group delay, not the start of the window or of the L1-point fold.  That matters between
+    stations only if they use different PFBs.
 
 ## Is WOLA the right first stage?
 
@@ -265,24 +291,53 @@ stage 2 the PFB matches `--wola`.
 
 ## Delay accuracy
 
-![The fractional-sample correction against a delay rate](../plots/two-stage-delayrate.png)
+![The fractional-sample correction against the delay rate](../plots/two-stage-delayrate.png)
 
-| channels | one stage: top channel / band average | two stage, 16 / 32 / 64 coarse channels: worst channel |
-|---|---|---|
-| 4096 | 0.9998 / 0.9999 | 1.0000 / 1.0000 / 1.0000 |
-| 16384 | 0.9960 / 0.9987 | 1.0000 / 1.0000 / 1.0000 |
-| 65536 | 0.9376 / 0.9790 | 0.9999 / 1.0000 / 1.0000 |
-| 262144 | 0.2516 / 0.7169 | 0.9990 / 0.9998 / 0.9999 |
-| 1048576 | 0.0447 / 0.2583 | 0.9842 / 0.9960 / 0.9990 |
+**One stage.**  The fractional-sample correction uses one delay per window, its middle (fft-fusion
+and mpifxcorr).
+- **The drift:** channel j (frequency j B / nchan, window nchan / B long) drifts in phase by
+  2π j × (delay rate) across the window, and keeps sinc(j × rate) of its amplitude.
+- **Channels, not bandwidth:** the loss depends on the channel count per subband, not on the
+  bandwidth.
 
-How the model works:
-- **One stage.** The fractional-sample correction uses one delay per window, its middle.  Channel j
-  (frequency j B / nchan, window nchan / B long) drifts in phase by 2π j × (delay rate) across the
-  window, and keeps sinc(j × rate) of its amplitude.  That is independent of the bandwidth.
-- **Two stages.** The coarse stage's correction is exact at the coarse centres.  Only the offset
-  within a coarse channel drifts, at most nchan / (2 Nc) channels' worth.
-- **The rate.** 3 µs/s is about the largest a ground baseline sees from Earth rotation.  Spacecraft
-  or fast-moving targets see more.
+Coherence kept, top channel / band average:
+
+| channels per subband | 3 µs/s (Earth rotation) | 30 µs/s | 100 µs/s |
+|---|---|---|---|
+| 1024 | 1.0000 / 1.0000 | 0.9985 / 0.9995 | 0.9829 / 0.9943 |
+| 4096 | 0.9998 / 0.9999 | 0.9754 / 0.9918 | 0.7461 / 0.9125 |
+| 16384 | 0.9960 / 0.9987 | 0.6474 / 0.8766 | 0.1762 / 0.4238 |
+| 65536 | 0.9376 / 0.9790 | 0.0172 / 0.3699 | 0.0479 / 0.1477 |
+| 262144 | 0.2516 / 0.7169 | 0.0167 / 0.1280 | 0.0076 / 0.0476 |
+| 1048576 | 0.0447 / 0.2583 | 0.0100 / 0.0408 | 0.0013 / 0.0146 |
+
+The loss reaches 0.5% (top channel / band average) at these channel counts per subband:
+
+| delay rate | channels per subband |
+|---|---|
+| 3 µs/s | 18400 / 31900 |
+| 30 µs/s | 1840 / 3190 |
+| 100 µs/s | 550 / 960 |
+
+**Two stages.**  An integer shift per coarse window, and the fractional part corrected at each
+coarse channel's centre, leave fine channel u (|u| ≤ ½ coarse channel) a phase 2π u δ / L1, with
+|δ| ≤ ½ sample.  As δ sweeps a sample (the delay drifting), the channel keeps sinc(u / L1).  That
+holds whatever the delay rate or the channel count, so the PFB can be small:
+
+| stage-1 FFT points L1 (L1 / 2 coarse channels of real data) | loss, worst fine channel / average |
+|---|---|
+| 8 | 0.64% / 0.21% |
+| 16 | 0.16% / 0.05% |
+| 32 | 0.04% / 0.01% |
+| 64 | 0.01% / 0.003% |
+
+- **The bound holds:** a simulated two-stage PFB (16 taps, O = 4/3; L1 = 8, 16, 32) on a delayed
+  signal leaves exactly the predicted phase.
+- **Stage 2's optional correction** (the residual's mean per window and fine channel) reduces it
+  further when δ changes slowly.
+- **What sets the coarse channel count in practice** is the stage-2 FFT, N2 = O × (channels per
+  subband) / Nc, which must fit cuFFTDx (16384 as built here).  65536 channels per subband at
+  O = 4/3 need Nc ≥ 6 (so 8), and 2^20 need Nc ≥ 86 (so 128).
 
 ## Cost
 
@@ -318,8 +373,8 @@ Floating-point operations per input sample:
 2. **Stage-1 kernel** (`coarse_inst.cu`, one instantiation per L1 and P, cuFFTDx; P = 1 is a WOLA
    window, P > 1 a PFB, so both first stages are the same kernel with a different weight table).
    - **Block:** G consecutive coarse windows of one (antenna, band).
-   - **Input:** the packed data decoded once into shared memory with the lean decode, with one
-     integer shift per stage-2 window.
+   - **Input:** the packed data decoded once into shared memory with the lean decode, with an
+     integer shift per coarse window.
    - **Per sample:** fringe rotation (as now).
    - **Per coarse window:** the P-tap fold to L1 samples, then a real FFT of L1 points.
    - **Per coarse channel:** derotation × delay phase at the channel's centre, then a scale.
@@ -330,7 +385,7 @@ Floating-point operations per input sample:
 3. **Stage-2 kernel.**
    - **Per (antenna, band, coarse channel, stage-2 window):** an N2-point complex FFT (cuFFTDx,
      batched in the block), keeping K bins.
-   - **Per fine channel:** the residual delay phase.
+   - **Per fine channel (optional):** the window mean of the residual delay phase.
    - **Correction:** none is needed.  The PFB's passband ripple is under 0.001 dB at 16 taps
      (O = 4/3) and 0.011 dB at 4 taps (O = 2); only the 8-tap O = 4/3 design reaches 0.09 dB.
    - **Output:** FP16 into the staged XMAC's layout, unchanged downstream; a stage-2 window's data
@@ -356,7 +411,10 @@ Answered (2026-11-20):
   gives exactly that grid.
 - **mpifxcorr also corrects the fractional sample once per FFT window,** so the delay-rate
   analysis applies to it as to fft-fusion.
-- **Two stages are an option, not the one path:** selectable, for about 2k-4k channels and up.
+- **Two stages are an option, not the one path.**  One stage whenever possible.  Two stages, with
+  a moderate number of PFB coarse channels, when the resolution needs more channels per subband
+  than one cuFFTDx FFT gives, or when the delay rate makes one stage's fractional-sample
+  correction lose (spacecraft VLBI); see In short.
 
 - **DiFX can use channel counts that are not powers of two,** so any oversampling will do
   (O = 8/7: multiples of 7; O = 4/3: multiples of 3).

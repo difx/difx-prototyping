@@ -254,19 +254,23 @@ def model(design, N2):
     return Design(design.name, design.h, design.L1, design.H, N2, K, w2=w2, hop2=hop2, short=design.short), M
 
 
-def delay_rate_coherence(nchan, rate, Nc=None):
-    """Coherence kept, against a delay rate (s/s), when the fractional-sample (baseband) delay
-    correction uses one delay per window (the window's middle), the windows nchan / B long: channel
-    j's phase drifts by 2 pi j x rate across a window (f T = j, whatever the bandwidth), which keeps
-    sinc(j x rate) of its amplitude.  Two stages (Nc coarse channels): the coarse stage corrects the
-    delay at each coarse sample (its residual is negligible), so only the offset within the coarse
-    channel drifts, |j - j_c| <= nchan / (2 Nc).  Returns (band top, band average)."""
-    j = np.arange(nchan)
-    if Nc:
-        K = nchan / Nc
-        j = (j + K / 2) % K - K / 2                    # offset from the coarse channel's centre
-    c = np.abs(np.sinc(j * rate))
-    return c[-1] if not Nc else c.min(), c.mean()
+def delay_rate_coherence(nchan, rate):
+    """One stage: coherence kept against a delay rate (s/s) when the fractional-sample (baseband)
+    delay correction uses one delay per window (its middle; fft-fusion and mpifxcorr), the windows
+    nchan / B long: channel j's phase drifts by 2 pi j x rate across a window (f T = j, whatever the
+    bandwidth), which keeps sinc(j x rate) of its amplitude.  Returns (top channel, band average)."""
+    c = np.abs(np.sinc(np.arange(nchan) * rate))
+    return c[-1], c.mean()
+
+
+def two_stage_fractional_loss(L1):
+    """Two stages, an integer-sample shift per coarse window and the fractional part corrected at each
+    coarse channel's centre: the fine channel u coarse channels from the centre (|u| <= 1/2) is left a
+    phase 2 pi u delta / L1, delta the fractional delay (|delta| <= 1/2 sample).  As delta sweeps a
+    sample it keeps sinc(u / L1): whatever the delay rate or the channel count.  Returns the loss of
+    (the worst channel, the average), L1 the stage-1 FFT's points (real data: L1 / 2 coarse channels)."""
+    u = np.linspace(-0.5, 0.5, 10001)
+    return 1 - np.sinc(0.5 / L1), float(np.mean(1 - np.sinc(u / L1)))
 
 
 def main():
@@ -289,13 +293,15 @@ def main():
         print(f"{d.name:58s} {d.O:5.3f} {s0:6.3f} {s1:6.3f} {s2:6.3f} {lk:8.3f} {m['gain_db'][0]:7.1f}dB {al:>21s} "
               f"{np.median(m['beyond5_db']):14.1f} dB {np.median(m['beyond20_db']):15.1f} dB", flush=True)
     print()
-    print("Coherence against a delay rate of 3e-6 s/s (an Earth-rotation maximum), one delay per window:")
-    print(f"{'channels':>9s} {'1 stage: top / mean':>21s} " + " ".join(f"{'2 stage, Nc ' + str(n) + ': worst / mean':>27s}" for n in (16, 32, 64)))
-    for nchan in (4096, 16384, 65536, 262144, 1048576):
-        one = delay_rate_coherence(nchan, 3e-6)
-        two = [delay_rate_coherence(nchan, 3e-6, n) for n in (16, 32, 64)]
-        print(f"{nchan:9d} {one[0]:10.4f} / {one[1]:.4f} " + " ".join(f"{t[0]:16.4f} / {t[1]:.4f}" for t in two))
-
+    print("One stage: coherence against the delay rate, top channel / band average:")
+    print(f"{'channels':>9s} " + " ".join(f"{'rate ' + r:>22s}" for r in ("3e-6", "3e-5", "1e-4")))
+    for nchan in (1024, 4096, 16384, 65536, 262144, 1048576):
+        print(f"{nchan:9d} " + " ".join(f"{a:12.4f} / {b:.4f}" for a, b in
+                                         (delay_rate_coherence(nchan, r) for r in (3e-6, 3e-5, 1e-4))))
+    print("Two stages (integer shift per coarse window): loss, worst fine channel / average, any rate:")
+    for L1 in (8, 16, 32, 64, 128):
+        w, a = two_stage_fractional_loss(L1)
+        print(f"  {L1:4d}-point stage 1: {w:.5f} / {a:.5f}")
 
 if __name__ == "__main__" and len(__import__("sys").argv) == 1:
     main()

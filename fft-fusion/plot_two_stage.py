@@ -174,26 +174,26 @@ def sensitivity_png(path):
 
 def delayrate_png(path):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6), facecolor=SURFACE)
-    n = 2 ** np.arange(12, 21)
-    one = np.array([T.delay_rate_coherence(int(x), 3e-6) for x in n])
+    n = 2 ** np.arange(9, 21)
     for ax, lim in ((axes[0], (0, 1.02)), (axes[1], (0.98, 1.0005))):
         style(ax)
-        ax.plot(n, one[:, 0], label="one stage: top channel", **REF)
-        ax.plot(n, one[:, 1], label="one stage: band average", color=INK2, linewidth=1.5, linestyle=":")
-        for i, Nc in enumerate((16, 32, 64)):
-            two = np.array([T.delay_rate_coherence(int(x), 3e-6, Nc) for x in n])
-            ax.plot(n, two[:, 0], color=SLOT[i], linewidth=2, marker="o", markersize=4,
-                    label=f"two stage, {Nc} coarse channels: worst channel")
+        for i, (r, lab) in enumerate(((3e-6, "Earth rotation, 3 \u00b5s/s"), (3e-5, "spacecraft, 30 \u00b5s/s"),
+                                      (1e-4, "fast spacecraft, 100 \u00b5s/s"))):
+            one = np.array([T.delay_rate_coherence(int(x), r) for x in n])
+            ax.plot(n, one[:, 0], color=SLOT[i], linewidth=2, label=f"one stage, {lab}: top channel")
+        for L1, st in ((16, (0, (4, 2))), (64, ":")):
+            ax.axhline(1 - T.two_stage_fractional_loss(L1)[0], color=INK2, linewidth=1.5, linestyle=st,
+                       label=f"two stages, {L1}-point stage 1: worst channel, any rate")
         ax.set_xscale("log", base=2)
         ax.set_ylim(*lim)
-        ax.set_xlabel("channels across the band", color=INK, fontsize=10)
+        ax.set_xlabel("channels per subband (any bandwidth)", color=INK, fontsize=10)
         ax.set_ylabel("coherence kept", color=INK, fontsize=10)
     axes[1].set_title("the top 2%", fontsize=10, color=INK2)
     legend(axes[0], loc="lower left")
-    finish(fig, path, "The fractional-sample correction against a delay rate of 3 \u00b5s/s", note=
-           "One delay per window (its middle): channel j's phase drifts by 2\u03c0 j \u00d7 rate across a window, "
-           "whatever the bandwidth.  Two stages correct at the coarse cadence; only the offset within a coarse "
-           "channel drifts, up to channels / (2 coarse channels).")
+    finish(fig, path, "The fractional-sample correction against the delay rate", note=
+           "One stage: one delay per window (its middle), channel j's phase drifts by 2\u03c0 j \u00d7 rate across a "
+           "window, whatever the bandwidth.  Two stages, an integer shift per coarse window: the fine channels are "
+           "left 2\u03c0 u \u03b4 / L1 (u <= 1/2 coarse channel, \u03b4 <= 1/2 sample), whatever the rate.")
 
 
 def offset_png(path):
