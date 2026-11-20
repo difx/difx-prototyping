@@ -73,6 +73,7 @@ make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everythin
 ./run-staged.sh                                                      # the staged XMAC's super-blocks, 4-128 stations
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
+python3 plot_xmac_paths.py                                           # plots/xmac-paths.svg
 ```
 
 On OzSTAR: run `make mathdx` on a login node, then `sbatch fusebench-ozstar.sbatch` from
@@ -163,6 +164,22 @@ FP16, converts to FP32 in registers, does an FP32 FFT, and stores FP32. The memo
 all in the load, and the FFT itself is not the bottleneck. An FP16 FFT would compute at FP16
 precision (unit roundoff 5e-4, with rounding error growing with the number of FFT stages) and
 return FP16, for no speed gain in a kernel that is memory-bound.
+
+## The station + XMAC paths
+
+[docs/xmac-paths.md](docs/xmac-paths.md) shows every path from packed data to visibilities in one
+diagram: the layout of each buffer, which kernel writes it and which reads it, each kernel's time.
+For each path it says what it does, what it saves, and what it costs.  In short: the end-to-end
+kernel removes the station stage's DRAM round trips (8x), and the tensor cores make the XMAC
+itself 10x faster.  Their catch is the layout: tensor cores want each receiver's 16 consecutive
+windows of a channel as a row, and the station kernel produces channels fastest.  That
+rearrangement can go in a transpose kernel (an extra DRAM pass, costing more than the tensor
+cores save over the tiled FP32 XMAC),
+in the station kernel (the layout path: a slower station kernel, tied to the XMAC), or in each
+XMAC block's copy into shared memory (the staged path, the one kept: the cheapest station output,
+at the cost of a slower XMAC kernel).
+
+![The station + XMAC paths and their layouts](plots/xmac-paths.svg)
 
 ## Results, 2026-11-16
 
@@ -1269,9 +1286,11 @@ path is the fastest):
 - **The staged path is the fastest chain in 32 of the 36 shapes**, by 1-20% (9-12% at 4 stations,
   13-20% at 1024 channels).  It is behind only at 32 stations with 1 subband (by 7%, 5% and 1% at 1,
   2 and 4 bits) and with 32 subbands at 1 bit (3%), each time behind writing the layout + tensor.
-  Probably the launch: with one frequency and one 64-receiver super-block, 4 channels a block
-  give just 32 blocks before window chunks, so the staged XMAC leans on the chunks' atomics there
-  (not profiled).
+  The split by stage shows why (as on the RTX PRO 6000 below): the staged XMAC alone takes
+  1.1-1.9x the tensor XMAC kernel alone here (whose layout the station kernel writes, its cost
+  in the station time) (1.94x at 32 stations with 1 subband), and the
+  FP16 station kernel saves least with one subband (0.83 of the layout-writing one's time, against
+  0.4-0.6 at 1024 channels), so where the XMAC's share is largest the saving no longer covers it.
 - **More bits favour the staged path**: the layout path's station kernel slows more with the
   4-bit decode (writing the layout + tensor: 1.32 ms/ms at 1 bit, 1.48 at 4, 4 subbands at 32
   stations; FP16 spectra + staged: 1.23 and 1.27), so at 4 bits the staged path leads at 32
@@ -1280,6 +1299,56 @@ path is the fastest):
   1 to 32 subbands, and the staged path's lead holds within a few percent across them.
 - **Against gpudifx today: 5.4-13.8x** (6-8x up to 10 stations, 10-14x at 32, 5.4-6.9x at 1024
   channels).
+
+### Wider shapes, bits and subbands: RTX PRO 6000 Blackwell Server Edition (OzSTAR, gina18, 2026-11-20)
+
+`run-wide.sh` on sm_120 (96 GB, 188 SMs, 450 W of 600 W allowed), so with 64 stations at 128
+channels and 32 at 1024 as well (54 shapes).  The first attempt (job 21263199, commit 880996a)
+failed every 1024-channel shape: the tensor-layout tile was planned for 227 KB of shared memory a
+block, taking sm_120 for a datacentre part like sm_90 ("sm_90 and up"), but it has 99 KB, like
+sm_86/89; and the register-capped variants assumed 2048 threads an SM, where it holds 1536
+(ptxas's "minnctapersm out of range" warnings).  Both are now listed per architecture
+(`fused_inst.cu`), and fusebench skips a tensor-layout variant whose shared memory does not fit.
+`results-local/gina18-wide-20261120-140632` (job 21267207, commit 92a16a2), all 54 runs passing;
+the 128-channel shapes repeat the first attempt's to within about 1%.
+
+FP16 spectra + staged, ms per ms of data, and in brackets its time over the best other chain:
+
+| bits | subbands (bands) | 128 ch, 4 stations | 128 ch, 10 | 128 ch, 32 | 128 ch, 64 | 1024 ch, 10 | 1024 ch, 32 |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 (2) | 0.0055 (0.99) | 0.0148 (1.18) | 0.0523 (1.09) | 0.116 (1.06) | 0.0164 (0.82) | 0.0640 (0.80) |
+| 1 | 4 (8) | 0.0172 (0.93) | 0.0471 (0.86) | 0.173 (0.97) | 0.436 (1.07) | 0.0549 (0.79) | 0.243 (1.01) |
+| 1 | 32 (64) | 0.139 (0.86) | 0.383 (0.78) | 1.52 (0.94) | 3.54 (0.98) | 0.477 (0.77) | 1.90 (0.78) |
+| 2 | 1 (2) | 0.0052 (0.96) | 0.0142 (1.18) | 0.0506 (1.08) | 0.114 (1.10) | 0.0158 (0.79) | 0.0626 (0.80) |
+| 2 | 4 (8) | 0.0169 (0.94) | 0.0464 (0.85) | 0.176 (0.98) | 0.440 (1.05) | 0.0562 (0.79) | 0.249 (1.01) |
+| 2 | 32 (64) | 0.139 (0.81) | 0.388 (0.76) | 1.55 (0.92) | 3.62 (0.96) | 0.507 (0.79) | 1.99 (0.75) |
+| 4 | 1 (2) | 0.0052 (0.97) | 0.0150 (1.16) | 0.0519 (1.09) | 0.117 (1.12) | 0.0159 (0.79) | 0.0640 (0.85) |
+| 4 | 4 (8) | 0.0175 (0.95) | 0.0473 (0.85) | 0.178 (0.98) | 0.443 (1.04) | 0.0564 (0.79) | 0.250 (0.99) |
+| 4 | 32 (64) | 0.147 (0.67) | 0.403 (0.71) | 1.60 (0.81) | 3.69 (0.84) | 0.544 (0.81) | 2.13 (0.71) |
+
+- **The staged path is the fastest chain in 40 of the 54 shapes**, by up to 33%, and 15-29% at
+  1024 channels (tied, 0.99-1.01, with 4 subbands at 32 stations).  It is behind with 1 subband
+  at 128 channels from 10 stations (by 6-18%, most at 10 stations) and with 4 subbands at 64
+  stations (4-7%), each time behind writing the layout + tensor.
+- **Why, split by stage** (2 bits; best variant of each station kernel, and each XMAC kernel
+  alone).  The layout path needs no transpose: its station kernel writes the tensor layout
+  itself, so the rearrangement's cost is in its station time, and its XMAC kernel reads a layout
+  ready for it.  The FP16-spectra station kernel takes 0.47-0.85 of the layout-writing one's
+  time, least saving with 1 subband at 128 channels (0.79-0.85) and most at 1024 channels
+  (0.47-0.55); the staged XMAC, which does the rearrangement in its own copy, takes 1.07-2.75x
+  the tensor kernel alone (1.07-1.18x at 4 stations, 1.55-2.4x from 10 stations with 1 subband,
+  1.8x at 64 stations).  The stages add up to the chains (1 subband, 10 stations: 0.192 + 0.051
+  ms for the layout path, 0.159 + 0.121 for the staged one, against 0.252 and 0.284 measured with
+  the phase and setup kernels).  So the staged path loses where the XMAC's share is large and the
+  station saving small.  Against the transpose route (FP32 spectra, transpose, tensor) the staged
+  XMAC is the faster: there the transpose alone is 0.246 ms.  The 2070 shows the same split (above), so it is
+  the staged XMAC, not sm_120: closing its gap to the tensor XMAC is the lever (Open items,
+  "Large N").
+- **More bits favour the staged path, as on the 2070**: at 4 bits with 32 subbands it leads by
+  16-33% at 128 channels.
+- **Against gpudifx today: 7.2-18.4x** (7-10x up to 10 stations and at 1024 channels, 13-16x at
+  32 stations, 17-18x at 64).
+- Not comparable in absolute terms with the 2070 or the A100 sections; the ratios are.
 
 ### Window design
 
@@ -1367,12 +1436,17 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   half the re-reads, with the items split differently among the warps for the registers); more
   output per stage load (bigger tiles per warp, more blocks an SM); and the XMAC literature for
   large N (e.g. the tensor-core correlators built for LOFAR-class arrays).  Not needed for
-  DiFX's usual arrays.
+  DiFX's usual arrays.  The same gap shows below 100 stations wherever the XMAC's share is
+  large: on the RTX PRO 6000 and the 2070 the staged XMAC takes 1.1-2.75x the tensor XMAC kernel
+  alone at every shape (the layout path pays for its rearrangement in the station kernel instead,
+  less than that gap where the FP16 station kernel saves least), and with 1 subband at 128 channels (where the FP16 station kernel saves
+  least) that already loses the chain from 10 stations ("Wider shapes", both GPUs).
 - **A wider test matrix**: 1, 2 and 4 bits x 1, 4 and 32 dual-polarisation subbands x 4-32
-  stations at 128 and 1024 channels done on the 2070 ("Wider shapes, bits and subbands",
-  `run-wide.sh`; the A100 adds 64 stations and 1024 channels at 32).  Still open: channel counts
-  from 64 to 16384 and not powers of two, single polarisation, 8 bits (not compiled for the XMAC
-  outputs), and 32 stations with one subband, where the layout path still leads by 1-7%.
+  stations at 128 and 1024 channels done on the 2070, and with 64 stations at 128 channels and
+  32 at 1024 on the RTX PRO 6000 ("Wider shapes, bits and subbands", `run-wide.sh`); the A100
+  still to run.  Still open: channel counts from 64 to 16384 and not powers of two, single
+  polarisation, 8 bits (not compiled for the XMAC outputs), and one subband from 10 stations
+  (the 2070 at 32, the RTX PRO 6000 from 10), where the layout path still leads by 1-18%.
 - **The end-to-end kernel is now arithmetic-bound on the A100** (FMA pipe 66%, special-function
   unit 28%): what is left is mostly the FFT itself, the integer multiply-adds of the indexing,
   a sincos per sample for the fringe phase and one per channel for the fractional-sample
