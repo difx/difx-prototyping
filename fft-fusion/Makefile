@@ -10,6 +10,12 @@
 #
 # The fused kernel is compiled once per FFT size, ~20-60 s each, so build in parallel (-j8).
 #
+# Each GPU architecture builds in its own build-sm<SM>/, objects and binaries both, so a build for
+# one never touches another's: build-sm80/fusebench and build-sm120/fusebench sit side by side and
+# switching between them rebuilds nothing.  ./fusebench and ./xmacbench are links to the last
+# build's binaries, for running by hand; the run-*.sh scripts take the binaries for the GPU they
+# find (bench-bin.sh), so jobs on different GPUs sharing this directory never run each other's.
+#
 # Every setting can be given on the command line.  Without one:
 #   CUDA_HOME  $CUDAROOT (setup.bash), else $CUDA_HOME, else the CUDA holding the nvcc on PATH,
 #              else /usr/local/cuda
@@ -83,7 +89,12 @@ endif
 
 all: fusebench xmacbench
 
-fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(BUILD)/xmac.o $(FUSED_OBJ)
+# the links to this architecture's binaries (always redone: the last build's architecture wins)
+.PHONY: all fusebench xmacbench mathdx clean
+fusebench xmacbench: %: $(BUILD)/%
+	ln -sfn $< $@
+
+$(BUILD)/fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(BUILD)/xmac.o $(FUSED_OBJ)
 	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
 
 $(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD) $(MATHDX_DEP)
@@ -93,7 +104,7 @@ $(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh decode.cuh gp
 	$(NVCC) $(FLAGS) -c $< -o $@
 
 # the XMAC stage on its own (xmac.cuh)
-xmacbench: $(BUILD)/xmacbench.o $(BUILD)/xmac.o
+$(BUILD)/xmacbench: $(BUILD)/xmacbench.o $(BUILD)/xmac.o
 	$(NVCC) $(FLAGS) $^ -o $@
 
 $(BUILD)/xmacbench.o: xmacbench.cu xmac.cuh common.cuh | $(BUILD)
@@ -124,4 +135,3 @@ $(MATHDX_STAMP):
 clean:
 	rm -rf build-sm* fusebench xmacbench
 
-.PHONY: all clean mathdx

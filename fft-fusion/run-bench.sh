@@ -31,7 +31,8 @@
 
 set -u
 cd "$(dirname "$0")"
-[ -x ./fusebench ] || { echo "ERROR: build fusebench first (make MATHDX=...)" >&2; exit 1; }
+. ./bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make MATHDX=...)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
@@ -46,7 +47,7 @@ fail=0
 run() {   # run <name> <fusebench options...>
     local name=$1
     shift
-    ./fusebench "$@" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
+    "$FUSEBENCH" "$@" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
     local rc=$?
     [ $rc = 0 ] || fail=1
     { echo "== $name (exit $rc): fusebench $* ${EXTRA[*]}"

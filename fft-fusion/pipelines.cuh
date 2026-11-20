@@ -78,12 +78,13 @@ struct FusedVariant {
     bool (*launch)(const Geometry& g, const PreVariant& pre, const FracParams& p, bool doAutocorr,
                    cuFloatComplex* out, int ant0, int nant, cudaStream_t st);
     // the same writing TensorOut (after launchFixedPhase and launchPackedSetup); compiled for the
-    // 2-bit lean decode, no autocorrelations, uncapped variants only (else nullptr)
+    // 1-, 2- and 4-bit lean decode, no autocorrelations, uncapped variants only (else nullptr)
     void (*launchTensor)(const Geometry& g, const PreVariant& pre, const FracParams& p, const TensorOut& out,
                          int ant0, int nant, cudaStream_t st);
     // the same writing HalfOut (same conditions)
     void (*launchHalf)(const Geometry& g, const PreVariant& pre, const FracParams& p, const HalfOut& out,
                        int ant0, int nant, cudaStream_t st);
+    unsigned tensorSmem;   // launchTensor's dynamic shared memory (the FFT's and the tile's), bytes
 };
 // registers per thread of the last fused kernel launched (for the report)
 extern int fusedLastRegisters;

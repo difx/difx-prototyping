@@ -20,7 +20,8 @@
 
 set -u
 cd "$(dirname "$0")"
-[ -x ./fusebench ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
+. ./bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-wide-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
@@ -38,7 +39,7 @@ printf "%-4s %-5s %-5s %-4s %6s %9s %9s %9s %9s %11s %11s %11s %8s %8s\n" nbit n
     e2e+gdx e2e+tiled e2e+tr+tens "e2e>tens+t" "e2e>16+stag" stag/best gain > "$OUT/wide.txt"
 chain() {   # chain <nbit> <nband> <nchan> <nant> <nwin>
     local name="nbit$1-nband$2-nchan$3-nant$4"
-    ./fusebench --input packed --xmac --rotator double --fpb sweep --ept sweep --check 4 --nbit "$1" --nband "$2" \
+    "$FUSEBENCH" --input packed --xmac --rotator double --fpb sweep --ept sweep --check 4 --nbit "$1" --nband "$2" \
         --nchan "$3" --nant "$4" --nwin "$5" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
     local rc=$?
     { [ $rc = 0 ] && ! grep -q "FAIL" "$OUT/$name.log"; } || { fail=1; echo "$name: exit $rc or a failed check, see $OUT/$name.log"; }

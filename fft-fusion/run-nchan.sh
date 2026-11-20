@@ -15,7 +15,8 @@
 
 set -u
 cd "$(dirname "$0")"
-[ -x ./fusebench ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
+. ./bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-nchan-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
@@ -35,7 +36,7 @@ for nchan in 32 64 128 256 512 1024 2048 4096 8192; do
         name="nchan$nchan-$([ $wola = yes ] && echo wola || echo plain)"
         opts=(--nchan "$nchan" --nwin "$nwin" --input packed --fpb sweep --ept sweep --check 4)
         [ $wola = yes ] && opts+=(--wola)
-        ./fusebench "${opts[@]}" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
+        "$FUSEBENCH" "${opts[@]}" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
         rc=$?
         [ $rc = 0 ] || { fail=1; echo "$name: exit $rc, see $OUT/$name.log"; }
         # the subint length, the best fused line, the two 2-kernel lines (median times)

@@ -139,8 +139,11 @@ __device__ __forceinline__ void fusedBody(const Geometry& g, const Pre& pre, con
 template<class FFT>
 struct TensorPlan {
     static constexpr unsigned N = size_of<FFT>::value, FPB = FFT::ffts_per_block;
-    // shared memory a block may use: sm_80 163 KB, sm_86/89 99 KB, sm_90 227 KB, sm_75 64 KB
-    static constexpr unsigned maxSmem = FUSE_SM >= 900 ? 227u * 1024 : FUSE_SM == 800 ? 163u * 1024
+    // shared memory a block may use: sm_80/87 163 KB, sm_90/100/103 227 KB, sm_75 64 KB, others
+    // (sm_86/89, sm_120/121: the GeForce and workstation parts) 99 KB.  Not "sm_90 and up": the
+    // RTX PRO 6000 Blackwell (sm_120) has 99 KB, and a tile planned for 227 KB failed to launch.
+    static constexpr unsigned maxSmem = FUSE_SM == 900 || FUSE_SM == 1000 || FUSE_SM == 1030 ? 227u * 1024
+                                      : FUSE_SM == 800 || FUSE_SM == 870 ? 163u * 1024
                                       : FUSE_SM >= 860 ? 99u * 1024 : 64u * 1024;
     static constexpr unsigned row(unsigned w) { return w >= 2 ? w + 2 : w; }
     // the tile for W windows; the packed data is real, so at most N / 2 channels
@@ -285,10 +288,10 @@ __global__ void fused_fft_half(Geometry g, Pre pre, Post post, OutHalf out, int 
 
 // The same with the registers capped (--regcap): REGCAP is a number of threads per SM to make
 // room for, so __launch_bounds__ asks for at least REGCAP / block threads blocks per SM.  The
-// request is clamped to what an SM holds (sm_80, sm_90: 2048 threads in 32 blocks; sm_75: 1024
-// in 16; others: taken as 1536 in 16), so where the SM holds fewer threads than REGCAP (sm_75)
-// the cap asks for no more than the SM's own limit.
-constexpr bool BIG_SM = FUSE_SM == 800 || FUSE_SM >= 900;
+// request is clamped to what an SM holds (sm_80/87, sm_90/100/103: 2048 threads in 32 blocks;
+// sm_75: 1024 in 16; others, sm_86/89 and sm_120/121 among them: taken as 1536 in 16), so where
+// the SM holds fewer threads than REGCAP (sm_75) the cap asks for no more than the SM's own limit.
+constexpr bool BIG_SM = FUSE_SM == 800 || FUSE_SM == 870 || FUSE_SM == 900 || FUSE_SM == 1000 || FUSE_SM == 1030;
 constexpr unsigned MAX_BLOCKS_PER_SM = BIG_SM ? 32 : 16;
 constexpr unsigned MAX_THREADS_PER_SM = BIG_SM ? 2048 : FUSE_SM == 750 ? 1024 : 1536;
 constexpr unsigned minBlocks(unsigned regcap, unsigned threads) {
@@ -405,7 +408,7 @@ static void addVariant(std::vector<FusedVariant>& v) {
         if constexpr (REGCAP == 0) { tensor = &launchTensorVariant<FFT>; half = &launchHalfVariant<FFT>; }
         v.push_back({FPB, E, FFT::max_threads_per_block, FFT::shared_memory_size,
                      E == E0 && FPB == FFTBase::suggested_ffts_per_block && REGCAP == 0, REGCAP,
-                     &launchVariant<FFT, REGCAP>, tensor, half});
+                     &launchVariant<FFT, REGCAP>, tensor, half, REGCAP == 0 ? TensorPlan<FFT>::smem : 0u});
     }
 }
 

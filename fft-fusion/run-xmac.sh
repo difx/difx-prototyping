@@ -21,7 +21,8 @@
 
 set -u
 cd "$(dirname "$0")"
-[ -x ./xmacbench ] || { echo "ERROR: build xmacbench first (make, see README.md)" >&2; exit 1; }
+. ./bench-bin.sh
+[ -x "$XMACBENCH" ] || { echo "ERROR: build xmacbench first (make, see README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-xmac-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
@@ -38,7 +39,7 @@ printf "%-6s %-5s %6s %9s %9s %9s %9s %10s %9s %9s %11s %11s %11s\n" nchan nant 
     tensor_x staged tiled/ms tensor_x/ms staged/ms > "$OUT/table.txt"
 run() {   # run <nchan> <nant> <nwin>
     local name="nchan$1-nant$2"
-    ./xmacbench --nchan "$1" --nant "$2" --nwin "$3" --check 2 "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
+    "$XMACBENCH" --nchan "$1" --nant "$2" --nwin "$3" --check 2 "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
     local rc=$?
     [ $rc = 0 ] || { fail=1; echo "$name: exit $rc, see $OUT/$name.log"; }
     awk -v nchan="$1" -v nant="$2" -v nwin="$3" '
@@ -68,8 +69,8 @@ printf "%-6s %-5s %6s %9s %10s %10s %10s %12s %12s %12s\n" nchan nant nwin subin
     e2e+tr+tens "e2e>tens+tens" "e2e>16+stag" > "$OUT/chain.txt"
 chain() {   # chain <nchan> <nant> <nwin>
     local name="chain-nchan$1-nant$2"
-    [ -x ./fusebench ] || { echo "no fusebench: skipping the chain runs"; return; }
-    ./fusebench --input packed --xmac --rotator double --fpb sweep --ept sweep --check 4 --nchan "$1" --nant "$2" \
+    [ -x "$FUSEBENCH" ] || { echo "no fusebench: skipping the chain runs"; return; }
+    "$FUSEBENCH" --input packed --xmac --rotator double --fpb sweep --ept sweep --check 4 --nchan "$1" --nant "$2" \
         --nwin "$3" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
     local rc=$?
     [ $rc = 0 ] || { fail=1; echo "$name: exit $rc, see $OUT/$name.log"; }

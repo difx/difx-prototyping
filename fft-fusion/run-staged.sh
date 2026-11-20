@@ -18,7 +18,8 @@
 
 set -u
 cd "$(dirname "$0")"
-[ -x ./xmacbench ] || { echo "ERROR: build xmacbench first (make, see README.md)" >&2; exit 1; }
+. ./bench-bin.sh
+[ -x "$XMACBENCH" ] || { echo "ERROR: build xmacbench first (make, see README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-staged-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
@@ -38,7 +39,7 @@ t() { awk -v pat="$2" '$0 ~ pat { match($0, /[0-9.]+ +\[/); print substr($0, RST
 one() {   # one <log> <xmacbench options...>: run, note a failure
     local log=$1
     shift
-    ./xmacbench "$@" --check 2 "${EXTRA[@]}" > "$log" 2>&1
+    "$XMACBENCH" "$@" --check 2 "${EXTRA[@]}" > "$log" 2>&1
     local rc=$?
     { [ $rc = 0 ] && grep -q '^check: PASS$' "$log"; } || { fail=1; echo "$log: exit $rc or a failed check"; }
 }

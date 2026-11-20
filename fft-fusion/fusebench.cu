@@ -799,6 +799,11 @@ int main(int argc, char** argv) {
     };
     if (xmac) {
         if (!chosen->launchTensor) { fprintf(stderr, "--xmac: the chosen variant has no tensor-layout output (--regcap 0)\n"); return 2; }
+        if (chosen->tensorSmem > prop.sharedMemPerBlockOptin) {
+            fprintf(stderr, "--xmac: the chosen variant's tensor-layout output needs %u B of shared memory, the GPU has %zu\n",
+                    chosen->tensorSmem, (size_t)prop.sharedMemPerBlockOptin);
+            return 2;
+        }
         hDirect = devAlloc<__half>(xL.count(xs));
         hTrans = devAlloc<__half>(xL.count(xs));
         CHECK_CUDA(cudaMemset(hDirect, 0, xL.count(xs) * sizeof(__half)));      // the slack at the end
@@ -1066,7 +1071,7 @@ int main(int argc, char** argv) {
         const FusedVariant* bestTensor = nullptr, * bestHalf = nullptr;
         double bestTensorMs = 1e30, bestHalfMs = 1e30;
         for (const auto& v : variants) {
-            if (!v.launchTensor) continue;
+            if (!v.launchTensor || v.tensorSmem > prop.sharedMemPerBlockOptin) continue;
             if (!sweep && v.fpb != chosen->fpb) continue;
             if (!sweepEpt && v.ept != chosen->ept) continue;
             const Timing t = timeIt([&] { runTensorStation(v); }, warmup, reps, st);

@@ -100,7 +100,7 @@ run_profile() {
     echo "== $name: $kernel in $prog $*"
     local t0=$(date +%s)
     "$NCU" --set full --import-source yes -k "regex:$kernel" -c 1 -f -o "$OUT/$name" \
-        "./$prog" "$@" "${QUICK[@]}" > "$OUT/$name.run.log" 2>&1
+        "build-sm$SM/$prog" "$@" "${QUICK[@]}" > "$OUT/$name.run.log" 2>&1
     local rc=$?
     if grep -q ERR_NVGPUCTRPERM "$OUT/$name.run.log"; then
         echo "ERROR: ncu may not read this GPU's performance counters (ERR_NVGPUCTRPERM): profiling" \
