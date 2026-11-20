@@ -87,12 +87,23 @@ ifeq ($(filter clean mathdx,$(MAKECMDGOALS)),)
   $(info fusebench: sm_$(SM) (from $(SM_FROM)), CUDA $(CUDA_HOME), MathDx $(MATHDX))
 endif
 
-all: fusebench xmacbench
+all: fusebench xmacbench twostagebench
 
 # the links to this architecture's binaries (always redone: the last build's architecture wins)
-.PHONY: all fusebench xmacbench mathdx clean
-fusebench xmacbench: %: $(BUILD)/%
+.PHONY: all fusebench xmacbench twostagebench mathdx clean
+fusebench xmacbench twostagebench: %: $(BUILD)/%
 	ln -sfn $< $@
+
+# two-stage channelisation (docs/two-stage.md): the PFB stage and the fine-FFT stage, compiled for
+# their FFT sizes (twostage1.cu, twostage2.cu), and the benchmark
+$(BUILD)/twostagebench: $(BUILD)/twostagebench.o $(BUILD)/twostage1.o $(BUILD)/twostage2.o $(BUILD)/unfused.o
+	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
+
+$(BUILD)/twostagebench.o: twostagebench.cu twostage.cuh pipelines.cuh stages.cuh common.cuh decode.cuh xmac.cuh | $(BUILD)
+	$(NVCC) $(FLAGS) -c $< -o $@
+
+$(BUILD)/twostage%.o: twostage%.cu twostage.cuh pipelines.cuh stages.cuh common.cuh decode.cuh | $(BUILD) $(MATHDX_DEP)
+	$(NVCC) $(FLAGS) $(DXFLAGS) -c $< -o $@
 
 $(BUILD)/fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(BUILD)/xmac.o $(FUSED_OBJ)
 	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
@@ -133,5 +144,5 @@ $(MATHDX_STAMP):
 	touch $@
 
 clean:
-	rm -rf build-sm* fusebench xmacbench
+	rm -rf build-sm* fusebench xmacbench twostagebench
 

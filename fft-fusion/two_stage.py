@@ -409,3 +409,41 @@ if __name__ == "__main__" and len(__import__("sys").argv) > 1 and __import__("sy
         (w, wx, wc, wo), (f, fx, fc, fo) = r[1:5], r[5:9]
         print(f"  p = {p:4.2f}:  WOLA stage 1 {w:6.1f} dB at {wx:+5.2f} (coarse {wc:+d}; one stage there {wo:6.1f} dB)   "
               f"PFB stage 1 {f:6.1f} dB at {fx:+5.2f} (coarse {fc:+d}; one stage there {fo:6.1f} dB)")
+
+
+# ---- the implemented PFB (twostagebench): continuum loss at the fine-channel count used ----------------
+
+def pfb_loss(P, O, Ks=(6, 12, 24)):
+    """The PFB first stage with P taps for oversampling O (pfb_design, the same prototype as
+    twostagebench), rectangular stage 2: the exact zero-delay continuum loss at K = 6, 12, 24 fine
+    channels a coarse channel, fitted as a + b / K (a: the aliasing floor; b / K: the stage-2
+    window's sidelobes across the coarse edges).  Returns (a, b), the worst alias image (dB) and the
+    passband ripple (dB, peak to peak) at 64 fine bins a coarse channel."""
+    L = 64
+    H = int(round(L / O))
+    h, _ = pfb_design(L, P, O)
+    losses = []
+    for K in Ks:
+        N2 = int(round(K * O))
+        d = Design("pfb", h, L, H, N2, K)
+        M = max(2, int(np.ceil(2 * len(h) / (N2 * H))))
+        losses.append(1 - sensitivity(d, M, (0.0,))[0])
+    X = np.vstack([np.ones(len(Ks)), 1 / np.asarray(Ks, float)]).T
+    a, b = np.linalg.lstsq(X, np.asarray(losses), rcond=None)[0]
+    m = metrics(Design("pfb", h, L, H, int(round(64 * O)) // 2 * 2, int(round(64 * O)) // 2 * 2 * H // L))
+    return a, b, losses, float(np.max(m["alias_db"])), float(np.ptp(m["gain_db"]))
+
+
+if __name__ == "__main__" and len(__import__("sys").argv) > 1 and __import__("sys").argv[1] == "pfb":
+    print("PFB first stage, rectangular stage 2: zero-delay continuum loss = a + b / K (exact at K = 6, 12, 24),")
+    print("at the K twostagebench uses (O = 4/3: 49152 channels; O = 2: 65536), plus the fractional-delay residual")
+    for O, Kof in ((4 / 3, {16: 3072, 32: 1536, 64: 768}), (2, {16: 4096, 32: 2048, 64: 1024})):
+        for P in (4, 8, 16):
+            a, b, ls, al, rip = pfb_loss(P, O)
+            cells = []
+            for Nc, K in Kof.items():
+                w, avg = two_stage_fractional_loss(2 * Nc)
+                cells.append(f"Nc {Nc}: {100 * (a + b / K + avg):.3f}%")
+            print(f"  O = {'4/3' if O < 2 else '2':3s} P = {P:2d}: floor {100 * a:.3f}%, b {b:.3f} (losses at K 6/12/24: "
+                  f"{', '.join(f'{100 * x:.2f}%' for x in ls)}); alias worst {al:.1f} dB, ripple {rip:.4f} dB;  " + "; ".join(cells),
+                  flush=True)

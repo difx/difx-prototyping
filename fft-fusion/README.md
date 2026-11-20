@@ -73,6 +73,7 @@ make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everythin
 ./run-staged.sh                                                      # the staged XMAC's super-blocks, 4-128 stations
 ./run-wide.sh                                                        # the whole chain: bits x subbands, 4-64 stations
 ./run-matrix.sh                                                      # the whole chain over 108 shapes (corner cases)
+./run-twostage.sh                                                    # two-stage channelisation: PFB parameters, ~64k channels (NCHAN=8192 NWIN=128 for ~8k)
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
 python3 plot_xmac_paths.py                                           # plots/xmac-paths.svg
@@ -139,6 +140,7 @@ Each run checks:
 | `fusebench.cu` | data, window, checks, timing, options |
 | `xmac.cuh`, `xmac.cu` | the XMAC stage: the shapes and layouts, gpudifx's XMAC (the reference) and the staged tensor XMAC from FP16 spectra, split by receiver, reading them through a map (any station layouts) |
 | `xmac_copy.cuh` | gpudifx's XMAC kernel, copied verbatim, and its launch geometry as GPUCore sets it |
+| `twostage.cuh`, `twostage1.cu`, `twostage2.cu`, `twostagebench.cu` | two-stage channelisation (docs/two-stage.md): the PFB stage (decode once a block, fold, coarse FFT, corrections), the fine-FFT stage, and the benchmark with its double-precision reference |
 | `xmacbench.cu` | the XMAC benchmark: station spectra with a common signal, the double-precision check, timing; `--messy` for stations with different band layouts |
 | `window_response.py` | sensitivity and spectral response of window designs |
 
@@ -1629,9 +1631,10 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   channel's samples, which for all coarse channels is the same large tile), about as much
   traffic as the transpose: two-stage moves that cost rather than removing it, so it should rest
   on its other gains (shorter FFTs, the fractional-sample correction's accuracy).
-- **Two-stage channelisation for high spectral resolution**: analysed and planned in
-  [docs/two-stage.md](docs/two-stage.md) (an oversampled polyphase filter bank as the first stage,
-  not WOLA; decisions pending).  The original note: (say above 512 channels): a coarse
+- **Two-stage channelisation for high spectral resolution**: analysed, planned and implemented
+  (PFB first stage; `twostagebench`, `run-twostage.sh`): see [docs/two-stage.md](docs/two-stage.md),
+  "Implementation and first results".  Next: the A100 and RTX PRO 6000, the setup and the decode
+  overlap, and the whole chain with the staged XMAC.  The original note: (say above 512 channels): a coarse
   first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
   second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes
   inaccurate with very long windows and high fringe rates), and two short FFTs may be faster

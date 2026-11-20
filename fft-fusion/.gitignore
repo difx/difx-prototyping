@@ -2,6 +2,7 @@ build-sm*/
 build-sm*.log
 fusebench
 xmacbench
+twostagebench
 results-local/
 build.log
 __pycache__/
