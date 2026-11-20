@@ -71,6 +71,8 @@ make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2          # everythin
 ./xmacbench --nant 10                                                # the XMAC stage, 10 stations
 ./run-xmac.sh                                                        # XMAC against the number of stations
 ./run-staged.sh                                                      # the staged XMAC's super-blocks, 4-128 stations
+./run-wide.sh                                                        # the whole chain: bits x subbands, 4-64 stations
+./run-matrix.sh                                                      # the whole chain over 108 shapes (corner cases)
 python3 window_response.py 256                                       # window design numbers
 python3 plot_windows.py                                              # the plots in plots/
 python3 plot_xmac_paths.py                                           # plots/xmac-paths.svg
@@ -87,7 +89,9 @@ The fused kernel is compiled once per FFT length (`SIZES` in the Makefile, defau
 16384), in all its variants. That takes about 4 minutes with `-j8` (8 cores); `SIZES="256 2048"`
 builds just the two the standard set uses. `fusebench` exits non-zero if a check fails.
 `run-bench.sh` takes about 30 s and writes its logs to `results-local/<host>-<stamp>/`
-(git-ignored).
+(git-ignored).  `results/` (in the repository) holds summaries only, one CSV row per shape:
+`run-matrix.sh` writes `results/<host>-matrix-<stamp>.csv` (columns: `matrix_summary.py`), from
+`fusebench --csv`, which appends every timing and check of a run as CSV rows.
 
 The main options:
 - shape: `--nant --nband --nchan`, and `--nwin`, the subint length in FFT lengths;

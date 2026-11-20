@@ -39,6 +39,9 @@
 #     sbatch --export=ALL,SCRIPTS="run-xmac.sh run-staged.sh" fusebench-ozstar.sbatch   # only some scripts
 #     sbatch --export=ALL,SCRIPTS="run-wide.sh" fusebench-ozstar.sbatch   # the wider shapes (bits, bands):
 #         not in the default set; results-local/<host>-wide-<stamp>/
+#     sbatch --time=4:00:00 --export=ALL,SCRIPTS="run-matrix.sh" fusebench-ozstar.sbatch   # the big matrix
+#         (bits x subbands x channels x stations, 108 shapes, 1-2 h): results-local/<host>-matrix-<stamp>/,
+#         and a summary CSV in results/ (copy it back with the tgz: it is in there too as summary.csv)
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"

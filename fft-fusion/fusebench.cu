@@ -286,6 +286,42 @@ static ChunkView chunkView(const Geometry& g, const FracParams& p, const PreVari
     return v;
 }
 
+// ---- --csv: every timing and check also as a row of a CSV file ---------------------------------
+// Appended to (several runs into one file); the header is written when the file is new or empty.
+// Columns: the shape (gpu, cc, input, nbit, nsub, nband, nchan, nant, nwin, subint_ms), then kind
+// (time, check or result), name, and for a time median_ms, min_ms and ms_per_ms (median / subint),
+// for a check rms, max, limit and ok (1/0; result: all checks).
+struct CsvOut {
+    FILE* f = nullptr;
+    std::string shape;
+    double subintMs = 0;
+    static std::string quote(std::string v) {
+        while (!v.empty() && v[0] == ' ') v.erase(0, 1);
+        std::string q = "\"";
+        for (char c : v) { if (c == '"') q += '"'; q += c; }
+        return q + "\"";
+    }
+    void open(const char* path, const std::string& shapeCols) {
+        f = fopen(path, "a");
+        if (!f) { fprintf(stderr, "--csv: cannot open %s\n", path); exit(2); }
+        if (ftell(f) == 0)
+            fprintf(f, "gpu,cc,input,nbit,nsub,nband,nchan,nant,nwin,subint_ms,kind,name,median_ms,min_ms,ms_per_ms,"
+                       "rms,max,limit,ok\n");
+        shape = shapeCols;
+    }
+    void time(const std::string& name, double median, double min) {
+        if (f) fprintf(f, "%s,time,%s,%.6g,%.6g,%.6g,,,,\n", shape.c_str(), quote(name).c_str(), median, min,
+                       median / subintMs);
+    }
+    void check(const std::string& name, double rms, double max, double limit, bool ok) {
+        if (f) fprintf(f, "%s,check,%s,,,,%.3g,%.3g,%.3g,%d\n", shape.c_str(), quote(name).c_str(), rms, max, limit,
+                       ok ? 1 : 0);
+    }
+    void result(bool ok) { if (f) fprintf(f, "%s,result,\"all checks\",,,,,,,%d\n", shape.c_str(), ok ? 1 : 0); }
+    ~CsvOut() { if (f) fclose(f); }
+};
+static CsvOut csv;
+
 // ---- options ---------------------------------------------------------------------------------
 static void usage() {
     printf(
@@ -353,7 +389,10 @@ static void usage() {
 "  --warmup N      untimed repetitions first, default 3\n"
 "  --check N       spectra checked against a double-precision DFT, default 16\n"
 "  --seed N        random seed, default 1\n"
-"  --device N      CUDA device, default 0\n");
+"  --device N      CUDA device, default 0\n"
+"  --csv FILE      also append every timing and check to FILE as CSV rows (header when new): the\n"
+"                  shape, then kind (time, check, result), name, median/min ms and ms per ms of\n"
+"                  data, or rms, max, limit and ok\n");
 }
 
 int main(int argc, char** argv) {
@@ -369,6 +408,7 @@ int main(int argc, char** argv) {
     int fpb = 0, ept = 0, regcap = 0, chunk = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
     bool sweepEpt = false, sweepRegcap = false, xmac = false;
     unsigned long long seed = 1;
+    std::string csvPath;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -413,6 +453,7 @@ int main(int argc, char** argv) {
         else if (a == "--batched") batched = true;
         else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--xmac") xmac = true;
+        else if (a == "--csv") csvPath = next();
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
@@ -496,6 +537,14 @@ int main(int argc, char** argv) {
 
     const double sampleTimeUs = complexData ? 1.0 / bw : 1.0 / (2.0 * bw);
     const double subintMs = subintSamples * sampleTimeUs / 1000.0;
+    if (!csvPath.empty()) {
+        char cols[512];
+        snprintf(cols, sizeof cols, "%s,%d.%d,%s,%d,%d,%d,%d,%d,%d,%.6g", CsvOut::quote(prop.name).c_str(), prop.major,
+                 prop.minor, packed ? "packed" : half ? "fp16" : "fp32", packed ? nbit : 0, g.nband / 2, g.nband,
+                 g.nchan, g.nant, g.nwin, subintMs);
+        csv.subintMs = subintMs;
+        csv.open(csvPath.c_str(), cols);
+    }
     const size_t nelem = g.perAnt() * g.nant;                      // FFT input/output, per window
     const size_t seriesLen = (size_t)(g.nwin - 1) * hop + g.fftchannels;
     const size_t ninput = series ? (size_t)g.nant * g.nband * seriesLen : nelem;
@@ -699,6 +748,7 @@ int main(int argc, char** argv) {
     pass &= specOk;
     printf("\ncheck: fused vs unfused spectra: rms %.2e, max %.2e (relative to rms; limits %.0e, %.0e)  %s\n",
            dSpec.rms, dSpec.max, specTol, 30 * specTol, specOk ? "OK" : "FAIL");
+    csv.check("fused vs unfused spectra", dSpec.rms, dSpec.max, specTol, specOk);
 
     // both against a double-precision DFT and rotation of the exact input (before rounding to the
     // storage precision), on a sample of valid spectra; with FP16 input this includes the rounding
@@ -770,6 +820,9 @@ int main(int argc, char** argv) {
         pass &= refOk;
         printf("check: vs double-precision DFT of the exact input (%d spectra): unfused rms %.2e max %.2e, "
                "fused rms %.2e max %.2e  %s\n", nc, eu.rms, eu.max, ef.rms, ef.max, refOk ? "OK" : "FAIL");
+        csv.check("unfused vs double-precision DFT", eu.rms, eu.max, packed ? 1e-5 : NAN, refOk);
+        csv.check("fused vs double-precision DFT", ef.rms, ef.max, packed ? std::min(1e-5, 2 * eu.rms + 1e-7)
+                                                                            : 2 * eu.rms + 1e-7, refOk);
         cudaFree(dWhich);
         cudaFree(dIn);
     }
@@ -784,6 +837,7 @@ int main(int argc, char** argv) {
     cuFloatComplex *visA = nullptr, *visB = nullptr;
     XmacGpudifx gx;
     TensorOut tout{};
+    const FusedVariant* tensorCheck = nullptr, * halfCheck = nullptr;
     const int sms = prop.multiProcessorCount;
     auto runTensorStation = [&](const FusedVariant& v) {
         launchFixedPhase(g, pF, st);
@@ -798,12 +852,18 @@ int main(int argc, char** argv) {
         else for (int a = 0; a < g.nant; a++) v.launchHalf(g, pre, pF, hout, a, 1, st);
     };
     if (xmac) {
-        if (!chosen->launchTensor) { fprintf(stderr, "--xmac: the chosen variant has no tensor-layout output (--regcap 0)\n"); return 2; }
-        if (chosen->tensorSmem > prop.sharedMemPerBlockOptin) {
-            fprintf(stderr, "--xmac: the chosen variant's tensor-layout output needs %u B of shared memory, the GPU has %zu\n",
-                    chosen->tensorSmem, (size_t)prop.sharedMemPerBlockOptin);
-            return 2;
-        }
+        // the checks use the chosen variant's tensor-layout and FP16 outputs where it has them (not with
+        // --regcap) and its tile fits; else the first variant whose do.  Where no tensor-layout tile
+        // fits a block (long FFTs on a GPU with little shared memory) the layout path is skipped.
+        auto tensorFits = [&](const FusedVariant& v) { return v.launchTensor && v.tensorSmem <= prop.sharedMemPerBlockOptin; };
+        if (tensorFits(*chosen)) tensorCheck = chosen;
+        else for (const auto& v : variants) if (tensorFits(v)) { tensorCheck = &v; break; }
+        if (chosen->launchHalf) halfCheck = chosen;
+        else for (const auto& v : variants) if (v.launchHalf) { halfCheck = &v; break; }
+        if (!halfCheck) { fprintf(stderr, "--xmac: no variant has the FP16-spectra output\n"); return 2; }
+        if (!tensorCheck)
+            printf("XMAC: no variant's tensor-layout output fits this GPU's shared memory (%zu B a block): the layout "
+                   "path is skipped\n", (size_t)prop.sharedMemPerBlockOptin);
         hDirect = devAlloc<__half>(xL.count(xs));
         hTrans = devAlloc<__half>(xL.count(xs));
         CHECK_CUDA(cudaMemset(hDirect, 0, xL.count(xs) * sizeof(__half)));      // the slack at the end
@@ -818,8 +878,8 @@ int main(int argc, char** argv) {
         gx.init(xs, outFused, p.validSamples, sms);
         printf("XMAC: %d baselines x 4 products, %d channels; tensor layout %.2f GiB (FP16, spectra scaled by 2^-%d)\n",
                xs.nbaseline(), xs.nchan, xL.count(xs) * sizeof(__half) * gib, half);
-        runTensorStation(*chosen);
-        runHalfStation(*chosen);
+        if (tensorCheck) runTensorStation(*tensorCheck);
+        runHalfStation(*halfCheck);
         xmacTranspose(xs, xL, outFused, hTrans, st);
         CHECK_CUDA(cudaStreamSynchronize(st));
         std::vector<cuFloatComplex> va(xs.visCount()), vb(xs.visCount());
@@ -839,22 +899,32 @@ int main(int argc, char** argv) {
             pass &= ok;
             printf("check: %s: rms %.2e, max %.2e (relative to rms; limits %.0e, %.0e)  %s\n", name, rms, mx, tol,
                    30 * tol, ok ? "OK" : "FAIL");
+            csv.check(name, rms, mx, tol, ok);
         };
         const double unscale = 1.0 / ((double)tout.scale * tout.scale);
-        // the same FP16 values up to the power-of-two scale: the same visibilities
-        xmacTensor(xs, xL, hDirect, visA, sms, st);
-        xmacTensor(xs, xL, hTrans, visB, sms, st);
-        visDiff("XMAC tensor, layout from the end-to-end kernel vs through the transpose", unscale, 1e-5);
+        // the same FP16 values up to the power-of-two scale (the transpose does not scale): the same
+        // visibilities
+        if (tensorCheck) {
+            xmacTensor(xs, xL, hDirect, visA, sms, st);
+            xmacTensor(xs, xL, hTrans, visB, sms, st);
+            visDiff("XMAC tensor, layout from the end-to-end kernel vs through the transpose", unscale, 1e-5);
+        }
         // the staged XMAC from the kernel's FP16 spectra: the same FP16 values again, summed in another
         // order (other window chunks, other atomic order): FP32 rounding over the windows, about
         // sqrt(nwin) x 6e-8 (6e-6 rms measured at 10000 windows)
         xmacTensorStaged(xs, hHalf, visA, sms, st);
-        xmacTensor(xs, xL, hDirect, visB, sms, st);
-        visDiff("XMAC staged tensor, FP16 spectra from the end-to-end kernel vs tensor from its layout", 1.0, 1e-4);
-        xmacTensor(xs, xL, hTrans, visB, sms, st);
-        // against FP32: FP16 rounding of the spectra
+        if (tensorCheck) {
+            xmacTensor(xs, xL, hDirect, visB, sms, st);
+            visDiff("XMAC staged tensor, FP16 spectra from the end-to-end kernel vs tensor from its layout", 1.0, 1e-4);
+        } else {
+            xmacTensor(xs, xL, hTrans, visB, sms, st);
+            visDiff("XMAC staged tensor, FP16 spectra from the end-to-end kernel vs tensor through the transpose",
+                    unscale, 1e-4);
+        }
+        // against FP32: FP16 rounding of the spectra (visA: the staged XMAC's, which matched the
+        // tensor XMAC's above)
         gx.run(visB, st);
-        visDiff("XMAC tensor, layout from the end-to-end kernel vs gpudifx's XMAC (FP32)", unscale, 1e-3);
+        visDiff("XMAC staged tensor (FP16, scaled) vs gpudifx's XMAC (FP32)", unscale, 1e-3);
         xmacTiled(xs, outFused, visA, sms, st);
         visDiff("XMAC tiled vs gpudifx's XMAC", 1.0, 1e-5);
     }
@@ -913,6 +983,7 @@ int main(int argc, char** argv) {
         pass &= ok;
         printf("check: %s vs unfused: rms %.2e, max %.2e (limits %.0e, %.0e)  %s\n", tk.name, d2.rms, d2.max,
                tol, 30 * tol, ok ? "OK" : "FAIL");
+        csv.check(std::string(tk.name) + " vs unfused", d2.rms, d2.max, tol, ok);
     }
 
     // ---- packed input, --chunk: the same pipelines W windows at a time, one stream per antenna ----
@@ -987,6 +1058,7 @@ int main(int argc, char** argv) {
         pass &= ok;
         printf("check: %s vs unfused: rms %.2e, max %.2e (limits %.0e, %.0e)  %s\n", c.name.c_str(), d2.rms,
                d2.max, tol, 30 * tol, ok ? "OK" : "FAIL");
+        csv.check(c.name + " vs unfused", d2.rms, d2.max, tol, ok);
     }
 
     if (doAuto) {
@@ -1013,8 +1085,12 @@ int main(int argc, char** argv) {
         printf("check: autocorrelations fused vs unfused: band rms %.2e", worst[0]);
         if (amode == AutoMode::FULL) printf(", cross-pol rms %.2e", worst[1]);
         printf(" (relative; limit %.0e)  %s\n", autoTol, autoOk ? "OK" : "FAIL");
+        csv.check("autocorrelations fused vs unfused, band", worst[0], NAN, autoTol, worst[0] < autoTol);
+        if (amode == AutoMode::FULL)
+            csv.check("autocorrelations fused vs unfused, cross-pol", worst[1], NAN, autoTol, worst[1] < autoTol);
     }
     printf("check: %s\n", pass ? "PASS" : "FAIL");
+    csv.result(pass);
 
     // ---- timing ----
     printf("\ntiming per subint (all antennas), median [min] of %d, ms:\n", reps);
@@ -1023,6 +1099,7 @@ int main(int argc, char** argv) {
         if (ref > 0) printf("  %5.2fx", ref / t.median);
         else printf("        ");
         printf("  %6.1f ns/spectrum  %5.1fx real time\n", t.median * 1e6 / g.spectra(), subintMs / t.median);
+        csv.time(name, t.median, t.min);
     };
     const Timing tU = timeIt(runUnfused, warmup, reps, st);
     line("unfused total", tU, 0);
@@ -1092,13 +1169,17 @@ int main(int argc, char** argv) {
             line(name, t, tU.median);
             if (t.median < bestHalfMs) { bestHalfMs = t.median; bestHalf = &v; }
         }
-        printf("  (the combined lines below: FP32 spectra from %u FFT/block, %u/thr%s; the tensor layout from %u "
-               "FFT/block, %u/thr; FP16 spectra from %u FFT/block, %u/thr)\n", bestFused->fpb, bestFused->ept,
-               bestFused->regcap ? " (capped)" : "", bestTensor->fpb, bestTensor->ept, bestHalf->fpb, bestHalf->ept);
+        if (!bestHalf) bestHalf = halfCheck;
+        printf("  (the combined lines below: FP32 spectra from %u FFT/block, %u/thr%s; ", bestFused->fpb, bestFused->ept,
+               bestFused->regcap ? " (capped)" : "");
+        if (bestTensor) printf("the tensor layout from %u FFT/block, %u/thr; ", bestTensor->fpb, bestTensor->ept);
+        else printf("no tensor layout (no variant fits); ");
+        printf("FP16 spectra from %u FFT/block, %u/thr)\n", bestHalf->fpb, bestHalf->ept);
+        __half* hTensor = tensorCheck ? hDirect : hTrans;   // the tensor XMAC's time does not depend on the values
         line("XMAC: gpudifx (FP32 spectra)", timeIt([&] { gx.run(visA, st); }, warmup, reps, st), 0);
         line("XMAC: tiled (FP32 spectra)", timeIt([&] { xmacTiled(xs, outFused, visA, sms, st); }, warmup, reps, st), 0);
         line("XMAC: transpose", timeIt([&] { xmacTranspose(xs, xL, outFused, hTrans, st); }, warmup, reps, st), 0);
-        line("XMAC: tensor", timeIt([&] { xmacTensor(xs, xL, hDirect, visA, sms, st); }, warmup, reps, st), 0);
+        line("XMAC: tensor", timeIt([&] { xmacTensor(xs, xL, hTensor, visA, sms, st); }, warmup, reps, st), 0);
         line("XMAC: staged tensor (FP16 spectra)", timeIt([&] { xmacTensorStaged(xs, hHalf, visA, sms, st); }, warmup,
                                                           reps, st), 0);
         line(rotator == Rotator::DOUBLE ? "station + XMAC: gpudifx today (both)" : "station + XMAC: unfused + gpudifx XMAC",
@@ -1110,8 +1191,9 @@ int main(int argc, char** argv) {
         line("station + XMAC: end-to-end + transpose + tensor", timeIt([&] {
             runFused(*bestFused); xmacTranspose(xs, xL, outFused, hTrans, st); xmacTensor(xs, xL, hTrans, visA, sms, st); },
             warmup, reps, st), 0);
-        line("station + XMAC: end-to-end -> tensor layout + tensor", timeIt([&] {
-            runTensorStation(*bestTensor); xmacTensor(xs, xL, hDirect, visA, sms, st); }, warmup, reps, st), 0);
+        if (bestTensor)
+            line("station + XMAC: end-to-end -> tensor layout + tensor", timeIt([&] {
+                runTensorStation(*bestTensor); xmacTensor(xs, xL, hDirect, visA, sms, st); }, warmup, reps, st), 0);
         line("station + XMAC: end-to-end -> FP16 spectra + staged tensor", timeIt([&] {
             runHalfStation(*bestHalf); xmacTensorStaged(xs, hHalf, visA, sms, st); }, warmup, reps, st), 0);
     }
