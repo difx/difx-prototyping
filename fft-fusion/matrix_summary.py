@@ -7,7 +7,8 @@ Usage: python3 matrix_summary.py runs.csv raw.csv [--host H --commit C --date D 
 Columns (times in ms per ms of data):
   host, gpu, cc, power_w, sm_clock_lock_mhz, commit, date   where and what
   nbit, nsub, nband, nchan, nant, nwin, subint_ms, reps      the shape (nsub dual-pol subbands)
-  status                  ok, fail (a check failed or a non-zero exit), oom, skip (did not fit)
+  status                  ok, fail (a check failed or a non-zero exit), oom, skip (did not fit),
+                          unsupported (refused by fusebench: a window over the lean decode's 32 frames)
   exit, note              fusebench's exit code; why a shape was skipped
   checks, checks_failed   number of checks; the names of any that failed (;-separated)
   worst_check, worst_ratio  the check closest to its limit, and its rms / limit

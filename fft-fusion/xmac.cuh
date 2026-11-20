@@ -13,6 +13,7 @@
 //            (halfIndex), each block reshuffling its channels of the receivers it multiplies into
 //            the tensor layout in shared memory: no transpose, and no tile in the station kernel
 #pragma once
+#include <vector>
 #include <cuda_fp16.h>
 #include "common.cuh"
 
@@ -77,8 +78,17 @@ struct XmacGpudifx {
     const cuFloatComplex** m1 = nullptr, ** m2 = nullptr;     // [baseline] station spectra
     const bool** v1 = nullptr, ** v2 = nullptr;               // [baseline] station valid flags
     int* b1 = nullptr, * b2 = nullptr, * offsets = nullptr;    // [freq][baseline][product]
-    int* bandStride = nullptr, * windowStride = nullptr;      // [baseline]
+    int* bandStride = nullptr, * windowStride = nullptr;      // [baseline], the first station's
+    int* bandStride2 = nullptr, * windowStride2 = nullptr;    // [baseline], the second station's
     void init(const XmacShape& shape, const cuFloatComplex* spectra, const bool* valid, int multiprocessors);
+    // the tables given directly (heterogeneous stations: xmacbench --messy); each vector as above, the
+    // offsets in vis, which needs room for whatever offsets point past visCount()
+    struct Tables {
+        std::vector<const cuFloatComplex*> m1, m2;
+        std::vector<const bool*> v1, v2;
+        std::vector<int> b1, b2, offsets, bandStride, windowStride, bandStride2, windowStride2;
+    };
+    void init(const XmacShape& shape, const Tables& t, int multiprocessors);
     void run(cuFloatComplex* vis, cudaStream_t st) const;
     void destroy();
 };
@@ -96,6 +106,31 @@ void xmacTranspose(const XmacShape& s, const TensorLayout& L, const cuFloatCompl
 void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFloatComplex* vis, int multiprocessors,
                 cudaStream_t st);
 
+// Where the staged XMAC finds each receiver's FP16 spectra, per correlated frequency: the stations
+// need not share one layout (different bandwidths and numbers of bands, a frequency some stations
+// lack).  Per frequency f, receivers r = 2 k + pol for the k-th station present (stations in
+// increasing order), nrecv[f] of them:
+//   off[f][r]      __half2 offset of window 0, channel 0 of f in that station's spectra
+//   wstride[f][r]  __half2 from one window to the next
+//   station[f][k]  the station (for the baseline index of the output, [freq][baseline][product][chan]
+//                  as XmacShape::visIndex with all nant stations; baselines a frequency lacks stay zero)
+// Offsets and strides must be multiples of 4 (16-byte loads of 4 channels).  The regular layout
+// (halfIndex) is the special case xmacRegularMap.
+struct XmacMapHost {
+    int rmax = 0;                                // receivers a frequency, at most
+    std::vector<int> nrecv, wstride, station;    // [freq], [freq][rmax], [freq][rmax / 2]
+    std::vector<long long> off;                  // [freq][rmax]
+};
+struct XmacMap {                                 // the same on the device
+    int rmax = 0;
+    long long maxOff = 0, maxStride = 0;         // (host) the largest offset and window stride
+    const int* nrecv = nullptr, * wstride = nullptr, * station = nullptr;
+    const long long* off = nullptr;
+};
+XmacMapHost xmacRegularMap(const XmacShape& s);
+XmacMap xmacUploadMap(const XmacMapHost& h);
+void xmacFreeMap(XmacMap& m);
+
 // The staged tensor version: FP16 spectra (halfIndex; windows past the subint need not exist) ->
 // vis.  Each block stages a few channels of the receivers it multiplies: every receiver up to 32 (8
 // channels), else two super-blocks of 64 receivers (KS 4, 4 channels), so the shared memory a block
@@ -105,6 +140,9 @@ void xmacTensor(const XmacShape& s, const TensorLayout& L, const __half* h, cuFl
 // xmacTensorStagedFits says whether the plan fits a block on this device.
 void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int multiprocessors,
                       cudaStream_t st);
+// The same with the spectra where a map says (the mma.sync version; spec is the base the offsets are from).
+void xmacTensorStagedMapped(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
+                            int multiprocessors, cudaStream_t st);
 int xmacTensorStagedTile(const XmacShape& s);
 int xmacTensorStagedStages(const XmacShape& s);
 void xmacTensorStagedSetTile(int ks);

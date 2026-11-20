@@ -1354,6 +1354,82 @@ FP16 spectra + staged, ms per ms of data, and in brackets its time over the best
   32 stations, 17-18x at 64).
 - Not comparable in absolute terms with the 2070 or the A100 sections; the ratios are.
 
+### The big matrix, 108 shapes: RTX 2070 SUPER (150 W + 1500 MHz) and A100-SXM4-80GB (gina10), 2026-11-20
+
+`run-matrix.sh` (new): the whole chain for 1, 2 and 4 bits x 1, 8 and 64 dual-pol subbands x 32,
+512 and 4096 channels x 4, 16, 64 and 256 stations, looking for corner cases.  Each shape gets the
+most windows that fit the GPU's memory, about 2e10 complex multiply-accumulates and 1e8 spectral
+values (at most 10000, at least 16), unrounded, so most counts are not a multiple of 16; shapes
+that do not fit at 16 windows are skipped.  Commit 3ff7185.  Summaries (one row per shape) in
+`results/ar313-adeller-matrix-20261120-144918.csv` and `results/gina10-matrix-20261120-145410.csv`;
+the logs and every timing and check (`raw.csv`) in `results-local/` under the same names.  The
+A100 took 846 s.
+
+| | 2070 | A100 |
+|---|---|---|
+| shapes run, every check passing | 79 | 92 |
+| skipped (too big at 16 windows: mostly the visibilities) | 27 | 12 |
+| refused (a window over the lean decode's 32 VDIF frames) | 2 | 4 |
+| the check closest to its limit (rms / limit) | 0.40 | 0.42 |
+| staged chain the fastest | 60 of 79 | 62 of 92 |
+| staged chain over the best other chain | 0.48-1.43 | 0.66-1.32 |
+| staged chain over the layout path | 0.24-1.21 | 0.31-1.32 |
+| gpudifx today over the staged chain | 3.5-30.8x | 2.2-28.7x |
+
+- **No wrong results anywhere.**  The closest any check came to its limit was 42% (the station
+  kernel against the double-precision DFT); every XMAC check had more room.
+- **One limitation found: the lean decode's 32-frame window.**  The window descriptor holds a
+  32-bit mask of the frames a window spans, so a window may span at most 32 VDIF frames.  With 128
+  bands in a frame at 2 or 4 bits, an 8192-point window spans more (1 bit fits), and fusebench
+  refuses the shape (`run-matrix.sh` records it as "unsupported").  Open items.
+- **Where the staged chain loses, it is the XMAC's share again**, as in the wider shapes: at 64 and
+  256 stations (fastest in 9 of 18 and 6 of 12 shapes on the 2070, 10 of 24 and 12 of 18 on the
+  A100), and at 32 channels on the A100 (13 of 36), where the FFT is short, the station saving
+  small, and the staged XMAC up to 2.2x the tensor XMAC kernel (0.8-2.2x).  At 512 and 4096 channels it is the
+  fastest in 25 of 27 and 15 of 16 shapes on the 2070, 28 of 33 and 21 of 23 on the A100, up to 4x
+  ahead of the layout path at 4096 channels (whose station kernel's tile is largest there).
+- **Very short subints with many baselines** (20-23 windows at 64-256 stations, where the
+  visibilities outweigh the data): the XMAC's per-subint output (zeroing, window chunks' atomics,
+  the stores) dominates, the tensor XMAC is 1.3-4.3x slower than the staged one, and the tiled
+  FP32 XMAC beats both (the chain by 1.3-1.4x).  Not a regime DiFX gets into: even multiple
+  phase centres at L band (8k channels in 32 MHz, 40 ms subints) have about 160 windows a subint.
+
+### Stations with different band layouts: `xmacbench --messy` (RTX 2070 SUPER, 150 W + 1500 MHz, 2026-11-20)
+
+The staged XMAC now takes a map (`XmacMap`, `xmac.cuh`): per correlated frequency and receiver,
+where that receiver's FP16 spectra start and their window stride, and which station it is.  So
+the stations need not share one layout: different bandwidths and numbers of bands, and stations
+missing a frequency.  The regular layout is the special case `xmacRegularMap`, so it is one
+kernel, not two.  Each row's place is a 32-bit offset (in `__half2`) and a 32-bit stride: as a
+64-bit pointer and stride each, the KS 2 kernel spilled at its 128 registers and was 12-20%
+slower at 10 stations; now the registers are as before (119, 128, 63, 64; no spills) and the regular
+case is within 1-3% of before (4-64 stations, 128 and 1024 channels).  The spectra may span at
+most 2^32 `__half2` (16 GiB), checked.
+
+`xmacbench --messy`: the correlated frequencies are F dual-pol bands of the narrowest bandwidth, C
+channels each.  Half the stations have bands of 2 frequencies (twice the bandwidth), the rest of 1,
+and one has bands of 3 (a bandwidth and channel count that are not powers of two) covering
+frequencies 1-6 of 8 only, so it lacks two.  Every band is whole correlated frequencies (no band
+straddles one's edge: the 62.5 MHz case, where zoom bands must be stitched, is still open).
+gpudifx's XMAC is configured as GPUCore would (per baseline each station's spectra and strides; per
+frequency, baseline and product a band index in units of C channels, -1 where a baseline lacks
+the frequency), and both are checked against a double-precision reference, with the absent
+baselines checked to be exactly zero.  Every shape passes:
+
+| stations | frequencies x channels | windows | gpudifx (tables) | staged (map) | staged, regular layout of the same size |
+|---|---|---|---|---|---|
+| 3 | 8 x 128 | 2001 | 0.423 | 0.195 | 0.199 |
+| 4 | 8 x 128 | 4000 | 1.79 | 0.417 | 0.407 |
+| 10 | 8 x 128 | 2000 | 6.38 | 0.810 | 0.803 |
+| 10 | 6 x 512 | 501 | 4.68 | 0.757 | 0.779 |
+| 32 | 8 x 128 | 1000 | 38.5 | 2.01 | 1.93 |
+| 64 | 8 x 128 | 500 | 84.0 | 3.84 | 3.52 |
+| 64 | 14 x 32 | 777 | 68.3 | 2.19 | 2.21 |
+
+(ms per subint.)  The map costs nothing measurable: the messy layout is within 4% of the regular one
+of the same size, 9% at 64 stations with 8 frequencies (the stations' wider bands spread a block's
+reads), while it does less work (the station missing two frequencies).
+
 ### Window design
 
 All the designs here overlap neighbouring windows over exactly their tapers (with 12.5% tapers,
@@ -1445,6 +1521,11 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   alone at every shape (the layout path pays for its rearrangement in the station kernel instead,
   less than that gap where the FP16 station kernel saves least), and with 1 subband at 128 channels (where the FP16 station kernel saves
   least) that already loses the chain from 10 stations ("Wider shapes", both GPUs).
+- **The lean decode's 32-frame window** (found by the big matrix): a window may span at most 32
+  VDIF frames (`leanDecodeFits`; the window descriptor's valid-frame mask is 32 bits), which 2- and
+  4-bit data with 128 bands in a frame exceed at 8192-point windows.  A 64-bit mask (the descriptor
+  is an `int4`: the parity bit could share a word), or a slower path for the rare long window.  The
+  XMAC outputs need the lean decode, so such shapes cannot run the whole chain today.
 - **A wider test matrix**: 1, 2 and 4 bits x 1, 4 and 32 dual-polarisation subbands x 4-32
   stations at 128 and 1024 channels done on the 2070, and with 64 stations at 128 channels and
   32 at 1024 on the RTX PRO 6000 ("Wider shapes, bits and subbands", `run-wide.sh`); the A100
@@ -1473,6 +1554,11 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   tensor kernel itself need not see any of it: the channels are its batch dimension (each one an
   independent X X^H), so their number is free, and the tensor cores only constrain the windows
   (blocks of 16, padded with zeros) and the receivers (16-row tiles, the spare rows discarded).
+  Done for the staged XMAC's input: its map ("Stations with different band layouts", `xmacbench
+  --messy`: different bandwidths and band counts, stations missing a frequency).  Still open: bands
+  that straddle a correlated frequency's edge (ALMA's 62.5 MHz against 64 MHz: zoom bands per
+  overlapping piece, stitched into synthetic channels), baselines not correlated, channel
+  averaging, and the station side (per-station FFT lengths in fusebench, non-power-of-two FFTs).
   The rest can be two tables, like the band indexes and result offsets gpudifx's XMAC takes now:
   an input map for whatever writes the tensor layout (per correlated frequency and receiver: the
   station's band and channel offset; a zoom band and a narrower band at another station are both
@@ -1482,10 +1568,13 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   store or a pass after it.  To show it in `xmacbench`: a "messy" configuration (per-frequency
   station subsets, a zoom band at a channel offset, a subset of baselines, a non-power-of-two
   channel count such as 1000) against the reference, and what the tables cost.  Still open:
-  pulsar binning (an accumulator set per bin, or a pass per bin, with the off-bin windows zero),
-  and FP16's range (65504): a strong tone in a long FFT can approach it, so the writer should
+  FP16's range (65504): a strong tone in a long FFT can approach it, so the writer should
   scale the spectra (free in the fractional-sample rotation), with a test with a strong tone; BF16
   has the range but only 8 bits of mantissa.
+- **Pulsar binning and multiple phase centres**: each in its own directory, as a backlog with the
+  approaches to compare ([../pulsar-binning](../pulsar-binning/README.md),
+  [../phase-centres](../phase-centres/README.md)).  Both build on the staged XMAC; multiple phase
+  centres also on the two-stage channelisation (fine channels).
 - **FFT lengths that are not powers of two.**  The main case is the EHT: ALMA's 62.5 MHz channels
   need FFTs of N x 125 points to match the channel width of the other stations, which record
   power-of-two bandwidths (so this is also mixed-bandwidth correlation, below).  cuFFTDx (MathDx

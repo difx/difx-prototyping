@@ -22,7 +22,9 @@
 # skipped.
 #
 # Every run checks everything fusebench --xmac checks (--check 4).  A run fails on a non-zero exit
-# or a failed check.  Results:
+# or a failed check; a shape fusebench refuses because a window spans more than the lean decode's
+# 32 VDIF frames (2 and 4 bits with 128 bands and 4096 channels) is "unsupported", not a failure.
+# Results:
 #   results-local/<host>-matrix-<stamp>/   the logs, fusebench's CSV of every timing and check
 #                                          (raw.csv), and summary.csv
 #   results/<host>-matrix-<stamp>.csv      summary.csv again, in the repository (results-local is
@@ -44,7 +46,8 @@ mkdir -p "$OUT" results
 cat "$OUT/system.txt"
 GPU_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 HOST_MB=$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo)
-# the job's memory limit, where Slurm sets one (cgroup v2, then v1), if lower
+# the job's memory limit, if lower: Slurm's (--mem, in MB), else the cgroup's (v2, then v1)
+[ -n "${SLURM_MEM_PER_NODE:-}" ] && [ "$SLURM_MEM_PER_NODE" -lt "$HOST_MB" ] && HOST_MB=$SLURM_MEM_PER_NODE
 for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
     [ -r "$f" ] || continue
     lim=$(cat "$f"); [ "$lim" = max ] && continue
@@ -98,11 +101,13 @@ for nbit in $NBITS; do
                     --nbit "$nbit" --nband $((2 * nsub)) --nchan "$nchan" --nant "$nant" --nwin "$nwin" \
                     --csv "$OUT/raw.csv" "${ropt[@]}" "${EXTRA[@]}" > "$OUT/$name.log" 2>&1
                 rc=$?
-                status=ok
+                status=ok note=
                 if grep -q "cudaErrorMemoryAllocation\|out of memory" "$OUT/$name.log"; then status=oom
+                elif [ $rc = 2 ] && grep -q "^--decode lean: windows of up to 32 frames" "$OUT/$name.log"; then
+                    status=unsupported note="the lean decode takes windows of up to 32 VDIF frames"
                 elif [ $rc != 0 ] || grep -q "FAIL" "$OUT/$name.log"; then status=fail; fi
-                [ $status = ok ] || fail=1
-                echo "$nbit,$nsub,$nchan,$nant,$nwin,$nreps,$status,$rc," >> "$RUNS"
+                [ $status = ok ] || [ $status = unsupported ] || fail=1
+                echo "$nbit,$nsub,$nchan,$nant,$nwin,$nreps,$status,$rc,\"$note\"" >> "$RUNS"
                 printf "%-34s nwin %5d  %-4s exit %d  %4d s\n" "$name" "$nwin" "$status" $rc $(( $(date +%s) - t0 ))
             done
         done

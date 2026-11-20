@@ -42,6 +42,16 @@ void XmacGpudifx::init(const XmacShape& shape, const cuFloatComplex* spectra, co
     m1 = upload(hm1); m2 = upload(hm2); v1 = upload(hv1); v2 = upload(hv2);
     b1 = upload(hb1); b2 = upload(hb2); offsets = upload(hoff);
     bandStride = upload(hbs); windowStride = upload(hws);
+    bandStride2 = upload(hbs); windowStride2 = upload(hws);
+}
+
+void XmacGpudifx::init(const XmacShape& shape, const Tables& t, int multiprocessors) {
+    s = shape;
+    sms = multiprocessors;
+    m1 = upload(t.m1); m2 = upload(t.m2); v1 = upload(t.v1); v2 = upload(t.v2);
+    b1 = upload(t.b1); b2 = upload(t.b2); offsets = upload(t.offsets);
+    bandStride = upload(t.bandStride); windowStride = upload(t.windowStride);
+    bandStride2 = upload(t.bandStride2); windowStride2 = upload(t.windowStride2);
 }
 
 void XmacGpudifx::run(cuFloatComplex* vis, cudaStream_t st) const {
@@ -51,14 +61,14 @@ void XmacGpudifx::run(cuFloatComplex* vis, cudaStream_t st) const {
     for (int f = 0; f < s.nfreq; f++) {
         const size_t o = (size_t)f * nbl * 4;
         gpu_fuse_xmac_and_average<<<L.blocks, L.threads, 0, st>>>(m1, m2, v1, v2, b1 + o, b2 + o, offsets + o, vis,
-            nbl, 4, s.nwin, L.fftsPerChunk, s.nchan, 1, bandStride, windowStride, bandStride, windowStride);
+            nbl, 4, s.nwin, L.fftsPerChunk, s.nchan, 1, bandStride, windowStride, bandStride2, windowStride2);
     }
     CHECK_CUDA(cudaGetLastError());
 }
 
 void XmacGpudifx::destroy() {
     for (void* p : {(void*)m1, (void*)m2, (void*)v1, (void*)v2, (void*)b1, (void*)b2, (void*)offsets,
-                    (void*)bandStride, (void*)windowStride})
+                    (void*)bandStride, (void*)windowStride, (void*)bandStride2, (void*)windowStride2})
         cudaFree(p);
 }
 
@@ -521,18 +531,22 @@ struct MmaCfg {
 
 template<int KS, int CH>
 __global__ void __launch_bounds__(MmaCfg<KS, CH>::NW * 32, MmaCfg<KS, CH>::MINB)
-xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, const int2* __restrict__ superPairs,
-                   int nsp, int srows, int nbuf, int nchunk) {
+xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, float2* vis,
+                   const int2* __restrict__ superPairs, int nsp, int srows, int nbuf, int nchunk) {
     using C = MmaCfg<KS, CH>;
     constexpr int NJ = C::NJ;
     extern __shared__ __align__(32) unsigned char smraw[];
     const int CSb = stagedChannelBytes(srows), BUFb = CH * CSb;
-    const int R = s.nrecv(), nb = (R + 15) / 16;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int ncg = (s.nchan + CH - 1) / CH;
     const int sp = blockIdx.x / ncg, c0 = (blockIdx.x % ncg) * CH;      // channel group fastest
     const int f = blockIdx.y;
+    const int R = m.nrecv[f], nb = (R + 15) / 16;                       // this frequency's receivers
     const int2 AB = superPairs[sp];
+    if (AB.y * 16 * KS >= R) return;           // the pair is past this frequency's receivers (whole block)
+    const long long* moff = m.off + (size_t)f * m.rmax;
+    const int* mws = m.wstride + (size_t)f * m.rmax;
+    const int* mst = m.station + (size_t)f * (m.rmax / 2);
     const bool diag = AB.x == AB.y;
     const int used = diag ? 16 * KS : 32 * KS;                          // stage rows in use
     const int ntb = (s.nwin + 15) / 16;
@@ -552,14 +566,19 @@ xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, c
     // the copy tasks: (channel quad q, window quad wq, row), q fastest then wq; a thread's q and wq are
     // fixed, its rows row0, row0 + RSTEP, ...: their spectra (this block's channels, window 0), or none
     const int q = threadIdx.x % C::NQ, wq = (threadIdx.x / C::NQ) % 4, row0 = threadIdx.x / (C::NQ * 4);
-    const size_t wstride = (size_t)s.nband() * s.nchan;                // __half2 from one window to the next
-    const __half2* src[C::MAXR];
-    int dofs[C::MAXR];
+    // src: where each task's spectra start (window 0), as a 32-bit offset in __half2 from spec, or NONE;
+    // wstride: __half2 a window.  (Rows may have different window strides.  As 64-bit pointers, with a
+    // stride each, the KS 2 kernel spilled at its 128 registers; the host checks the offsets fit.)
+    constexpr unsigned NONE = 0xffffffffu;
+    unsigned src[C::MAXR];
+    int dofs[C::MAXR], wstride[C::MAXR];
 #pragma unroll
     for (int k = 0; k < C::MAXR; k++) {
         const int row = row0 + k * C::RSTEP;
         const int r = row < used ? recvOf(row) : -1;
-        src[k] = r >= 0 && c0 + 4 * q < s.nchan ? spec + s.halfIndex(r >> 1, 0, 2 * f + (r & 1), c0 + 4 * q) : nullptr;
+        const bool any = r >= 0 && c0 + 4 * q < s.nchan;
+        src[k] = any ? (unsigned)moff[r] + c0 + 4 * q : NONE;
+        wstride[k] = any ? mws[r] : 0;
         dofs[k] = 4 * q * CSb + stagedChunk(row, wq);
     }
     // windows 16 tb + 4 wq .. + 3 of each task into registers (zero past the last window) ...
@@ -570,15 +589,16 @@ xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, c
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 const int wg = tb * 16 + 4 * wq + e;
-                v[k][e] = src[k] && wg < s.nwin ? __ldg(reinterpret_cast<const uint4*>(src[k] + (size_t)wg * wstride))
-                                                : make_uint4(0, 0, 0, 0);
+                v[k][e] = src[k] != NONE && wg < s.nwin
+                        ? __ldg(reinterpret_cast<const uint4*>(spec + (src[k] + (unsigned)wg * (unsigned)wstride[k])))
+                        : make_uint4(0, 0, 0, 0);
             }
     };
     // ... and from there into a stage: channel cq's 4 windows are word cq of each, one chunk
     auto put = [&](int buf) {
 #pragma unroll
         for (int k = 0; k < C::MAXR; k++) {
-            if (!src[k]) continue;
+            if (src[k] == NONE) continue;
             unsigned char* d = smraw + buf * BUFb + dofs[k];
 #pragma unroll
             for (int cq = 0; cq < 4; cq++)
@@ -688,7 +708,7 @@ xmac_staged_kernel(XmacShape s, const __half2* __restrict__ spec, float2* vis, c
                 for (int e = 0; e < 4; e++) {
                     const int r1 = I * 16 + g + 8 * (e >> 1), r2 = J * 16 + 8 * h + 2 * t + (e & 1);
                     if (r1 >= R || r2 >= R || (r1 >> 1) >= (r2 >> 1)) continue;
-                    const int bl = baselineIndex(r1 >> 1, r2 >> 1, s.nant);
+                    const int bl = baselineIndex(mst[r1 >> 1], mst[r2 >> 1], s.nant);
                     addVis((cuFloatComplex*)vis, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), acc[i][jj][0][h][e],
                            acc[i][jj][1][h][e], nchunk > 1);
                 }
@@ -730,14 +750,15 @@ static int stagedBlocksPerSM(int ks, int ch, size_t smem) {
          : ks == 2 ? stagedBlocks<2, 8>(smem) : stagedBlocks<4, 4>(smem);
 }
 
-static StagedPlan stagedPlan(const XmacShape& s) {
-    const int nb = (s.nrecv() + 15) / 16;
+// rmax: receivers a frequency, at most (the map's; s.nrecv() for the regular layout)
+static StagedPlan stagedPlan(const XmacShape& s, int rmax) {
+    const int nb = (rmax + 15) / 16;
     static int maxSmem = 0;
     if (!maxSmem) maxSmem = deviceAttr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
     auto plan = [&](int ks) {
         StagedPlan p;
         p.ks = ks;
-        p.ch = ks == 4 ? 4 : ks == 1 && stagedImpl == 0 && s.nrecv() > 8 ? 16 : 8;
+        p.ch = ks == 4 ? 4 : ks == 1 && stagedImpl == 0 && rmax > 8 ? 16 : 8;
         p.nw = p.ch == 8 ? 8 : 16;
         p.nsuper = (nb + ks - 1) / ks;
         p.srows = (p.nsuper == 1 ? 16 : 32) * ks;
@@ -757,6 +778,7 @@ static StagedPlan stagedPlan(const XmacShape& s) {
     return plan(4);                                                     // else 64-receiver super-blocks, 4 channels
 }
 
+static StagedPlan stagedPlan(const XmacShape& s) { return stagedPlan(s, s.nrecv()); }
 int xmacTensorStagedTile(const XmacShape& s) { return stagedPlan(s).ks; }
 int xmacTensorStagedStages(const XmacShape& s) { return stagedPlan(s).nbuf; }
 bool xmacTensorStagedFits(const XmacShape& s) {
@@ -766,8 +788,8 @@ bool xmacTensorStagedFits(const XmacShape& s) {
 }
 
 template<int KS, int CH>
-static void launchStaged(const XmacShape& s, const StagedPlan& P, const __half2* spec, cuFloatComplex* vis, int sms,
-                         cudaStream_t st) {
+static void launchStaged(const XmacShape& s, const XmacMap& m, const StagedPlan& P, const __half2* spec,
+                         cuFloatComplex* vis, int sms, cudaStream_t st) {
     static size_t smemSet[2] = {0, 0};
     auto kernel = stagedImpl == 1 ? nullptr : xmac_staged_kernel<KS, CH>;
     auto kernelW = xmac_staged_wmma_kernel<KS, CH>;
@@ -785,25 +807,101 @@ static void launchStaged(const XmacShape& s, const StagedPlan& P, const __half2*
     const int nchunk = windowChunks((long long)nx * s.nfreq * threads, ntb, 4, sms);
     CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
     if (kernel)
-        kernel<<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, spec, (float2*)vis, superPairs, nsp, P.srows,
-                                                                    P.nbuf, nchunk);
+        kernel<<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, m, spec, (float2*)vis, superPairs, nsp,
+                                                                    P.srows, P.nbuf, nchunk);
     else
         kernelW<<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, spec, (float2*)vis, superPairs, nsp, P.srows,
                                                                      nchunk);
     CHECK_CUDA(cudaGetLastError());
 }
 
-void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int sms, cudaStream_t st) {
+XmacMapHost xmacRegularMap(const XmacShape& s) {
+    XmacMapHost h;
+    h.rmax = s.nrecv();
+    h.nrecv.assign(s.nfreq, h.rmax);
+    h.off.resize((size_t)s.nfreq * h.rmax);
+    h.wstride.assign(h.off.size(), s.nband() * s.nchan);
+    h.station.resize((size_t)s.nfreq * s.nant);
+    for (int f = 0; f < s.nfreq; f++) {
+        for (int r = 0; r < h.rmax; r++) h.off[(size_t)f * h.rmax + r] = (long long)s.halfIndex(r >> 1, 0, 2 * f + (r & 1), 0);
+        for (int a = 0; a < s.nant; a++) h.station[(size_t)f * s.nant + a] = a;
+    }
+    return h;
+}
+
+XmacMap xmacUploadMap(const XmacMapHost& h) {
+    for (size_t i = 0; i < h.off.size(); i++)
+        if (h.off[i] % 4 || h.wstride[i] % 4) {
+            fprintf(stderr, "staged tensor XMAC: map offsets and window strides must be multiples of 4 __half2\n");
+            exit(2);
+        }
+    XmacMap m;
+    m.rmax = h.rmax;
+    for (size_t i = 0; i < h.off.size(); i++) {
+        m.maxOff = std::max(m.maxOff, h.off[i]);
+        m.maxStride = std::max(m.maxStride, (long long)h.wstride[i]);
+    }
+    m.nrecv = upload(h.nrecv);
+    m.off = upload(h.off);
+    m.wstride = upload(h.wstride);
+    m.station = upload(h.station);
+    return m;
+}
+
+void xmacFreeMap(XmacMap& m) {
+    for (const void* p : {(const void*)m.nrecv, (const void*)m.off, (const void*)m.wstride, (const void*)m.station})
+        cudaFree(const_cast<void*>(p));
+    m = XmacMap{};
+}
+
+void xmacTensorStagedMapped(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis, int sms,
+                            cudaStream_t st) {
     if (s.nchan % 4) { fprintf(stderr, "staged tensor XMAC: the channel count must be a multiple of 4\n"); exit(2); }
-    const StagedPlan P = stagedPlan(s);
-    if (!xmacTensorStagedFits(s)) {
+    if (m.maxOff + (long long)(s.nwin - 1) * m.maxStride + s.nchan > 0xfffffffeLL) {
+        fprintf(stderr, "staged tensor XMAC: the spectra span more than 2^32 __half2 (16 GiB): use fewer windows\n");
+        exit(2);
+    }
+    const StagedPlan P = stagedPlan(s, m.rmax);
+    static int maxSmem = 0;
+    if (!maxSmem) maxSmem = deviceAttr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
+    if (P.smem > (size_t)maxSmem) {
         fprintf(stderr, "staged tensor XMAC: %zu bytes of shared memory a block (KS %d), more than a block may have\n",
                 P.smem, P.ks);
         exit(2);
     }
-    if (P.ks == 1 && P.ch == 16) launchStaged<1, 16>(s, P, spec, vis, sms, st);
-    else if (P.ks == 1) launchStaged<1, 8>(s, P, spec, vis, sms, st);
-    else if (P.ks == 2) launchStaged<2, 8>(s, P, spec, vis, sms, st);
-    else if (P.ks == 4) launchStaged<4, 4>(s, P, spec, vis, sms, st);
+    if (stagedImpl == 1) { fprintf(stderr, "staged tensor XMAC: the WMMA version takes the regular layout only\n"); exit(2); }
+    if (P.ks == 1 && P.ch == 16) launchStaged<1, 16>(s, m, P, spec, vis, sms, st);
+    else if (P.ks == 1) launchStaged<1, 8>(s, m, P, spec, vis, sms, st);
+    else if (P.ks == 2) launchStaged<2, 8>(s, m, P, spec, vis, sms, st);
+    else if (P.ks == 4) launchStaged<4, 4>(s, m, P, spec, vis, sms, st);
     else { fprintf(stderr, "staged tensor XMAC: KS must be 1, 2 or 4, not %d\n", P.ks); exit(2); }
+}
+
+// The regular layout (halfIndex): its map, made and uploaded once per shape.  The WMMA version (for
+// comparison) still indexes the regular layout itself.
+void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int sms, cudaStream_t st) {
+    if (stagedImpl == 1) {
+        if (s.nchan % 4) { fprintf(stderr, "staged tensor XMAC: the channel count must be a multiple of 4\n"); exit(2); }
+        const StagedPlan P = stagedPlan(s);
+        if (!xmacTensorStagedFits(s)) {
+            fprintf(stderr, "staged tensor XMAC: %zu bytes of shared memory a block (KS %d), more than a block may have\n",
+                    P.smem, P.ks);
+            exit(2);
+        }
+        const XmacMap none{};
+        if (P.ks == 1 && P.ch == 16) launchStaged<1, 16>(s, none, P, spec, vis, sms, st);
+        else if (P.ks == 1) launchStaged<1, 8>(s, none, P, spec, vis, sms, st);
+        else if (P.ks == 2) launchStaged<2, 8>(s, none, P, spec, vis, sms, st);
+        else launchStaged<4, 4>(s, none, P, spec, vis, sms, st);
+        return;
+    }
+    static XmacShape mapped{};
+    static XmacMap map{};
+    if (map.rmax == 0 || mapped.nant != s.nant || mapped.nfreq != s.nfreq || mapped.nchan != s.nchan ||
+        mapped.nwin != s.nwin) {
+        if (map.rmax) xmacFreeMap(map);
+        map = xmacUploadMap(xmacRegularMap(s));
+        mapped = s;
+    }
+    xmacTensorStagedMapped(s, map, spec, vis, sms, st);
 }

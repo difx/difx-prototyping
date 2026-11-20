@@ -79,6 +79,246 @@ static Timing timeIt(F f, int warmup, int reps, cudaStream_t st) {
     return {t[t.size() / 2], t[0]};
 }
 
+// ---- --messy: stations with different band layouts ----------------------------------------------
+// The correlated frequencies are F narrow dual-polarisation bands of C channels each (the narrowest
+// bandwidth), and every station's bands are whole numbers of them (no band straddles a correlated
+// frequency's edge), so the channel width, the FFT duration and the windows are the same everywhere:
+//   A  the first half of the stations: bands of 2 frequencies (twice the bandwidth), F / 2 of them
+//   B  the rest but one: bands of 1 frequency, F of them
+//   C  the last station: bands of 3 frequencies (3 x the bandwidth: not a power of two), covering
+//      frequencies 1 .. 3 floor((F - 2) / 3), so it lacks frequency 0 and the last one or more
+// Each station's spectra are [win][band][its channels] (bands 2 sub + pol), stored one station after
+// another.  A frequency inside a wider band is a channel range of it: the staged XMAC reads it through
+// its map (XmacMapHost), gpudifx's kernel through GPUCore's tables (a band index in units of C channels).
+struct MessyStation { char kind; int k, nsub, f0, nchan, nband; long long base; };
+
+__global__ void make_messy(MessyStation m, int F, int C, int nwin, unsigned long long seed, int station, float rho,
+                           float2* spec, __half2* half) {
+    const size_t n = (size_t)nwin * m.nband * m.nchan;
+    const float a = sqrtf(rho), b = sqrtf(1.f - rho);
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const int j = (int)(i % m.nchan);
+        const size_t t = i / m.nchan;                 // (win, band)
+        const int band = (int)(t % m.nband), w = (int)(t / m.nband);
+        const int f = m.f0 + (band >> 1) * m.k + j / C, c = j % C, pol = band & 1;
+        const float2 sig = gauss(seed, ((((size_t)w * F + f) * 2 + pol) * C + c) * 2 + 1);
+        const float2 own = gauss(seed + 7 + 1000ull * station, i * 2);
+        const float2 v = make_float2(a * sig.x + b * own.x, a * sig.y + b * own.y);
+        spec[m.base + i] = v;
+        half[m.base + i] = __float22half2_rn(v);
+    }
+}
+
+static int runMessy(int nant, int F, int C, int nwin, double bw, double rho, int reps, int warmup, int ncheck,
+                    unsigned long long seed, int device) {
+    if (nant < 3 || F < 5 || F % 2 || C % 4 || nwin < 16) {
+        fprintf(stderr, "--messy: needs at least 3 stations, an even number of at least 5 frequencies (--nfreq), "
+                        "channels a multiple of 4 and at least 16 windows\n");
+        return 2;
+    }
+    std::vector<MessyStation> st(nant);
+    long long base = 0;
+    for (int a = 0; a < nant; a++) {
+        MessyStation& m = st[a];
+        if (a == nant - 1) m = {'C', 3, (F - 2) / 3, 1, 0, 0, 0};
+        else if (a < nant / 2) m = {'A', 2, F / 2, 0, 0, 0, 0};
+        else m = {'B', 1, F, 0, 0, 0, 0};
+        m.nchan = m.k * C;
+        m.nband = 2 * m.nsub;
+        m.base = base;
+        base += (long long)nwin * m.nband * m.nchan;
+    }
+    auto has = [&](int a, int f) { return f >= st[a].f0 && f < st[a].f0 + st[a].nsub * st[a].k; };
+    // where frequency f of station a starts in its spectra (window 0, pol 0), and its window stride
+    auto offOf = [&](int a, int f, int pol) {
+        const MessyStation& m = st[a];
+        const int sub = (f - m.f0) / m.k, part = (f - m.f0) % m.k;
+        return m.base + (long long)(2 * sub + pol) * m.nchan + (long long)part * C;
+    };
+    const XmacShape s{nant, F, C, nwin, C};
+    CHECK_CUDA(cudaSetDevice(device));
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+    const int sms = prop.multiProcessorCount;
+    const double subintMs = (double)nwin * C / bw / 1000.0;     // real data: a window is C / bw
+    printf("GPU %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, sms);
+    printf("messy setup: %d correlated dual-pol frequencies of %g MHz, %d channels each, %d windows (subint %.3f ms)\n",
+           F, bw, C, nwin, subintMs);
+    int nA = 0, nB = 0;
+    for (const auto& m : st) (m.kind == 'A' ? nA : nB) += m.kind != 'C';
+    printf("  %d stations A: %d bands of %g MHz (%d channels); %d stations B: %d bands of %g MHz (%d channels);\n"
+           "  1 station C: %d bands of %g MHz (%d channels), frequencies %d-%d only\n", nA, F / 2, 2 * bw, 2 * C, nB,
+           F, bw, C, st.back().nsub, 3 * bw, 3 * C, st.back().f0, st.back().f0 + 3 * st.back().nsub - 1);
+
+    // the map, and the work: the baselines each frequency has
+    XmacMapHost mh;
+    mh.rmax = 2 * nant;
+    mh.nrecv.assign(F, 0);
+    mh.off.assign((size_t)F * mh.rmax, 0);
+    mh.wstride.assign(mh.off.size(), 0);
+    mh.station.assign((size_t)F * nant, 0);
+    double cmacs = 0;
+    for (int f = 0; f < F; f++) {
+        int k = 0;
+        for (int a = 0; a < nant; a++) {
+            if (!has(a, f)) continue;
+            for (int pol = 0; pol < 2; pol++) {
+                mh.off[(size_t)f * mh.rmax + 2 * k + pol] = offOf(a, f, pol);
+                mh.wstride[(size_t)f * mh.rmax + 2 * k + pol] = st[a].nband * st[a].nchan;
+            }
+            mh.station[(size_t)f * nant + k] = a;
+            k++;
+        }
+        mh.nrecv[f] = 2 * k;
+        cmacs += (double)k * (k - 1) / 2 * 4 * C * nwin;
+    }
+    printf("%d baselines x 4 products in all; %.3g complex MACs per subint (the baselines each frequency has)\n",
+           s.nbaseline(), cmacs);
+
+    // ---- inputs ----
+    float2* spec;
+    __half2* half;
+    CHECK_CUDA(cudaMalloc(&spec, base * sizeof(float2)));
+    CHECK_CUDA(cudaMalloc(&half, base * sizeof(__half2)));
+    for (int a = 0; a < nant; a++) make_messy<<<4096, 256>>>(st[a], F, C, nwin, seed, a, (float)rho, spec, half);
+    CHECK_CUDA(cudaGetLastError());
+    std::vector<unsigned char> ones((size_t)nant * nwin, 1);
+    bool* dValid;
+    CHECK_CUDA(cudaMalloc(&dValid, ones.size()));
+    CHECK_CUDA(cudaMemcpy(dValid, ones.data(), ones.size(), cudaMemcpyHostToDevice));
+    cuFloatComplex* vis;
+    CHECK_CUDA(cudaMalloc(&vis, s.visCount() * sizeof(float2)));
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreate(&stream));
+    XmacMap map = xmacUploadMap(mh);
+
+    // gpudifx's kernel, configured as GPUCore would: per baseline each station's spectra and strides,
+    // per (frequency, baseline, product) a band index in units of C channels (band b of a station with
+    // k C channels a band, part p: b k + p), -1 where the baseline lacks the frequency
+    XmacGpudifx gx;
+    {
+        const int nbl = s.nbaseline();
+        XmacGpudifx::Tables t;
+        t.m1.resize(nbl); t.m2.resize(nbl); t.v1.resize(nbl); t.v2.resize(nbl);
+        t.bandStride.assign(nbl, C); t.bandStride2.assign(nbl, C);
+        t.windowStride.resize(nbl); t.windowStride2.resize(nbl);
+        t.b1.assign((size_t)F * nbl * 4, -1); t.b2 = t.b1; t.offsets.assign(t.b1.size(), 0);
+        for (int a = 0; a < nant; a++)
+            for (int b = a + 1; b < nant; b++) {
+                const int bl = baselineIndex(a, b, nant);
+                t.m1[bl] = (const cuFloatComplex*)spec + st[a].base;
+                t.m2[bl] = (const cuFloatComplex*)spec + st[b].base;
+                t.v1[bl] = dValid + (size_t)a * nwin;
+                t.v2[bl] = dValid + (size_t)b * nwin;
+                t.windowStride[bl] = st[a].nband * st[a].nchan;
+                t.windowStride2[bl] = st[b].nband * st[b].nchan;
+                for (int f = 0; f < F; f++) {
+                    if (!has(a, f) || !has(b, f)) continue;
+                    for (int p = 0; p < 4; p++) {
+                        const int pol1 = p < 2 ? p : p - 2, pol2 = p < 2 ? p : 3 - p;
+                        const size_t i = ((size_t)f * nbl + bl) * 4 + p;
+                        t.b1[i] = (int)((offOf(a, f, pol1) - st[a].base) / C);
+                        t.b2[i] = (int)((offOf(b, f, pol2) - st[b].base) / C);
+                        t.offsets[i] = (int)s.visIndex(f, bl, p, 0);
+                    }
+                }
+            }
+        gx.init(s, t, sms);
+    }
+
+    // ---- reference: picked (frequency, channel) pairs, in double, from the FP32 spectra ----
+    struct Pick { int f, c; };
+    std::vector<Pick> picks;
+    unsigned long long r = seed * 7919 + 17;
+    for (int k = 0; k < ncheck; k++) {
+        r = splitmix(r); const int f = (int)(r % F);
+        r = splitmix(r); const int c = (int)(r % C);
+        picks.push_back({f, c});
+    }
+    std::vector<std::complex<double>> ref;                     // [pick][baseline][product], 0 where absent
+    {
+        std::vector<float2> col((size_t)nant * nwin * 2);
+        for (const auto& pk : picks) {
+            for (int a = 0; a < nant; a++) {
+                if (!has(a, pk.f)) continue;
+                for (int pol = 0; pol < 2; pol++)
+                    CHECK_CUDA(cudaMemcpy2D(&col[((size_t)a * 2 + pol) * nwin], sizeof(float2),
+                                            spec + offOf(a, pk.f, pol) + pk.c,
+                                            (size_t)st[a].nband * st[a].nchan * sizeof(float2), sizeof(float2), nwin,
+                                            cudaMemcpyDeviceToHost));
+            }
+            for (int a = 0; a < nant; a++)
+                for (int b = a + 1; b < nant; b++)
+                    for (int p = 0; p < 4; p++) {
+                        std::complex<double> v = 0;
+                        if (has(a, pk.f) && has(b, pk.f)) {
+                            const int pol1 = p < 2 ? p : p - 2, pol2 = p < 2 ? p : 3 - p;
+                            for (int w = 0; w < nwin; w++) {
+                                const float2 x = col[((size_t)a * 2 + pol1) * nwin + w];
+                                const float2 y = col[((size_t)b * 2 + pol2) * nwin + w];
+                                v += std::complex<double>(x.x, x.y) * std::conj(std::complex<double>(y.x, y.y));
+                            }
+                        }
+                        ref.push_back(v);
+                    }
+        }
+    }
+
+    struct Variant { const char* name; double tol; std::function<void()> run; };
+    std::vector<Variant> variants = {
+        {"gpudifx (FP32), GPUCore's tables", 1e-5, [&] { gx.run(vis, stream); }},
+        {"staged tensor (FP16), its map", 1e-3, [&] { xmacTensorStagedMapped(s, map, half, vis, sms, stream); }},
+    };
+    bool pass = true;
+    std::vector<float2> hv(s.visCount());
+    for (const auto& v : variants) {
+        CHECK_CUDA(cudaMemset(vis, 0xff, s.visCount() * sizeof(float2)));     // NaN: anything unwritten shows
+        v.run();
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        CHECK_CUDA(cudaMemcpy(hv.data(), vis, hv.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+        double d2 = 0, r2 = 0, dmax = 0;
+        size_t k = 0;
+        for (const auto& pk : picks)
+            for (int bl = 0; bl < s.nbaseline(); bl++)
+                for (int p = 0; p < 4; p++, k++) {
+                    const float2 g = hv[s.visIndex(pk.f, bl, p, pk.c)];
+                    const std::complex<double> d = std::complex<double>(g.x, g.y) - ref[k];
+                    d2 += std::norm(d);
+                    r2 += std::norm(ref[k]);
+                    dmax = std::max(dmax, std::abs(d));
+                }
+        // the baselines a frequency lacks: every channel exactly zero
+        size_t absentBad = 0;
+        for (int f = 0; f < F; f++)
+            for (int a = 0; a < nant; a++)
+                for (int b = a + 1; b < nant; b++) {
+                    if (has(a, f) && has(b, f)) continue;
+                    for (int p = 0; p < 4; p++)
+                        for (int c = 0; c < C; c++) {
+                            const float2 g = hv[s.visIndex(f, baselineIndex(a, b, nant), p, c)];
+                            absentBad += g.x != 0.f || g.y != 0.f;
+                        }
+                }
+        const double rref = sqrt(r2 / k), rms = sqrt(d2 / k) / rref, mx = dmax / rref;
+        const bool ok = std::isfinite(rms) && rms < v.tol && mx < 30 * v.tol && absentBad == 0;
+        pass &= ok;
+        printf("check: %s vs double: rms %.2e, max %.2e (relative to rms; limits %.0e, %.0e); absent baselines: "
+               "%zu nonzero  %s\n", v.name, rms, mx, v.tol, 30 * v.tol, absentBad, ok ? "OK" : "FAIL");
+    }
+    printf("check: %s\n", pass ? "PASS" : "FAIL");
+
+    printf("\ntiming per subint, median [min] of %d, ms:\n", reps);
+    for (const auto& v : variants) {
+        const Timing t = timeIt(v.run, warmup, reps, stream);
+        printf("  %-56s %8.3f [%8.3f]  %7.1f Gcmac/s  %6.1fx real time\n", v.name, t.median, t.min,
+               cmacs / t.median * 1e-6, subintMs / t.median);
+    }
+    printf("  (Gcmac/s: the complex multiply-accumulates of the baselines each frequency has)\n");
+    gx.destroy();
+    xmacFreeMap(map);
+    return pass ? 0 : 1;
+}
+
 static void usage() {
     printf(
 "Usage: xmacbench [options]\n"
@@ -100,7 +340,12 @@ static void usage() {
 "  --warmup N    untimed repetitions first, default 3\n"
 "  --check N     (frequency, channel) pairs checked against a double-precision reference, default 4\n"
 "  --seed N      random seed, default 1\n"
-"  --device N    CUDA device, default 0\n");
+"  --device N    CUDA device, default 0\n"
+"  --messy       stations with different band layouts (gpudifx's XMAC and the staged one only):\n"
+"                --nfreq correlated dual-pol frequencies (default 8, even, at least 6) of --nchan\n"
+"                channels and --bw MHz; half the stations with bands of 2 frequencies, the rest\n"
+"                with bands of 1, one with bands of 3 (not a power of two) covering frequencies\n"
+"                1 .. 3 floor((F - 2) / 3) only\n");
 }
 
 int main(int argc, char** argv) {
@@ -112,6 +357,7 @@ int main(int argc, char** argv) {
     std::string only;
     int stagedTile = 0;
     std::string stagedImpl = "mma";
+    bool messy = false, nfreqGiven = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -119,7 +365,8 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--nant") s.nant = std::stoi(next());
-        else if (a == "--nfreq") s.nfreq = std::stoi(next());
+        else if (a == "--nfreq") { s.nfreq = std::stoi(next()); nfreqGiven = true; }
+        else if (a == "--messy") messy = true;
         else if (a == "--nchan") s.nchan = std::stoi(next());
         else if (a == "--nwin") s.nwin = std::stoi(next());
         else if (a == "--complex") complexData = true;
@@ -136,6 +383,8 @@ int main(int argc, char** argv) {
         else if (a == "--device") device = std::stoi(next());
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }
+    if (messy) return runMessy(s.nant, nfreqGiven ? s.nfreq : 8, s.nchan, s.nwin, bw, rho, reps, warmup, ncheck, seed,
+                               device);
     s.fftchannels = complexData ? s.nchan : 2 * s.nchan;
     if (s.nant < 2 || s.nfreq < 1 || s.nchan < 1 || s.nwin < 16 || reps < 1 || rho < 0 || rho > 1 ||
         (!only.empty() && only != "gpudifx" && only != "tiled" && only != "tensor" && only != "staged")) {

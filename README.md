@@ -11,5 +11,7 @@ evaluated.
 | directory | what |
 |---|---|
 | `fft-fusion/` | GPU (gpudifx): the FFT and the fractional-sample correction fused into one cuFFTDx kernel, vs cuFFT + mpifxcorr's rotation kernel; FP16 FFT input; windowed overlap-add front end |
+| `pulsar-binning/` | GPU pulsar gating and binning in the XMAC (backlog: not started) |
+| `phase-centres/` | GPU correlation to many phase centres at once, shifted and averaged from high-resolution visibilities (backlog: not started) |
 
 Each directory has its own README with how to build and run it, and its results.
