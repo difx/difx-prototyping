@@ -106,9 +106,10 @@ The main options:
 - `--rotator`, `--autocorr`, `--fpb N|sweep` (FFTs per block of the fused kernel, default
   cuFFTDx's suggestion), `--batched` (one launch for all antennas), `--invalid F` (flag a
   fraction of the windows);
-- `--xmac` (packed 2-bit input, lean decode, dual polarisation): the XMAC after the station
-  processing, including the end-to-end kernel writing the tensor XMAC's layout itself, and
-  writing FP16 spectra for the staged tensor XMAC.
+- `--xmac` (packed 1-, 2- or 4-bit input, lean decode, dual polarisation): the XMAC after the
+  station processing: gpudifx's XMAC from the FP32 spectra, and the end-to-end kernel writing
+  FP16 spectra for the staged tensor XMAC;
+- `--csv FILE`: every timing and check also as CSV rows (`run-matrix.sh`, `results/`).
 
 ### Checks
 
@@ -120,7 +121,10 @@ Each run checks:
   generated noise before it is rounded to the storage precision, times the window. FP32 input
   gives 2-3e-7 rms. FP16 input gives 2e-4 rms, which is FP16's own rounding (about -74 dB),
   far below the quantisation noise of 2- or 4-bit data;
-- that the autocorrelations agree (relative rms < 1e-4), when they are on.
+- that the autocorrelations agree (relative rms < 1e-4), when they are on;
+- with `--xmac`, that the staged XMAC agrees with gpudifx's XMAC run on the same FP16 spectra
+  (relative rms < 1e-4: only the order of the FP32 sums differs) and on the FP32 spectra (< 1e-3:
+  FP16's rounding of the spectra).
 
 ## Code layout: adding the pre-FFT steps
 
@@ -131,11 +135,11 @@ Each run checks:
 | `decode.cuh` | decode, sideband sign and fixed-point fringe rotation from the packed data, as pre-FFT stages: `PreDecodeLean<NBIT>` (the default) and `PreDecode` (gpudifx's per-sample arithmetic, `--decode direct`); the per-window descriptor (`WinDesc`) |
 | `gpudecode_copy.cuh` | gpudifx's decode helpers and tiled decode + fringe kernel, copied verbatim (the commit and the two changes are noted there) |
 | `unfused.cu` | the copied production kernel, cuFFT plans as `GPUMode` makes them, the kernel that materialises a pre-FFT stage, the generic rotation kernel, the fixed-point phase precompute, and for packed input the fringe phases and window descriptors (`launchPackedSetup`) |
-| `fused_inst.cu` | the fused kernel, compiled per FFT length; each length registers its variants (FFTs per block, and cuFFTDx's elements per thread or half of it) at start-up; three outputs: FP32 spectra, FP16 spectra in the same order (for the staged tensor XMAC), and the tensor XMAC's layout |
+| `fused_inst.cu` | the fused kernel, compiled per FFT length; each length registers its variants (FFTs per block, and cuFFTDx's elements per thread or half of it) at start-up; two outputs: FP32 spectra, and FP16 spectra in the same order (for the staged tensor XMAC) |
 | `fusebench.cu` | data, window, checks, timing, options |
-| `xmac.cuh`, `xmac.cu` | the XMAC stage: the shapes and layouts, the four versions (gpudifx's, tiled FP32, tensor from its layout, staged tensor from FP16 spectra, split by receiver) and the transpose |
+| `xmac.cuh`, `xmac.cu` | the XMAC stage: the shapes and layouts, gpudifx's XMAC (the reference) and the staged tensor XMAC from FP16 spectra, split by receiver, reading them through a map (any station layouts) |
 | `xmac_copy.cuh` | gpudifx's XMAC kernel, copied verbatim, and its launch geometry as GPUCore sets it |
-| `xmacbench.cu` | the XMAC benchmark: station spectra with a common signal, the double-precision check, timing |
+| `xmacbench.cu` | the XMAC benchmark: station spectra with a common signal, the double-precision check, timing; `--messy` for stations with different band layouts |
 | `window_response.py` | sensitivity and spectral response of window designs |
 
 Both pipelines are built from the same stage objects. A pre-FFT stage is a struct with
@@ -181,7 +185,7 @@ rearrangement can go in a transpose kernel (an extra DRAM pass, costing more tha
 cores save over the tiled FP32 XMAC),
 in the station kernel (the layout path: a slower station kernel, tied to the XMAC), or in each
 XMAC block's copy into shared memory (the staged path, the one kept: the cheapest station output,
-at the cost of a slower XMAC kernel).
+at the cost of a slower XMAC kernel).  The other paths were retired on 2026-11-20 (Open items).
 
 ![The station + XMAC paths and their layouts](plots/xmac-paths.svg)
 
@@ -1502,14 +1506,17 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
 
 ### Open items
 
-- **One XMAC path: the staged one, decided (2026-11-18).**  With the mma.sync version FP16 spectra
+- **One XMAC path: the staged one, done (2026-11-20).**  With the mma.sync version FP16 spectra
   + the staged XMAC is the fastest chain from 4 to 32 stations on both GPUs and at 1024 channels,
   and works at any station count ("The mma.sync staged XMAC on the A100", and the 2070 table
-  before it).  For general-purpose DiFX that is the path.  Next: retire the transpose, the layout
-  output of the station kernel, the tensor XMAC from that layout, the tiled XMAC and the staged
-  WMMA version (keeping gpudifx's XMAC as the reference in the benchmarks).
+  before it); the big matrix found no shape that needed the others.  Retired: the transpose, the
+  station kernel's tensor-layout output, the tensor XMAC from that layout, the tiled FP32 XMAC and
+  the staged XMAC's WMMA version.  gpudifx's XMAC stays as the reference, and fusebench's tight
+  XMAC check now runs it on the staged path's own FP16 spectra.  The results sections above keep
+  their measurements of the retired paths, as the record of the comparison (and
+  `docs/xmac-paths.md`).
 - **Large N (about 100 stations and up): an XMAC-focused optimisation.**  There the staged path
-  trails the layout path by 25% in the chain on the A100 (6% at 64 stations), and the staged
+  trailed the (now retired) layout path by 25% in the chain on the A100 (6% at 64 stations), and the staged
   XMAC alone is 1.75-2.5x the tensor XMAC from its layout: the XMAC, not the station processing,
   dominates, and each receiver is re-read once per super-block it is paired with (4 times at 100
   stations).  Candidates: larger super-blocks where the shared memory allows (KS 8 on the A100,

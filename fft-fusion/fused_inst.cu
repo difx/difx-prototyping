@@ -125,147 +125,11 @@ __device__ __forceinline__ void fusedBody(const Geometry& g, const Pre& pre, con
     }
 }
 
-// The same, writing the tensor-core XMAC's layout (TensorOut, pipelines.cuh) instead of FP32
-// spectra.  A block takes W consecutive windows of one (antenna, band), FFTs-per-block at a time
-// (W / FFTs-per-block passes), so that it writes each channel's run of W windows in each plane as
-// whole 32-byte sectors (W = 16) or halves (W = 8) whatever its FFTs per block.  After each pass's
-// fractional-sample rotation the threads put their channels' values, scaled, as FP16 into a
-// shared-memory tile [plane][channel][window], kept apart from the FFT's shared memory when there
-// are several passes; then the block writes the runs with 16-byte stores.  Block b of the launch is
-// (antenna, group of W windows, band), band fastest, so that the blocks of a window group's bands,
-// which read the same packed bytes, run together (with the band slowest the packed data was read
-// from DRAM 6.6 times over).  The tile's rows are padded by one 32-bit word, so that a warp's
-// channels fall in different banks (unpadded, 16 windows to a row put 16 channels in 4 banks).
-template<class FFT>
-struct TensorPlan {
-    static constexpr unsigned N = size_of<FFT>::value, FPB = FFT::ffts_per_block;
-    // shared memory a block may use: sm_80/87 163 KB, sm_90/100/103 227 KB, sm_75 64 KB, others
-    // (sm_86/89, sm_120/121: the GeForce and workstation parts) 99 KB.  Not "sm_90 and up": the
-    // RTX PRO 6000 Blackwell (sm_120) has 99 KB, and a tile planned for 227 KB failed to launch.
-    static constexpr unsigned maxSmem = FUSE_SM == 900 || FUSE_SM == 1000 || FUSE_SM == 1030 ? 227u * 1024
-                                      : FUSE_SM == 800 || FUSE_SM == 870 ? 163u * 1024
-                                      : FUSE_SM >= 860 ? 99u * 1024 : 64u * 1024;
-    static constexpr unsigned row(unsigned w) { return w >= 2 ? w + 2 : w; }
-    // the tile for W windows; the packed data is real, so at most N / 2 channels
-    static constexpr unsigned tile(unsigned w) { return 2u * (N / 2) * row(w) * (unsigned)sizeof(__half); }
-    static constexpr unsigned fft = (FFT::shared_memory_size + 15) / 16 * 16;
-    static constexpr unsigned W = FPB >= 16 ? FPB
-                                : fft + tile(16) <= maxSmem ? 16
-                                : FPB <= 8 && fft + tile(8) <= maxSmem ? 8 : FPB;
-    static constexpr bool separate = W > FPB;               // several passes: the tile apart
-    static constexpr unsigned ROW = row(W);
-    static constexpr unsigned tileOffset = separate ? fft : 0;
-    static constexpr unsigned smem = separate ? fft + tile(W) : (fft > tile(W) ? fft : tile(W));
-};
-
-template<class FFT, class Pre, class Post>
-__device__ __forceinline__ void tensorBody(const Geometry& g, const Pre& pre, const Post& post, const TensorOut& o,
-                                           int ant0) {
-    using complex_type = typename FFT::value_type;
-    using P = TensorPlan<FFT>;
-    extern __shared__ __align__(alignof(float4)) unsigned char smem[];
-    constexpr unsigned N = P::N, FPB = P::FPB, W = P::W, ROW = P::ROW;
-    static_assert(FFT::stride * FFT::input_ept == N, "a thread's samples cover the FFT exactly");
-    const unsigned nwb = (g.nwin + W - 1) / W;
-    const int band = blockIdx.x % (unsigned)g.nband;
-    const unsigned aw = blockIdx.x / (unsigned)g.nband;
-    const unsigned wb = aw % nwb;
-    const int ant = ant0 + (int)(aw / nwb);
-    __half* tile = reinterpret_cast<__half*>(smem + P::tileOffset);       // [plane][channel][window]
-
-#pragma unroll 1
-    for (unsigned pass = 0; pass < W / FPB; pass++) {
-        const unsigned wl = pass * FPB + threadIdx.y;                     // window within the block
-        const int win = wb * W + wl;
-        const bool active = win < g.nwin;
-        complex_type td[FFT::storage_size];
-        if (active) {
-            typename Pre::State st = pre.prepare(g, ant, win, band, threadIdx.x, FFT::stride);
-#pragma unroll
-            for (unsigned i = 0; i < FFT::input_ept; i++) {
-                const cuFloatComplex v = pre.at(st, g, ant, win, band, threadIdx.x + i * FFT::stride);
-                td[i] = complex_type{v.x, v.y};
-            }
-        }
-        FFT().execute(td, smem);
-        const bool valid = active && post.windowValid(g, ant, win);
-        if constexpr (!P::separate)
-            __syncthreads();                                   // the FFT is done with shared memory
-#pragma unroll
-        for (unsigned i = 0; i < FFT::output_ept; i++) {
-            const unsigned k = threadIdx.x + i * FFT::stride;
-            if (k < (unsigned)g.nchan) {
-                cuFloatComplex v = make_cuFloatComplex(0.f, 0.f);   // invalid windows, those past the end
-                if (valid)
-                    v = post.apply(g, ant, win, band, k, make_cuFloatComplex(td[i].x, td[i].y));
-                tile[k * ROW + wl] = __float2half_rn(v.x * o.scale);
-                tile[((unsigned)g.nchan + k) * ROW + wl] = __float2half_rn(v.y * o.scale);
-            }
-        }
-    }
-    __syncthreads();
-    constexpr unsigned G = W < 8 ? W : 8, NC = W / G;         // G windows a store, NC stores a run
-    const unsigned nthreads = blockDim.x * blockDim.y, tid = threadIdx.y * blockDim.x + threadIdx.x;
-    const int f = band >> 1, r = 2 * ant + (band & 1);
-    for (unsigned u = tid; u < 2u * g.nchan * NC; u += nthreads) {
-        const unsigned chunk = u % NC, pk = u / NC;             // pk = plane * nchan + channel
-        const unsigned plane = pk / g.nchan, k = pk % g.nchan;
-        const unsigned w0 = wb * W + chunk * G;
-        if (w0 >= (unsigned)o.L.ntb * 16) continue;             // past the padded subint
-        const __half* src = tile + pk * ROW + chunk * G;
-        // read as 32-bit words (the rows are padded), stored as one vector (__stcg: without it the
-        // compiler split the 16-byte store into four 4-byte ones, 25% slower); cached in L2 only
-        const unsigned* w32 = reinterpret_cast<const unsigned*>(src);
-        __half* dst = o.h + o.L.index(o.s, f, k, w0 / 16, plane, r, w0 % 16);
-        if constexpr (G == 1) *dst = *src;
-        else if constexpr (G == 2) *reinterpret_cast<__half2*>(dst) = *reinterpret_cast<const __half2*>(src);
-        else if constexpr (G == 4) __stcg(reinterpret_cast<uint2*>(dst), make_uint2(w32[0], w32[1]));
-        else __stcg(reinterpret_cast<uint4*>(dst), make_uint4(w32[0], w32[1], w32[2], w32[3]));
-    }
-}
-
-template<class FFT, class Pre, class Post>
-__launch_bounds__(FFT::max_threads_per_block)
-__global__ void fused_fft_tensor(Geometry g, Pre pre, Post post, TensorOut o, int ant0) {
-    tensorBody<FFT, Pre, Post>(g, pre, post, o, ant0);
-}
-
-// The pre-FFT stages the XMAC outputs (tensor layout, FP16 spectra) are compiled for: the lean decode
+// The pre-FFT stages the XMAC output (FP16 spectra) is compiled for: the lean decode
 // of 1-, 2- and 4-bit data (each one more kernel per variant and FFT length, so not 8 bits).
 template<class Pre> constexpr bool xmacDecode = std::is_same<Pre, PreDecodeLean<1>>::value ||
                                                 std::is_same<Pre, PreDecodeLean<2>>::value ||
                                                 std::is_same<Pre, PreDecodeLean<4>>::value;
-
-template<class FFT>
-static void launchTensorVariant(const Geometry& g, const PreVariant& pre, const FracParams& p, const TensorOut& o,
-                                int ant0, int nant, cudaStream_t st) {
-    withPre(pre, [&](auto stage) {
-        using Pre = decltype(stage);
-        if constexpr (xmacDecode<Pre>) {
-            using Post = FracRotateFixed<false>;
-            auto kernel = fused_fft_tensor<FFT, Pre, Post>;
-            using TP = TensorPlan<FFT>;
-            constexpr unsigned smemBytes = TP::smem;
-            if (2 * g.nchan > (int)TP::N) { fprintf(stderr, "tensor-layout output: real data only\n"); exit(2); }
-            static int regs = -1;
-            if (regs < 0) {
-                CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
-                cudaFuncAttributes attr;
-                CHECK_CUDA(cudaFuncGetAttributes(&attr, kernel));
-                regs = attr.numRegs;
-            }
-            fusedLastRegisters = regs;
-            Post post;
-            post.p = p;
-            const unsigned nwb = (g.nwin + TP::W - 1) / TP::W;
-            kernel<<<(unsigned)nant * g.nband * nwb, FFT::block_dim, smemBytes, st>>>(g, stage, post, o, ant0);
-            CHECK_CUDA(cudaGetLastError());
-        } else {
-            fprintf(stderr, "the tensor-layout output is compiled for the 1-, 2- and 4-bit lean decode only\n");
-            exit(2);
-        }
-    });
-}
 
 // The kernel: __launch_bounds__ with the block size only, so the compiler chooses the registers.
 // Not __launch_bounds__(threads, 1): with an explicit minimum of one block per SM the compiler
@@ -401,14 +265,12 @@ static void addVariant(std::vector<FusedVariant>& v) {
         static_assert(!FFT::requires_workspace, "FFT size needs a workspace; only powers of two are supported");
         for (const auto& e : v)
             if (e.fpb == FPB && e.ept == E && e.regcap == REGCAP) return;
-        void (*tensor)(const Geometry&, const PreVariant&, const FracParams&, const TensorOut&, int, int,
-                       cudaStream_t) = nullptr;
         void (*half)(const Geometry&, const PreVariant&, const FracParams&, const HalfOut&, int, int,
                      cudaStream_t) = nullptr;
-        if constexpr (REGCAP == 0) { tensor = &launchTensorVariant<FFT>; half = &launchHalfVariant<FFT>; }
+        if constexpr (REGCAP == 0) half = &launchHalfVariant<FFT>;
         v.push_back({FPB, E, FFT::max_threads_per_block, FFT::shared_memory_size,
                      E == E0 && FPB == FFTBase::suggested_ffts_per_block && REGCAP == 0, REGCAP,
-                     &launchVariant<FFT, REGCAP>, tensor, half, REGCAP == 0 ? TensorPlan<FFT>::smem : 0u});
+                     &launchVariant<FFT, REGCAP>, half});
     }
 }
 

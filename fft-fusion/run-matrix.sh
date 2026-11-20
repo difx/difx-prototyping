@@ -121,7 +121,7 @@ cp "$OUT/summary.csv" "results/$NAME.csv"
 echo
 python3 -I -c '
 import csv, sys
-cols = "nbit nsub nchan nant nwin status worst_ratio chain_layout_tensor chain_staged staged_over_best gain_vs_gpudifx".split()
+cols = "nbit nsub nchan nant nwin status worst_ratio chain_gpudifx chain_staged gain_vs_gpudifx".split()
 print(" ".join(f"{c:>12}" for c in cols))
 for r in csv.DictReader(open(sys.argv[1])):
     print(" ".join(f"{r[c]:>12}" for c in cols))' "$OUT/summary.csv"

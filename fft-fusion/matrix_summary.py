@@ -12,15 +12,16 @@ Columns (times in ms per ms of data):
   exit, note              fusebench's exit code; why a shape was skipped
   checks, checks_failed   number of checks; the names of any that failed (;-separated)
   worst_check, worst_ratio  the check closest to its limit, and its rms / limit
-  station_unfused, station_fp32, station_layout, station_fp16
+  station_unfused, station_fp32, station_fp16
                           the station processing alone: gpudifx's three kernels, and the best
-                          end-to-end kernel variant writing FP32 spectra, the tensor layout, FP16 spectra
-  xmac_gpudifx, xmac_tiled, xmac_transpose, xmac_tensor, xmac_staged   each XMAC stage alone
-  chain_gpudifx_today, chain_gpudifx, chain_tiled, chain_transpose_tensor, chain_layout_tensor,
-  chain_staged            station + XMAC as one timed chain (README.md, docs/xmac-paths.md)
-  staged_over_best        chain_staged / the fastest of the other end-to-end chains (< 1: staged fastest)
-  staged_over_layout      chain_staged / chain_layout_tensor
+                          end-to-end kernel variant writing FP32 spectra, FP16 spectra
+  xmac_gpudifx, xmac_staged   each XMAC stage alone
+  chain_gpudifx_today, chain_gpudifx, chain_staged
+                          station + XMAC as one timed chain: gpudifx today, the end-to-end kernel +
+                          gpudifx's XMAC, the end-to-end kernel's FP16 spectra + the staged XMAC
   gain_vs_gpudifx         chain_gpudifx_today / chain_staged
+(Summaries made before the layout path was retired, 2026-11-20, also have the retired chains and
+staged_over_best / staged_over_layout; see results/README.md.)
 """
 import argparse
 import csv
@@ -30,28 +31,21 @@ import sys
 CHAINS = {
     "station + XMAC: gpudifx today (both)": "chain_gpudifx_today",
     "station + XMAC: end-to-end + gpudifx XMAC": "chain_gpudifx",
-    "station + XMAC: end-to-end + tiled": "chain_tiled",
-    "station + XMAC: end-to-end + transpose + tensor": "chain_transpose_tensor",
-    "station + XMAC: end-to-end -> tensor layout + tensor": "chain_layout_tensor",
     "station + XMAC: end-to-end -> FP16 spectra + staged tensor": "chain_staged",
 }
 XMACS = {
     "XMAC: gpudifx (FP32 spectra)": "xmac_gpudifx",
-    "XMAC: tiled (FP32 spectra)": "xmac_tiled",
-    "XMAC: transpose": "xmac_transpose",
-    "XMAC: tensor": "xmac_tensor",
     "XMAC: staged tensor (FP16 spectra)": "xmac_staged",
 }
 STATIONS = [  # (column, name prefix): the best (lowest) of the variants whose name starts so
     ("station_fp32", "fused, "),
-    ("station_layout", "end-to-end -> tensor layout, "),
     ("station_fp16", "end-to-end -> FP16 spectra, "),
 ]
 COLS = (["host", "gpu", "cc", "power_w", "sm_clock_lock_mhz", "commit", "date",
          "nbit", "nsub", "nband", "nchan", "nant", "nwin", "subint_ms", "reps", "status", "exit", "note",
          "checks", "checks_failed", "worst_check", "worst_ratio",
          "station_unfused"] + [c for c, _ in STATIONS] + list(XMACS.values()) + list(CHAINS.values()) +
-        ["staged_over_best", "staged_over_layout", "gain_vs_gpudifx"])
+        ["gain_vs_gpudifx"])
 
 
 def num(x):
@@ -116,12 +110,6 @@ def main():
             for name, col in list(XMACS.items()) + list(CHAINS.items()):
                 out[col] = fmt(times.get(name))
             st = times.get("station + XMAC: end-to-end -> FP16 spectra + staged tensor")
-            others = [times[n] for n in CHAINS if n in times and "end-to-end" in n and "FP16" not in n]
-            if st and others:
-                out["staged_over_best"] = fmt(st / min(others), 3)
-            lay = times.get("station + XMAC: end-to-end -> tensor layout + tensor")
-            if st and lay:
-                out["staged_over_layout"] = fmt(st / lay, 3)
             ref = times.get("station + XMAC: gpudifx today (both)")
             if st and ref:
                 out["gain_vs_gpudifx"] = fmt(ref / st, 3)

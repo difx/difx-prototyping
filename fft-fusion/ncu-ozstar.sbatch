@@ -143,12 +143,7 @@ profile c1024-fused-fp32           fused_fft_frac "${C1024[@]}"
 profile c1024-packed-wola          fused_fft_frac "${C1024[@]}" --input packed --wola
 profile c1024-packed-wola-ept-half fused_fft_frac "${C1024[@]}" --input packed --wola --ept half
 profile c1024-packed-wola-cap1024  fused_fft_frac "${C1024[@]}" --input packed --wola --regcap 1024
-# the end-to-end kernel writing the tensor-core XMAC's layout (fusebench --xmac), at the variants
-# fastest on the 2070, and the XMAC kernels (10 stations, from the same run)
-profile c128-tensor-out-fpb16      fused_fft_tensor "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
-profile c1024-tensor-out-fpb4      fused_fft_tensor "${C1024[@]}" --input packed --xmac --fpb 4 --ept 16
-profile c128-xmac-tensor           xmac_tensor_kernel "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
-profile c128-xmac-tiled            xmac_tiled_kernel "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
+# gpudifx's XMAC kernel (fusebench --xmac, 10 stations)
 profile c128-xmac-gpudifx          gpu_fuse_xmac_and_average "${C128[@]}" --input packed --xmac --fpb 16 --ept 16
 # the end-to-end kernel writing FP16 spectra in its own order, and the staged tensor XMAC that
 # reshuffles them itself (at the variants fastest on the A100 for the FP32 output)
@@ -158,16 +153,13 @@ profile c128-xmac-staged           xmac_staged_kernel "${C128[@]}" --input packe
 profile c1024-xmac-staged          xmac_staged_kernel "${C1024[@]}" --input packed --xmac --fpb 1 --ept 16
 
 # the staged tensor XMAC alone (xmacbench, its own spectra), at each super-block size it chooses
-# (KS 1 at 4 stations, 2 at 10, 4 from 24), KS 2 forced at 64 for comparison, and the tensor XMAC
-# from its layout at 10 and 64 stations: why the staged one is 1.3-2.9x the tensor one on the A100
+# (KS 1 at 4 stations, 2 at 10, 4 from 24), and KS 2 forced at 64 for comparison
 profilex xstaged-c128-n4           xmac_staged_kernel --nchan 128 --nwin 10000 --nant 4 --only staged
 profilex xstaged-c128-n10          xmac_staged_kernel --nchan 128 --nwin 10000 --nant 10 --only staged
 profilex xstaged-c128-n64          xmac_staged_kernel --nchan 128 --nwin 10000 --nant 64 --only staged
 profilex xstaged-c128-n64-ks2      xmac_staged_kernel --nchan 128 --nwin 10000 --nant 64 --only staged --staged-tile 2
 profilex xstaged-c128-n100         xmac_staged_kernel --nchan 128 --nwin 10000 --nant 100 --only staged
 profilex xstaged-c1024-n32         xmac_staged_kernel --nchan 1024 --nwin 1000 --nant 32 --only staged
-profilex xtensor-c128-n10          xmac_tensor_kernel --nchan 128 --nwin 10000 --nant 10 --only tensor
-profilex xtensor-c128-n64          xmac_tensor_kernel --nchan 128 --nwin 10000 --nant 64 --only tensor
 
 tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"

@@ -1,6 +1,6 @@
-// xmacbench - the cross-multiply-accumulate (XMAC) stage on its own: gpudifx's kernel, a
-// register-tiled FP32 kernel and a tensor-core kernel (xmac.cuh), from the same station spectra,
-// checked against a double-precision reference and timed.  See README.md.
+// xmacbench - the cross-multiply-accumulate (XMAC) stage on its own: gpudifx's kernel and the
+// staged tensor-core kernel (xmac.cuh), from the same station spectra, checked against a
+// double-precision reference and timed.  See README.md.
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -331,11 +331,9 @@ static void usage() {
 "  --bw MHz      bandwidth per band, for the real-time figure, default 64\n"
 "  --rho R       correlation of the common signal between stations, default 0.1\n"
 "  --invalid F   fraction of (station, window) flagged invalid, default 0\n"
-"  --only V      run only gpudifx | tiled | tensor | staged (default all)\n"
+"  --only V      run only gpudifx | staged (default both)\n"
 "  --staged-tile K  the staged XMAC's super-blocks of 16 K receivers, K = 1, 2 (8 channels a block)\n"
 "                or 4 (4 channels a block) (default: its own choice, printed)\n"
-"  --staged-impl I  the staged XMAC's version: mma (mma.sync, (re, im) interleaved; the default) or\n"
-"                wmma (the WMMA version, real and imaginary planes), for comparison\n"
 "  --reps N      timed repetitions, default 20 (median and minimum reported)\n"
 "  --warmup N    untimed repetitions first, default 3\n"
 "  --check N     (frequency, channel) pairs checked against a double-precision reference, default 4\n"
@@ -356,7 +354,6 @@ int main(int argc, char** argv) {
     unsigned long long seed = 1;
     std::string only;
     int stagedTile = 0;
-    std::string stagedImpl = "mma";
     bool messy = false, nfreqGiven = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -375,7 +372,6 @@ int main(int argc, char** argv) {
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--only") only = next();
         else if (a == "--staged-tile") stagedTile = std::stoi(next());
-        else if (a == "--staged-impl") stagedImpl = next();
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
         else if (a == "--check") ncheck = std::stoi(next());
@@ -387,16 +383,13 @@ int main(int argc, char** argv) {
                                device);
     s.fftchannels = complexData ? s.nchan : 2 * s.nchan;
     if (s.nant < 2 || s.nfreq < 1 || s.nchan < 1 || s.nwin < 16 || reps < 1 || rho < 0 || rho > 1 ||
-        (!only.empty() && only != "gpudifx" && only != "tiled" && only != "tensor" && only != "staged")) {
+        (!only.empty() && only != "gpudifx" && only != "staged")) {
         usage(); return 2;
     }
-    const bool runG = only.empty() || only == "gpudifx", runT = only.empty() || only == "tiled",
-               runC = only.empty() || only == "tensor";
+    const bool runG = only.empty() || only == "gpudifx";
     bool runS = only.empty() || only == "staged";
     if (stagedTile != 0 && stagedTile != 1 && stagedTile != 2 && stagedTile != 4) { usage(); return 2; }
     xmacTensorStagedSetTile(stagedTile);
-    if (stagedImpl != "mma" && stagedImpl != "wmma") { usage(); return 2; }
-    xmacTensorStagedSetImpl(stagedImpl == "wmma" ? 1 : 0);
 
     CHECK_CUDA(cudaSetDevice(device));
     if (runS && !xmacTensorStagedFits(s)) {
@@ -405,26 +398,24 @@ int main(int argc, char** argv) {
         if (only == "staged") return 2;
         runS = false;
     }
-    if (runS) printf("staged tensor XMAC (%s): super-blocks of %d x 16 receivers, %d stage%s\n", stagedImpl.c_str(),
-                     xmacTensorStagedTile(s), xmacTensorStagedStages(s), xmacTensorStagedStages(s) > 1 ? "s" : "");
+    if (runS) printf("staged tensor XMAC: super-blocks of %d x 16 receivers, %d stage%s\n", xmacTensorStagedTile(s),
+                     xmacTensorStagedStages(s), xmacTensorStagedStages(s) > 1 ? "s" : "");
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     const int sms = prop.multiProcessorCount;
-    const TensorLayout L = tensorLayout(s);
     const size_t nspec = (size_t)s.nant * s.nwin * s.nband() * s.fftchannels;
     const double gib = 1.0 / 1073741824.0;
-    const double specBytes = nspec * sizeof(float2), hBytes = runC ? L.count(s) * sizeof(__half) : 0,
-                 halfBytes = runS ? s.halfCount() * sizeof(__half2) : 0;
+    const double specBytes = nspec * sizeof(float2), halfBytes = runS ? s.halfCount() * sizeof(__half2) : 0;
     const double subintMs = (double)s.nwin * s.fftchannels / (complexData ? bw : 2 * bw) / 1000.0;
     printf("GPU %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, sms);
     printf("%d stations x %d frequencies x 2 polarisations, %d channels, %d windows (subint %.3f ms); "
            "%d baselines x 4 products, %.3g complex MACs per subint\n", s.nant, s.nfreq, s.nchan, s.nwin, subintMs,
            s.nbaseline(), s.cmacs());
-    printf("GPU memory: spectra %.2f GiB (FP32, %d channels a band as the fused kernel writes them), tensor input "
-           "%.2f GiB (FP16, %d receivers)\n", specBytes * gib, s.fftchannels, hBytes * gib, s.nrecv());
+    printf("GPU memory: spectra %.2f GiB (FP32, %d channels a band as the fused kernel writes them), FP16 spectra "
+           "%.2f GiB\n", specBytes * gib, s.fftchannels, halfBytes * gib);
     size_t freeMem, totalMem;
     CHECK_CUDA(cudaMemGetInfo(&freeMem, &totalMem));
-    if (specBytes + hBytes + halfBytes + 2 * s.visCount() * sizeof(float2) > 0.95 * freeMem) {
+    if (specBytes + halfBytes + 2 * s.visCount() * sizeof(float2) > 0.95 * freeMem) {
         fprintf(stderr, "not enough GPU memory (%.2f GiB free): use fewer --nwin\n", freeMem * gib);
         return 2;
     }
@@ -440,11 +431,6 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&spec, nspec * sizeof(float2)));
     make_spectra<<<4096, 256>>>(s, seed, (float)rho, dValid, (float2*)spec);
     CHECK_CUDA(cudaGetLastError());
-    __half* h = nullptr;
-    if (runC) {
-        CHECK_CUDA(cudaMalloc(&h, L.count(s) * sizeof(__half)));
-        CHECK_CUDA(cudaMemset(h, 0, L.count(s) * sizeof(__half)));     // the slack at the end
-    }
     __half2* hs = nullptr;
     if (runS) {
         CHECK_CUDA(cudaMalloc(&hs, s.halfCount() * sizeof(__half2)));
@@ -461,11 +447,6 @@ int main(int argc, char** argv) {
     struct Variant { const char* name; double tol; std::function<void()> run; };
     std::vector<Variant> variants;
     if (runG) variants.push_back({"gpudifx (FP32, a thread per baseline, product, channel)", 1e-5, [&] { gx.run(vis, st); }});
-    if (runT) variants.push_back({"tiled (FP32, 4 x 4 receiver pairs a thread)", 1e-5,
-                                  [&] { xmacTiled(s, spec, vis, sms, st); }});
-    if (runC) variants.push_back({"tensor (FP16 in, FP32 sums): transpose + XMAC", 1e-3, [&] {
-        xmacTranspose(s, L, spec, h, st);
-        xmacTensor(s, L, h, vis, sms, st); }});
     if (runS) variants.push_back({"staged tensor (FP16 spectra, reshuffled in the XMAC)", 1e-3,
                                   [&] { xmacTensorStaged(s, hs, vis, sms, st); }});
 
@@ -542,11 +523,6 @@ int main(int argc, char** argv) {
                s.cmacs() / t.median * 1e-6, subintMs / t.median);
     };
     for (const auto& v : variants) line(v.name, timeIt(v.run, warmup, reps, st));
-    if (runC) {
-        line("  of which the transpose (FP32 -> FP16 tensor layout)",
-             timeIt([&] { xmacTranspose(s, L, spec, h, st); }, warmup, reps, st));
-        line("  of which the tensor-core XMAC", timeIt([&] { xmacTensor(s, L, h, vis, sms, st); }, warmup, reps, st));
-    }
     printf("  (Gcmac/s: complex multiply-accumulates of the %d baselines x 4 products per second)\n", s.nbaseline());
     if (runG) gx.destroy();
     return pass ? 0 : 1;
