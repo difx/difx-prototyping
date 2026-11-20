@@ -1629,7 +1629,9 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
   channel's samples, which for all coarse channels is the same large tile), about as much
   traffic as the transpose: two-stage moves that cost rather than removing it, so it should rest
   on its other gains (shorter FFTs, the fractional-sample correction's accuracy).
-- **Two-stage channelisation for high spectral resolution** (say above 512 channels): a coarse
+- **Two-stage channelisation for high spectral resolution**: analysed and planned in
+  [docs/two-stage.md](docs/two-stage.md) (an oversampled polyphase filter bank as the first stage,
+  not WOLA; decisions pending).  The original note: (say above 512 channels): a coarse
   first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
   second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes
   inaccurate with very long windows and high fringe rates), and two short FFTs may be faster
