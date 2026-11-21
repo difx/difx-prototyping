@@ -1,0 +1,16 @@
+# build (the top-level Makefile)
+build-sm*/
+build-sm*.log
+build-sm*.lock
+build.log
+mathdx-*/
+__pycache__/
+# the links to the last build's binaries
+fft-fusion/fusebench
+xmac/xmacbench
+two-stage/twostagebench
+# local results, OzSTAR job logs and copy scripts
+*/results-local/
+ozstar.*.log
+ncu.*.log
+copy-results.*.sh

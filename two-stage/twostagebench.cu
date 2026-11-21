@@ -9,46 +9,12 @@
 #include <string>
 #include <vector>
 #include "twostage.cuh"
+#include "benchutil.cuh"
 
-static const int VDIF_HEADER = 32, VDIF_PAYLOAD = 8000;
-
-// as fusebench.cu's (the same packed bytes for the same seed)
-static inline unsigned long long splitmix(unsigned long long x) {
-    x += 0x9E3779B97F4A7C15ull;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-    return x ^ (x >> 31);
-}
-
-struct Rng {
-    unsigned long long s;
-    double uniform() { s = splitmix(s); return (s >> 11) * (1.0 / 9007199254740992.0); }
-    double range(double a, double b) { return a + (b - a) * uniform(); }
-};
-template<class T> T* devAlloc(size_t n) { T* p; CHECK_CUDA(cudaMalloc(&p, n * sizeof(T))); return p; }
-template<class T> T* devCopy(const std::vector<T>& v) {
-    T* p = devAlloc<T>(v.size());
-    CHECK_CUDA(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
-    return p;
-}
 static bool* devOnes(size_t n) {
     bool* p = devAlloc<bool>(n);
     CHECK_CUDA(cudaMemset(p, 1, n));
     return p;
-}
-
-// mark5access's levels, from the host (as fusebench.cu's reference)
-static double hostDecode(const unsigned char* payload, int nbit, int nband, int sampleInFrame, int band) {
-    const long bit = ((long)sampleInFrame * nband + band) * nbit;
-    if (nbit <= 2) {
-        const int v = (payload[bit / 8] >> (bit % 8)) & ((1 << nbit) - 1);
-        static const double two[4] = {-OPTIMAL_2BIT_HIGH, -1.0, 1.0, OPTIMAL_2BIT_HIGH};
-        return nbit == 1 ? (v ? 1.0 : -1.0) : two[v];
-    }
-    unsigned int w;
-    memcpy(&w, payload + bit / 32 * 4, 4);
-    const int v = (w >> (bit % 32)) & ((1u << nbit) - 1);
-    return nbit == 4 ? (v - 7.5) / 2.95 : (v - 128.0) / 3.3;
 }
 
 // The PFB prototype, as two_stage.py's pfb_design: a sinc falling to half at +-O/2 coarse channels
@@ -71,26 +37,6 @@ static std::vector<float> pfbTaps(int L1, int P, double O, double& A) {
         h[i] = (float)(sinc * besselI0(beta * sqrt(std::max(0.0, 1 - r * r))) / besselI0(beta));
     }
     return h;
-}
-
-struct Timing { double median, min; };
-template<class F>
-static Timing timeIt(F f, int warmup, int reps, cudaStream_t st) {
-    for (int i = 0; i < warmup; i++) f();
-    std::vector<cudaEvent_t> ev(reps + 1);
-    for (auto& e : ev) CHECK_CUDA(cudaEventCreate(&e));
-    CHECK_CUDA(cudaEventRecord(ev[0], st));
-    for (int i = 0; i < reps; i++) { f(); CHECK_CUDA(cudaEventRecord(ev[i + 1], st)); }
-    CHECK_CUDA(cudaEventSynchronize(ev[reps]));
-    std::vector<double> t(reps);
-    for (int i = 0; i < reps; i++) {
-        float ms;
-        CHECK_CUDA(cudaEventElapsedTime(&ms, ev[i], ev[i + 1]));
-        t[i] = ms;
-    }
-    for (auto& e : ev) cudaEventDestroy(e);
-    std::sort(t.begin(), t.end());
-    return {t[reps / 2], t[0]};
 }
 
 static void usage() {

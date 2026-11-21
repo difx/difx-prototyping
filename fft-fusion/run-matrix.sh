@@ -3,7 +3,7 @@
 # run-matrix.sh - the whole chain (fusebench --xmac: station processing from packed data + XMAC)
 # over a big matrix of shapes, looking for corner cases: 1, 2 and 4 bits a sample x 1, 8 and 64
 # dual-polarisation subbands x 32, 512 and 4096 channels x 4, 16, 64 and 256 stations (108 shapes).
-# Build first (make, see README.md).
+# Build first (make in the repository root, see ../README.md).
 #
 # Usage:  ./run-matrix.sh [extra fusebench options]
 #         NBITS="2" NSUBS="1 8" NCHANS="32" NANTS="4 16" ./run-matrix.sh     # a subset
@@ -32,8 +32,8 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 STAMP=$(date +%Y%m%d-%H%M%S)
 NAME=$(hostname -s)-matrix-$STAMP
 OUT=results-local/$NAME

@@ -1,10 +1,11 @@
-# fusebench - cuFFT + fractional-sample correction (mpifxcorr today) vs one fused cuFFTDx kernel.
-# See README.md.
+# difx-prototyping: one build for every sub-project (fft-fusion, xmac, two-stage), the shared code in
+# common/.  See README.md.
 #
 #   source <gpudifx>/setup.bash; make -j8      # CUDA and the GPU architecture from setup.bash,
 #                                              # MathDx fetched from PyPI on the first build
 #   make SM=80 ...                             # another GPU architecture (80: A100)
-#   make SIZES="256 2048" ...                  # only some FFT lengths
+#   make xmacbench twostagebench               # only some binaries (fusebench is the slow one)
+#   make SIZES="256 2048" ...                  # only some FFT lengths in fusebench's fused kernel
 #   make mathdx                                # only fetch MathDx (on a login node with network
 #                                              # access, before building on a node without it)
 #
@@ -12,9 +13,10 @@
 #
 # Each GPU architecture builds in its own build-sm<SM>/, objects and binaries both, so a build for
 # one never touches another's: build-sm80/fusebench and build-sm120/fusebench sit side by side and
-# switching between them rebuilds nothing.  ./fusebench and ./xmacbench are links to the last
-# build's binaries, for running by hand; the run-*.sh scripts take the binaries for the GPU they
-# find (bench-bin.sh), so jobs on different GPUs sharing this directory never run each other's.
+# switching between them rebuilds nothing.  fft-fusion/fusebench, xmac/xmacbench and
+# two-stage/twostagebench are links to the last build's binaries, for running by hand; the run-*.sh
+# scripts take the binaries for the GPU they find (common/scripts/bench-bin.sh), so jobs on
+# different GPUs sharing this checkout never run each other's.
 #
 # Every setting can be given on the command line.  Without one:
 #   CUDA_HOME  $CUDAROOT (setup.bash), else $CUDA_HOME, else the CUDA holding the nvcc on PATH,
@@ -77,55 +79,65 @@ endif
 # FFT lengths (2 x channels for real data, channels for complex) built into the fused kernel
 SIZES     ?= 64 128 256 512 1024 2048 4096 8192 16384
 
-FLAGS     := -std=c++17 -O3 -arch=sm_$(SM) -lineinfo -I$(CUDA_HOME)/include \
+C := common
+COMMON_H  := $(C)/pipelines.cuh $(C)/stages.cuh $(C)/common.cuh $(C)/decode.cuh $(C)/gpudecode_copy.cuh $(C)/xmac.cuh \
+             $(C)/benchutil.cuh
+FLAGS     := -std=c++17 -O3 -arch=sm_$(SM) -lineinfo -I$(CUDA_HOME)/include -I$(C) \
              -Xcompiler -Wno-deprecated-declarations
 DXFLAGS    = -I$(MATHDX)/include -I$(MATHDX)/external/cutlass/include -DFUSE_SM=$(patsubst %a,%,$(SM))0
 BUILD     := build-sm$(SM)
 FUSED_OBJ := $(foreach n,$(SIZES),$(BUILD)/fused_$(n).o)
 
 ifeq ($(filter clean mathdx,$(MAKECMDGOALS)),)
-  $(info fusebench: sm_$(SM) (from $(SM_FROM)), CUDA $(CUDA_HOME), MathDx $(MATHDX))
+  $(info difx-prototyping: sm_$(SM) (from $(SM_FROM)), CUDA $(CUDA_HOME), MathDx $(MATHDX))
 endif
 
 all: fusebench xmacbench twostagebench
 
-# the links to this architecture's binaries (always redone: the last build's architecture wins)
+# the links to this architecture's binaries in each sub-project (always redone: the last build's
+# architecture wins)
 .PHONY: all fusebench xmacbench twostagebench mathdx clean
-fusebench xmacbench twostagebench: %: $(BUILD)/%
-	ln -sfn $< $@
+fusebench: $(BUILD)/fusebench
+	ln -sfn ../$< fft-fusion/$@
+xmacbench: $(BUILD)/xmacbench
+	ln -sfn ../$< xmac/$@
+twostagebench: $(BUILD)/twostagebench
+	ln -sfn ../$< two-stage/$@
 
-# two-stage channelisation (docs/two-stage.md): the PFB stage and the fine-FFT stage, compiled for
-# their FFT sizes (twostage1.cu, twostage2.cu), and the benchmark
-$(BUILD)/twostagebench: $(BUILD)/twostagebench.o $(BUILD)/twostage1.o $(BUILD)/twostage2.o $(BUILD)/unfused.o
-	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
-
-$(BUILD)/twostagebench.o: twostagebench.cu twostage.cuh pipelines.cuh stages.cuh common.cuh decode.cuh xmac.cuh | $(BUILD)
-	$(NVCC) $(FLAGS) -c $< -o $@
-
-$(BUILD)/twostage%.o: twostage%.cu twostage.cuh pipelines.cuh stages.cuh common.cuh decode.cuh | $(BUILD) $(MATHDX_DEP)
-	$(NVCC) $(FLAGS) $(DXFLAGS) -c $< -o $@
-
+# ---- fft-fusion: the station kernel (common/fused_inst.cu, once per FFT size) against gpudifx
+# today (common/unfused.cu), and the whole chain with the XMAC
 $(BUILD)/fusebench: $(BUILD)/fusebench.o $(BUILD)/unfused.o $(BUILD)/xmac.o $(FUSED_OBJ)
 	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
 
-$(BUILD)/fusebench.o: fusebench.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD) $(MATHDX_DEP)
+$(BUILD)/fusebench.o: fft-fusion/fusebench.cu $(COMMON_H) | $(BUILD) $(MATHDX_DEP)
 	$(NVCC) $(FLAGS) -I$(MATHDX)/include -c $< -o $@
 
-$(BUILD)/unfused.o: unfused.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD)
+$(BUILD)/fused_%.o: $(C)/fused_inst.cu $(COMMON_H) | $(BUILD) $(MATHDX_DEP)
+	$(NVCC) $(FLAGS) $(DXFLAGS) -DFUSE_N=$* -c $< -o $@
+
+$(BUILD)/unfused.o: $(C)/unfused.cu $(COMMON_H) | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
-# the XMAC stage on its own (xmac.cuh)
+# ---- xmac: the XMAC stage on its own (common/xmac.cuh)
 $(BUILD)/xmacbench: $(BUILD)/xmacbench.o $(BUILD)/xmac.o
 	$(NVCC) $(FLAGS) $^ -o $@
 
-$(BUILD)/xmacbench.o: xmacbench.cu xmac.cuh common.cuh | $(BUILD)
+$(BUILD)/xmacbench.o: xmac/xmacbench.cu $(C)/xmac.cuh $(C)/common.cuh $(C)/benchutil.cuh | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
-$(BUILD)/xmac.o: xmac.cu xmac.cuh xmac_copy.cuh common.cuh | $(BUILD)
+$(BUILD)/xmac.o: $(C)/xmac.cu $(C)/xmac.cuh $(C)/xmac_copy.cuh $(C)/common.cuh | $(BUILD)
 	$(NVCC) $(FLAGS) -c $< -o $@
 
-$(BUILD)/fused_%.o: fused_inst.cu pipelines.cuh stages.cuh common.cuh decode.cuh gpudecode_copy.cuh xmac.cuh | $(BUILD) $(MATHDX_DEP)
-	$(NVCC) $(FLAGS) $(DXFLAGS) -DFUSE_N=$* -c $< -o $@
+# ---- two-stage: the PFB stage and the fine-FFT stage, compiled for their FFT sizes
+# (common/twostage1.cu, twostage2.cu), and the benchmark
+$(BUILD)/twostagebench: $(BUILD)/twostagebench.o $(BUILD)/twostage1.o $(BUILD)/twostage2.o $(BUILD)/unfused.o
+	$(NVCC) $(FLAGS) $^ -o $@ -L$(CUDA_HOME)/lib64 -lcufft
+
+$(BUILD)/twostagebench.o: two-stage/twostagebench.cu $(C)/twostage.cuh $(COMMON_H) | $(BUILD)
+	$(NVCC) $(FLAGS) -c $< -o $@
+
+$(BUILD)/twostage%.o: $(C)/twostage%.cu $(C)/twostage.cuh $(COMMON_H) | $(BUILD) $(MATHDX_DEP)
+	$(NVCC) $(FLAGS) $(DXFLAGS) -c $< -o $@
 
 $(BUILD):
 	mkdir -p $@
@@ -144,5 +156,5 @@ $(MATHDX_STAMP):
 	touch $@
 
 clean:
-	rm -rf build-sm* fusebench xmacbench twostagebench
+	rm -rf build-sm* fft-fusion/fusebench xmac/xmacbench two-stage/twostagebench
 

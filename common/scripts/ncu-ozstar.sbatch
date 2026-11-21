@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-#SBATCH --job-name=fusebench-ncu
-#SBATCH --output=fusebench-ncu.%j.log
+#SBATCH --job-name=difx-proto-ncu
+#SBATCH --output=ncu.%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8         # for the parallel build
@@ -14,27 +14,29 @@
 #
 # Nsight Compute profiles of the fusebench kernels on one OzSTAR GPU node (an A100 on the gina
 # nodes): the full set of sections for one launch of each kernel below, to find out why the fused
-# kernel stays well below the memory bandwidth (README.md, "What changes on the A100").
+# kernel stays well below the memory bandwidth (fft-fusion/docs/station-kernel.md, "What changes on
+# the A100"), and of the xmacbench kernels.
 #
-# Set up and submit as fusebench-ozstar.sbatch (its header): the same DIFX_SETUP, run from
-# fft-fusion after "make mathdx" on a login node.  ncu comes from the CUDA toolkit DIFX_SETUP
-# selects (NCU=<path to ncu> overrides).  The job writes results-local/ncu-<host>-<stamp>/:
+# Set up and submit as ozstar.sbatch (its header): the same DIFX_SETUP, from the checkout after
+# "make mathdx" on a login node (sbatch common/scripts/ncu-ozstar.sbatch).  ncu comes from the CUDA
+# toolkit DIFX_SETUP selects (NCU=<path to ncu> overrides).  The job writes
+# fft-fusion/results-local/ncu-<host>-<stamp>/:
 #   <case>.ncu-rep   the reports (open in the Nsight Compute GUI: ncu-ui), with the source
 #   <case>.txt       the same as text (ncu --import ... --page details)
 #   <case>.run.log   fusebench's own output under the profiler
-# and packs it into a .tgz next to it: send that and the SLURM log back.  If the GPU's
+# and packs it into a .tgz next to it, and writes copy-results.<jobid>.sh (as ozstar.sbatch).  If the GPU's
 # performance counters are restricted to administrators, ncu fails with ERR_NVGPUCTRPERM; the job
 # then stops and says so.  ncu locks the GPU to its base clock while it profiles (the A100's
 # 1095 MHz rather than 1410), so its durations are longer than fusebench's.
 #
 # CASES=<extended regex> profiles only the cases whose names match, e.g. the xmacbench ones alone
 # (a few minutes once built):
-#     sbatch --export=ALL,CASES='^x' ncu-ozstar.sbatch
+#     sbatch --export=ALL,CASES='^x' common/scripts/ncu-ozstar.sbatch
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
-BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+BENCHDIR="${BENCHDIR:-$(git -C "${SLURM_SUBMIT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null)}"
 [ -f "$DIFX_SETUP" ] || { echo "ERROR: DIFX_SETUP $DIFX_SETUP does not exist" >&2; exit 1; }
-[ -f "$BENCHDIR/fusebench.cu" ] || { echo "ERROR: BENCHDIR $BENCHDIR is not fft-fusion: submit from there or set BENCHDIR" >&2; exit 1; }
+[ -f "$BENCHDIR/Makefile" ] && [ -d "$BENCHDIR/common" ] || { echo "ERROR: BENCHDIR ${BENCHDIR:-?} is not a difx-prototyping checkout: submit from one or set BENCHDIR" >&2; exit 1; }
 cd "$BENCHDIR" || exit 1
 if [ -n "${MATHDX:-}" ]; then
     [ -f "$MATHDX/include/cufftdx.hpp" ] || { echo "ERROR: MATHDX $MATHDX has no include/cufftdx.hpp" >&2; exit 1; }
@@ -68,7 +70,7 @@ echo "Building for sm_$SM ..."
 tmpfree=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR==2 {print int($4/1048576)}')
 echo "Temporary files in ${TMPDIR:-/tmp} (${tmpfree:-?} GB free)"
 [ "${tmpfree:-0}" -ge 3 ] || echo "WARNING: the build may need ~3 GB of temporary space: set TMPDIR, or build on a login node first"
-# Jobs started together (fusebench-ozstar.sbatch and ncu-ozstar.sbatch) build in the same
+# Jobs started together (ozstar.sbatch and ncu-ozstar.sbatch) build in the same
 # build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
 # filesystem does not support locks, warn and build without one.
 blog="build-sm$SM.${SLURM_JOB_ID:-manual}.log"
@@ -83,7 +85,7 @@ fi
     || { echo "ERROR: build failed, see $BENCHDIR/$blog" >&2; tail -20 "$blog" >&2; exit 1; }
 head -1 "$blog"
 
-OUT=results-local/ncu-$(hostname -s)-$(date +%Y%m%d-%H%M%S)
+OUT=fft-fusion/results-local/ncu-$(hostname -s)-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 QUICK=(--reps 1 --warmup 0 --check 0)
 # big enough not to fit in the A100's 40 MB L2 cache (128 channels: 164 MB of FP32 input per antenna)
@@ -161,7 +163,8 @@ profilex xstaged-c128-n64-ks2      xmac_staged_kernel --nchan 128 --nwin 10000 -
 profilex xstaged-c128-n100         xmac_staged_kernel --nchan 128 --nwin 10000 --nant 100 --only staged
 profilex xstaged-c1024-n32         xmac_staged_kernel --nchan 1024 --nwin 1000 --nant 32 --only staged
 
-tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
+tar czf "$OUT.tgz" -C fft-fusion/results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"
-SLURM_LOG="${SLURM_JOB_ID:+${SLURM_SUBMIT_DIR:-$BENCHDIR}/fusebench-ncu.$SLURM_JOB_ID.log}" ./make-copy-script.sh "$OUT.tgz"
+submit=$(realpath --relative-to="$BENCHDIR" "${SLURM_SUBMIT_DIR:-$BENCHDIR}")
+SLURM_LOG="${SLURM_JOB_ID:+$submit/ncu.$SLURM_JOB_ID.log}" common/scripts/make-copy-script.sh "$OUT.tgz"
 [ $fail = 0 ] || { echo "SOME PROFILES FAILED: see the .run.log files" >&2; exit 1; }

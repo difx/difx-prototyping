@@ -9,13 +9,8 @@
 #include <string>
 #include <vector>
 #include "xmac.cuh"
+#include "benchutil.cuh"
 
-__host__ __device__ static inline unsigned long long splitmix(unsigned long long x) {
-    x += 0x9e3779b97f4a7c15ull;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
-    return x ^ (x >> 31);
-}
 // a complex Gaussian of unit variance per component, from a hash of (seed, i)
 __device__ static inline float2 gauss(unsigned long long seed, unsigned long long i) {
     const unsigned long long r = splitmix(seed * 0x100000001b3ull + i);
@@ -54,29 +49,6 @@ __global__ void make_spectra(XmacShape s, unsigned long long seed, float rho, co
         const float2 own = gauss(seed + 7, i * 2);
         spec[i] = make_float2(a * sig.x + b * own.x, a * sig.y + b * own.y);
     }
-}
-
-struct Timing { double median, min; };
-template<class F>
-static Timing timeIt(F f, int warmup, int reps, cudaStream_t st) {
-    for (int i = 0; i < warmup; i++) f();
-    cudaEvent_t e0, e1;
-    CHECK_CUDA(cudaEventCreate(&e0));
-    CHECK_CUDA(cudaEventCreate(&e1));
-    std::vector<double> t;
-    for (int i = 0; i < reps; i++) {
-        CHECK_CUDA(cudaEventRecord(e0, st));
-        f();
-        CHECK_CUDA(cudaEventRecord(e1, st));
-        CHECK_CUDA(cudaEventSynchronize(e1));
-        float ms;
-        CHECK_CUDA(cudaEventElapsedTime(&ms, e0, e1));
-        t.push_back(ms);
-    }
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    std::sort(t.begin(), t.end());
-    return {t[t.size() / 2], t[0]};
 }
 
 // ---- --messy: stations with different band layouts ----------------------------------------------
@@ -309,7 +281,7 @@ static int runMessy(int nant, int F, int C, int nwin, double bw, double rho, int
 
     printf("\ntiming per subint, median [min] of %d, ms:\n", reps);
     for (const auto& v : variants) {
-        const Timing t = timeIt(v.run, warmup, reps, stream);
+        const Timing t = timeItSync(v.run, warmup, reps, stream);
         printf("  %-56s %8.3f [%8.3f]  %7.1f Gcmac/s  %6.1fx real time\n", v.name, t.median, t.min,
                cmacs / t.median * 1e-6, subintMs / t.median);
     }
@@ -522,7 +494,7 @@ int main(int argc, char** argv) {
         printf("  %-56s %8.3f [%8.3f]  %7.1f Gcmac/s  %6.1fx real time\n", name, t.median, t.min,
                s.cmacs() / t.median * 1e-6, subintMs / t.median);
     };
-    for (const auto& v : variants) line(v.name, timeIt(v.run, warmup, reps, st));
+    for (const auto& v : variants) line(v.name, timeItSync(v.run, warmup, reps, st));
     printf("  (Gcmac/s: complex multiply-accumulates of the %d baselines x 4 products per second)\n", s.nbaseline());
     if (runG) gx.destroy();
     return pass ? 0 : 1;

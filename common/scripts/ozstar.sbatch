@@ -1,21 +1,22 @@
 #!/bin/bash
 #
-#SBATCH --job-name=fusebench
-#SBATCH --output=fusebench.%j.log
+#SBATCH --job-name=difx-proto
+#SBATCH --output=ozstar.%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8         # for the parallel build (the fused kernel is compiled per FFT length)
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G                 # the build: up to ~4 GB per ptxas (N=8192 and up), eight at once
 #SBATCH --tmp=8G                  # job-local disk ($JOBFS) for nvcc's intermediate files
-#SBATCH --time=1:30:00            # estimate: build ~25 min on a gina node (5 min on a desktop), the four scripts ~20 min
+#SBATCH --time=1:30:00            # estimate: build ~25 min on a gina node (5 min on a desktop), the default scripts ~20 min
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #
-# fusebench on one OzSTAR GPU node (an A100 on the gina nodes): builds fusebench and xmacbench for
-# the GPU the job got, then runs the standard set (run-bench.sh), the channel-count sweep
-# (run-nchan.sh), the XMAC stage against the number of stations (run-xmac.sh) and the staged XMAC's
-# super-block sizes against the number of stations (run-staged.sh).  See README.md.
+# The benchmarks on one OzSTAR GPU node (an A100 on most gina nodes): builds them for the GPU the
+# job got (the Makefile in the repository root), then runs the sub-projects' run-*.sh scripts named
+# in SCRIPTS (paths from the root), each in its own directory.  Default: fft-fusion's standard set
+# (run-bench.sh) and channel-count sweep (run-nchan.sh), and xmac's station-count sweeps
+# (run-xmac.sh, run-staged.sh).  See README.md (OzSTAR).
 #
 # The build environment comes from DIFX_SETUP, a file this job sources: your gpudifx setup (module
 # loads, then gpudifx's setup.bash), which sets CUDAROOT or puts nvcc on PATH.  Default:
@@ -23,36 +24,33 @@
 #
 # Before submitting, on a login node, in a clone of difx-prototyping
 # (git clone https://github.com/difx/difx-prototyping.git):
-#     cd difx-prototyping/fft-fusion
+#     cd difx-prototyping
 #     make mathdx           # fetches MathDx (cuFFTDx) from PyPI; the GPU nodes may have no network
-#     sbatch fusebench-ozstar.sbatch
-# Submit from fft-fusion (or set BENCHDIR).  The SLURM log fusebench.<jobid>.log is written there
-# and holds the summary.  The logs of every run are in results-local/<host>-<stamp>/ (run-bench.sh),
-# results-local/<host>-nchan-<stamp>/ (run-nchan.sh), results-local/<host>-xmac-<stamp>/
-# (run-xmac.sh) and results-local/<host>-staged-<stamp>/ (run-staged.sh), each also packed into a .tgz next to it at the end: send those and the SLURM log
-# back.
+#     sbatch common/scripts/ozstar.sbatch
+# Submit from anywhere in the checkout (or set BENCHDIR to its root).  The SLURM log ozstar.<jobid>.log
+# is written where you submit (the root, as above) and holds the summary.  Each script's results go
+# to its sub-project's results-local/<host>-...-<stamp>/, packed into a .tgz next to it at the end.
+# The job then writes copy-results.<jobid>.sh in the root (make-copy-script.sh): run it once the
+# job has finished to copy the SLURM log and the .tgz files to the same places in RESULTS_DEST
+# (default ar313's checkout; --export=ALL,RESULTS_DEST=<host>:<checkout>/).
 #
 # Other settings, through the environment:
-#     sbatch --export=ALL,DIFX_SETUP=<file> fusebench-ozstar.sbatch
-#     sbatch --export=ALL,MATHDX=<MathDx dir> fusebench-ozstar.sbatch    # a MathDx you already have
-#     sbatch --export=ALL,EXTRA="--reps 50" fusebench-ozstar.sbatch      # extra fusebench options
-#     sbatch --export=ALL,SCRIPTS="run-xmac.sh run-staged.sh" fusebench-ozstar.sbatch   # only some scripts
-#     sbatch --export=ALL,SCRIPTS="run-wide.sh" fusebench-ozstar.sbatch   # the wider shapes (bits, bands):
-#         not in the default set; results-local/<host>-wide-<stamp>/
-#     sbatch --export=ALL,SCRIPTS="run-matrix.sh" fusebench-ozstar.sbatch   # the big matrix
-#         (bits x subbands x channels x stations, 108 shapes, 15 min on an A100): results-local/<host>-matrix-<stamp>/,
-#         and a summary CSV in results/ (copy it back with the tgz: it is in there too as summary.csv)
-#     sbatch --export=ALL,SCRIPTS=run-twostage.sh fusebench-ozstar.sbatch   # two-stage channelisation,
-#         ~64k channels; add NCHAN=8192,NWIN=128 for ~8k: results-local/<host>-twostage[-8192]-<stamp>/
-#
-# At the end the job writes copy-results.<jobid>.sh (make-copy-script.sh): run it once the job has
-# finished to scp the SLURM log and the .tgz files to RESULTS_DEST (default ar313's results-local/;
-# set it with --export=ALL,RESULTS_DEST=<host>:<dir>/).
+#     sbatch --export=ALL,DIFX_SETUP=<file> common/scripts/ozstar.sbatch
+#     sbatch --export=ALL,MATHDX=<MathDx dir> ...           # a MathDx you already have
+#     sbatch --export=ALL,EXTRA="--reps 50" ...             # extra options for every script
+#     sbatch --export=ALL,TARGETS="xmacbench" ...           # build only these (default: all; fusebench
+#                                                           # is the ~25 min part)
+#     sbatch --export=ALL,SCRIPTS="xmac/run-xmac.sh xmac/run-staged.sh" ...   # only some scripts
+#     SCRIPTS=fft-fusion/run-wide.sh      the wider shapes (bits, bands)
+#     SCRIPTS=fft-fusion/run-matrix.sh    the big matrix (bits x subbands x channels x stations, 108
+#                                         shapes, 15 min on an A100), with a summary CSV in the .tgz
+#     SCRIPTS=two-stage/run-twostage.sh   two-stage channelisation, ~64k channels; add
+#                                         NCHAN=8192,NWIN=128 for ~8k
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
-BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+BENCHDIR="${BENCHDIR:-$(git -C "${SLURM_SUBMIT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null)}"
 [ -f "$DIFX_SETUP" ] || { echo "ERROR: DIFX_SETUP $DIFX_SETUP does not exist" >&2; exit 1; }
-[ -x "$BENCHDIR/run-bench.sh" ] || { echo "ERROR: BENCHDIR $BENCHDIR has no run-bench.sh: submit from fft-fusion or set BENCHDIR" >&2; exit 1; }
+[ -f "$BENCHDIR/Makefile" ] && [ -d "$BENCHDIR/common" ] || { echo "ERROR: BENCHDIR ${BENCHDIR:-?} is not a difx-prototyping checkout: submit from one or set BENCHDIR" >&2; exit 1; }
 cd "$BENCHDIR" || exit 1
 if [ -n "${MATHDX:-}" ]; then
     [ -f "$MATHDX/include/cufftdx.hpp" ] || { echo "ERROR: MATHDX $MATHDX has no include/cufftdx.hpp" >&2; exit 1; }
@@ -82,7 +80,7 @@ t0=$(date +%s)
 tmpfree=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR==2 {print int($4/1048576)}')
 echo "Temporary files in ${TMPDIR:-/tmp} (${tmpfree:-?} GB free)"
 [ "${tmpfree:-0}" -ge 3 ] || echo "WARNING: the build may need ~3 GB of temporary space: set TMPDIR, or build on a login node first"
-# Jobs started together (fusebench-ozstar.sbatch and ncu-ozstar.sbatch) build in the same
+# Jobs started together (ozstar.sbatch and ncu-ozstar.sbatch) build in the same
 # build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
 # filesystem does not support locks, warn and build without one.
 blog="build-sm$SM.${SLURM_JOB_ID:-manual}.log"
@@ -93,31 +91,36 @@ if [ $rc != 0 ] && [ $rc != 200 ]; then
     echo "WARNING: file locks do not work in $BENCHDIR; building without one, so do not start two of these jobs at once"
     lock=()
 fi
-"${lock[@]}" make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" > "$blog" 2>&1 \
+read -r -a targets <<< "${TARGETS:-all}"
+"${lock[@]}" make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" "${targets[@]}" > "$blog" 2>&1 \
     || { echo "ERROR: build failed, see $BENCHDIR/$blog" >&2; tail -20 "$blog" >&2; exit 1; }
 head -1 "$blog"                   # what the Makefile chose: CUDA, MathDx
 "${CUDAROOT:+$CUDAROOT/bin/}nvcc" --version | tail -1   # the Makefile's choice: CUDAROOT, else PATH
 echo "Built in $(( $(date +%s) - t0 )) s"
 
-# run <script>: run it, then pack the results directory it reports ("Results in <dir> ...")
+# run <sub-project>/<script>: run it in its directory, then pack the results directory it reports
+# ("Results in <dir> ...", from that directory)
 rc=0
+packed=()
 run() {
-    local t0=$(date +%s) log="$1.${SLURM_JOB_ID:-manual}.out"
-    "./$1" "${extra[@]}" 2>&1 | tee "$log"
+    local t0=$(date +%s) dir=$(dirname "$1") name=$(basename "$1")
+    local log="$BENCHDIR/$dir/$name.${SLURM_JOB_ID:-manual}.out"
+    [ -x "$BENCHDIR/$1" ] || { echo "ERROR: no script $1"; rc=1; return; }
+    (cd "$BENCHDIR/$dir" && "./$name" "${extra[@]}") 2>&1 | tee "$log"
     local r=${PIPESTATUS[0]}
     echo "$1: exit $r, $(( $(date +%s) - t0 )) s"
     [ $r = 0 ] || rc=1
     local results=$(sed -n 's/^Results in \([^ ]*\).*/\1/p' "$log" | tail -1)
-    if [ -n "$results" ] && [ -d "$results" ]; then
-        command mv "$log" "$results/"
-        tar czf "$results.tgz" -C results-local "$(basename "$results")"
-        echo "Packed: $BENCHDIR/$results.tgz"
-        packed+=("$results.tgz")
+    if [ -n "$results" ] && [ -d "$dir/$results" ]; then
+        command mv "$log" "$dir/$results/"
+        tar czf "$dir/$results.tgz" -C "$dir/$(dirname "$results")" "$(basename "$results")"
+        echo "Packed: $BENCHDIR/$dir/$results.tgz"
+        packed+=("$dir/$results.tgz")
     fi
 }
-packed=()
-for script in ${SCRIPTS:-run-bench.sh run-nchan.sh run-xmac.sh run-staged.sh}; do
+for script in ${SCRIPTS:-fft-fusion/run-bench.sh fft-fusion/run-nchan.sh xmac/run-xmac.sh xmac/run-staged.sh}; do
     run "$script"
 done
-SLURM_LOG="${SLURM_JOB_ID:+${SLURM_SUBMIT_DIR:-$BENCHDIR}/fusebench.$SLURM_JOB_ID.log}" ./make-copy-script.sh "${packed[@]}"
+submit=$(realpath --relative-to="$BENCHDIR" "${SLURM_SUBMIT_DIR:-$BENCHDIR}")
+SLURM_LOG="${SLURM_JOB_ID:+$submit/ozstar.$SLURM_JOB_ID.log}" common/scripts/make-copy-script.sh "${packed[@]}"
 exit $rc

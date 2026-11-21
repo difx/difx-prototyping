@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # run-xmac.sh - the XMAC stage on its own (xmacbench) against the number of stations.  Build
-# first (make, see README.md).
+# first (make in the repository root, see ../README.md).
 #
 # Usage:  ./run-xmac.sh [extra xmacbench options, e.g. --reps 50]
 #
@@ -19,8 +19,8 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-[ -x "$XMACBENCH" ] || { echo "ERROR: build xmacbench first (make, see README.md)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+[ -x "$XMACBENCH" ] || { echo "ERROR: build xmacbench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-xmac-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"

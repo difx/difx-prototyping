@@ -6,7 +6,7 @@
 # double-precision check of the whole chain in each run.  For comparison: gpudifx today at the same
 # channel counts, and the single-stage end-to-end kernel at its largest size, 8192 channels
 # (fusebench --xmac: the FP16-spectra kernel, the fastest variant), per ms of data.  Build first
-# (make, see README.md).
+# (make in the repository root, see ../README.md).
 #
 # Usage:  [NCHAN=8192 NWIN=128] ./run-twostage.sh [extra twostagebench options, e.g. --nant 10]
 #   NCHAN: the channel count wanted (default 65536); NWIN: stage-2 windows per subint (default 16;
@@ -17,9 +17,9 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-TWOSTAGE=$( [ -n "$BENCH_SM" ] && [ -x "build-sm$BENCH_SM/twostagebench" ] && echo "build-sm$BENCH_SM/twostagebench" || echo ./twostagebench)
-[ -x "$TWOSTAGE" ] || { echo "ERROR: build twostagebench first (make, see README.md)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+TWOSTAGE=$TWOSTAGEBENCH
+[ -x "$TWOSTAGE" ] || { echo "ERROR: build twostagebench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 NCHAN=${NCHAN:-65536} NWIN=${NWIN:-16}
 OUT=results-local/$(hostname -s)-twostage$([ $NCHAN = 65536 ] || echo -$NCHAN)-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"

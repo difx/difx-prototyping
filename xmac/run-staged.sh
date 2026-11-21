@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # run-staged.sh - the staged tensor XMAC (xmacbench) against the number of stations, with each of
-# its super-block sizes.  Build first (make, see README.md).
+# its super-block sizes.  Build first (make in the repository root, see ../README.md).
 #
 # Usage:  ./run-staged.sh [extra xmacbench options, e.g. --reps 50]
 #
@@ -15,8 +15,8 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-[ -x "$XMACBENCH" ] || { echo "ERROR: build xmacbench first (make, see README.md)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+[ -x "$XMACBENCH" ] || { echo "ERROR: build xmacbench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-staged-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"

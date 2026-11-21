@@ -3,7 +3,7 @@
 # run-wide.sh - the whole chain (fusebench --xmac: station processing from packed data + XMAC)
 # over a wider range of shapes: 1, 2 and 4 bits a sample x 1, 4 and 32 dual-polarisation
 # subbands (2, 8 and 64 bands) x 128 channels at 4, 10, 32 (and 64) stations and 1024 channels at
-# 10 (and 32).  Build first (make, see README.md).
+# 10 (and 32).  Build first (make in the repository root, see ../README.md).
 #
 # Usage:  ./run-wide.sh [extra fusebench options, e.g. --reps 50]
 #
@@ -18,8 +18,8 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-wide-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"

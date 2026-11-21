@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# run-bench.sh - the standard fusebench set, for comparing GPUs.  Build first (make, see README.md).
+# run-bench.sh - the standard fusebench set, for comparing GPUs.  Build first (make in the repository root, see ../README.md).
 #
 # Usage:  ./run-bench.sh [extra fusebench options, e.g. --reps 50]
 #
@@ -31,8 +31,8 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make MATHDX=...)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"

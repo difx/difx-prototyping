@@ -16,6 +16,7 @@
 #include <vector>
 #include <cufftdx/cufftdx_version.hpp>
 #include "pipelines.cuh"
+#include "benchutil.cuh"
 
 int fusedLastRegisters = 0;
 
@@ -43,12 +44,6 @@ void launchCrossPol(const Geometry& g, const FracParams& p, const cuFloatComplex
 }
 
 // ---- synthetic data --------------------------------------------------------------------------
-__device__ __host__ inline unsigned long long splitmix(unsigned long long x) {
-    x += 0x9E3779B97F4A7C15ull;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-    return x ^ (x >> 31);
-}
 
 // unit-variance complex Gaussian noise for sample i (Box-Muller on a counter hash), so that any
 // sample can be regenerated exactly, before rounding to the storage precision
@@ -113,18 +108,6 @@ __global__ void gather_exact(Geometry g, Pre pre, unsigned long long seed, const
     }
 }
 
-struct Rng {
-    unsigned long long s;
-    double uniform() { s = splitmix(s); return (s >> 11) * (1.0 / 9007199254740992.0); }
-    double range(double a, double b) { return a + (b - a) * uniform(); }
-};
-
-template<class T> T* devAlloc(size_t n) { T* p; CHECK_CUDA(cudaMalloc(&p, n * sizeof(T))); return p; }
-template<class T> T* devCopy(const std::vector<T>& v) {
-    T* p = devAlloc<T>(v.size());
-    CHECK_CUDA(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
-    return p;
-}
 static bool* devCopyBool(const std::vector<char>& v) {
     bool* p = devAlloc<bool>(v.size());
     std::vector<unsigned char> b(v.begin(), v.end());
@@ -149,26 +132,6 @@ static std::vector<float> taperedWindow(int n, double taper, Taper shape) {
         w[n - 1 - i] = v;
     }
     return w;
-}
-
-// ---- packed data -----------------------------------------------------------------------------
-// Multi-channel VDIF: 32-byte headers, 8000-byte payloads, nband interleaved nbit-bit samples per
-// sample time, little-endian bit order, offset-binary levels as mark5access decodes them.
-static const int VDIF_HEADER = 32, VDIF_PAYLOAD = 8000;
-
-// The host's own decode of one sample (written from mark5access's level tables, independently of
-// the GPU code), for the reference.
-static double hostDecode(const unsigned char* payload, int nbit, int nband, int sampleInFrame, int band) {
-    const long bit = ((long)sampleInFrame * nband + band) * nbit;
-    if (nbit <= 2) {
-        const int v = (payload[bit / 8] >> (bit % 8)) & ((1 << nbit) - 1);
-        static const double two[4] = {-OPTIMAL_2BIT_HIGH, -1.0, 1.0, OPTIMAL_2BIT_HIGH};
-        return nbit == 1 ? (v ? 1.0 : -1.0) : two[v];
-    }
-    unsigned int w;
-    memcpy(&w, payload + bit / 32 * 4, 4);
-    const int v = (w >> (bit % 32)) & ((1u << nbit) - 1);
-    return nbit == 4 ? (v - 7.5) / 2.95 : (v - 128.0) / 3.3;
 }
 
 // ---- comparison ------------------------------------------------------------------------------
@@ -225,31 +188,6 @@ static Diff compareHost(const std::vector<std::complex<double>>& a, const std::v
     }
     const double rref = sqrt(r2 / ref.size());
     return {sqrt(d2 / ref.size()) / rref, dmax / rref};
-}
-
-// ---- timing ----------------------------------------------------------------------------------
-struct Timing { double median, min; };
-
-template<class F>
-static Timing timeIt(F f, int warmup, int reps, cudaStream_t st) {
-    for (int i = 0; i < warmup; i++) f();
-    std::vector<cudaEvent_t> ev(reps + 1);
-    for (auto& e : ev) CHECK_CUDA(cudaEventCreate(&e));
-    CHECK_CUDA(cudaEventRecord(ev[0], st));
-    for (int i = 0; i < reps; i++) {
-        f();
-        CHECK_CUDA(cudaEventRecord(ev[i + 1], st));
-    }
-    CHECK_CUDA(cudaEventSynchronize(ev[reps]));
-    std::vector<double> t(reps);
-    for (int i = 0; i < reps; i++) {
-        float ms;
-        CHECK_CUDA(cudaEventElapsedTime(&ms, ev[i], ev[i + 1]));
-        t[i] = ms;
-    }
-    for (auto& e : ev) cudaEventDestroy(e);
-    std::sort(t.begin(), t.end());
-    return {reps % 2 ? t[reps / 2] : 0.5 * (t[reps / 2 - 1] + t[reps / 2]), t[0]};
 }
 
 // ---- chunks: one antenna, a range of windows -------------------------------------------------

@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # run-nchan.sh - how the cost of a subint depends on the number of channels.  Build first (make,
-# see README.md).
+# see ../README.md).
 #
 # Usage:  ./run-nchan.sh [extra fusebench options, e.g. --reps 50]
 #
@@ -15,8 +15,8 @@
 
 set -u
 cd "$(dirname "$0")"
-. ./bench-bin.sh
-[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make, see README.md)" >&2; exit 1; }
+. ../common/scripts/bench-bin.sh
+[ -x "$FUSEBENCH" ] || { echo "ERROR: build fusebench first (make in the repository root, see ../README.md)" >&2; exit 1; }
 OUT=results-local/$(hostname -s)-nchan-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 { echo "Host $(hostname), $(date), commit $(git log -1 --format='%h %s' 2>/dev/null)"
