@@ -557,6 +557,42 @@ channels: 0.0951 ms/ms; gpudifx today 0.326 ms/ms at 49152 channels, 0.249 at 65
 - **The choices hold:** 32 coarse channels, O = 4/3, 8 taps (1.6x the single stage); 16 taps for
   lines (1.9x); O = 2, 4 taps for powers of two (1.9x).
 
+### A100-SXM4-80GB (OzSTAR, gina17), about 8k channels
+
+SLURM job 21316333, commit 4ae0c67, all 18 passing
+(`results-local/gina17-twostage-8192-20261121-124621`).  The single-stage kernel at 8192 channels:
+0.0952 ms/ms; gpudifx today 0.221 ms/ms at 6144 channels, 0.1995 at 8192.
+
+| Nc | O | taps | channels | stage 1 | stage 2 | total | slowdown | against gpudifx | 2070 slowdown |
+|---|---|---|---|---|---|---|---|---|---|
+| 16 | 4/3 | 4 | 6144 | 0.1236 | 0.0274 | 0.1508 | 1.58 | 1.47x | 1.95 |
+| 16 | 4/3 | 8 | 6144 | 0.1327 | 0.0265 | 0.1591 | 1.67 | 1.39x | 2.09 |
+| 16 | 4/3 | 16 | 6144 | 0.1609 | 0.0265 | 0.1872 | 1.97 | 1.18x | 2.43 |
+| 32 | 4/3 | 4 | 6144 | 0.1083 | 0.0214 | 0.1295 | 1.36 | 1.71x | 1.62 |
+| 32 | 4/3 | 8 | 6144 | 0.1240 | 0.0214 | 0.1452 | 1.52 | 1.52x | 1.98 |
+| 32 | 4/3 | 16 | 6144 | 0.1546 | 0.0214 | 0.1757 | 1.85 | 1.26x | 2.38 |
+| 64 | 4/3 | 4 | 6144 | 0.1211 | 0.0242 | 0.1452 | 1.52 | 1.52x | 2.10 |
+| 64 | 4/3 | 8 | 6144 | 0.1413 | 0.0243 | 0.1655 | 1.74 | 1.34x | 2.36 |
+| 64 | 4/3 | 16 | 6144 | 0.1820 | 0.0242 | 0.2061 | 2.16 | 1.07x | 3.38 |
+| 16 | 2 | 4 | 8192 | 0.1529 | 0.0467 | 0.1994 | 2.09 | 1.00x | 2.70 |
+| 16 | 2 | 8 | 8192 | 0.1719 | 0.0467 | 0.2184 | 2.29 | 0.91x | 2.95 |
+| 16 | 2 | 16 | 8192 | 0.2112 | 0.0467 | 0.2578 | 2.71 | 0.77x | 3.42 |
+| 32 | 2 | 4 | 8192 | 0.1477 | 0.0349 | 0.1826 | 1.92 | 1.09x | 2.31 |
+| 32 | 2 | 8 | 8192 | 0.1713 | 0.0349 | 0.2061 | 2.16 | 0.97x | 2.60 |
+| 32 | 2 | 16 | 8192 | 0.2171 | 0.0349 | 0.2519 | 2.65 | 0.79x | 3.43 |
+| 64 | 2 | 4 | 8192 | 0.1678 | 0.0301 | 0.1977 | 2.08 | 1.01x | 2.78 |
+| 64 | 2 | 8 | 8192 | 0.1976 | 0.0301 | 0.2276 | 2.39 | 0.88x | 3.16 |
+| 64 | 2 | 16 | 8192 | 0.2585 | 0.0301 | 0.2885 | 3.03 | 0.69x | 3.91 |
+
+- **The slowdown at 8k is what it is at 64k** (32 coarse channels, O = 4/3, 8 taps: 1.52x against
+  1.57x), as on the 2070.  Best: 1.36x (32, 4/3, 4 taps).
+- **Against gpudifx today** two stages are 1.1-1.7x faster at 6144 channels (O = 4/3) and 0.7-1.1x at
+  8192 (O = 2).  But 8192 channels is the single stage's range, where it is 2.1x faster than
+  gpudifx today: two stages are only for what one cannot do.
+- **16 coarse channels** is 10% behind 32 at 8 taps here (0.159 against 0.145 ms/ms; tied at 64k):
+  its stage 1 is 7% slower (0.133 against 0.124) and its 512-point stage 2 costs more than 32's
+  256-point one (0.027 against 0.021).
+
 ## Implementation plan
 
 1. **Python reference.**  A numpy model of the whole two-stage chain from a sample series (both
