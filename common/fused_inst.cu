@@ -22,7 +22,7 @@ using namespace cufftdx;
 using FFTBase = decltype(Size<FUSE_N>() + Precision<float>() + Type<fft_type::c2c>() +
                          Direction<fft_direction::forward>() + SM<FUSE_SM>() + Block());
 // E elements per thread (cuFFTDx's suggestion E0, or E0 / 2: measured faster for these kernels,
-// see README.md) and FPB FFTs per block
+// see fft-fusion/docs/station-kernel.md and lean-decode.md) and FPB FFTs per block
 constexpr unsigned E0 = FFTBase::elements_per_thread;
 template<unsigned E, unsigned FPB>
 using FFTn = decltype(FFTBase() + ElementsPerThread<E>() + FFTsPerBlock<FPB>());
@@ -135,7 +135,7 @@ template<class Pre> constexpr bool xmacDecode = std::is_same<Pre, PreDecodeLean<
 // Not __launch_bounds__(threads, 1): with an explicit minimum of one block per SM the compiler
 // used more registers (sm_80: 86-96 instead of 64-72 at cuFFTDx's elements per thread, 54-56
 // instead of 48 at half; sm_75: 92-96 instead of 64-80), which lowered occupancy and made some
-// variants up to 56% slower (README.md).
+// variants up to 56% slower (fft-fusion/docs/channel-count.md).
 template<class FFT, class Pre, class Post, bool CROSSPOL>
 __launch_bounds__(FFT::max_threads_per_block)
 __global__ void fused_fft_frac(Geometry g, Pre pre, Post post, cuFloatComplex* out,

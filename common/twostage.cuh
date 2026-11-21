@@ -1,4 +1,4 @@
-// twostage.cuh - two-stage channelisation (docs/two-stage.md): a polyphase filter bank (PFB) of Nc
+// twostage.cuh - two-stage channelisation (two-stage/docs/analysis.md, results.md): a polyphase filter bank (PFB) of Nc
 // coarse channels, then an FFT of each coarse channel's series.  Real-sampled data.
 //
 // Stage 1 (twostage1.cu): coarse window n starts at sample n H (plus its integer delay shift) and

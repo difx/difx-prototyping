@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """plot_two_stage.py - pictures of two-stage channelisation's sensitivity and leakage
-(docs/two-stage.md; the numbers: two_stage.py).
+(docs/analysis.md; the numbers: two_stage.py).
 
 Usage:  python3 plot_two_stage.py [output directory, default plots/]
 

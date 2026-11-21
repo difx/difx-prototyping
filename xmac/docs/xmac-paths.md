@@ -2,7 +2,7 @@
 
 **Since 2026-11-20 only paths 1, 2 and 6 are in the code** (gpudifx today and gpudifx's XMAC as the
 reference, and the staged path, the one kept).  Paths 3, 4, 5 and 7 were retired after these
-comparisons and the 108-shape matrix ("The big matrix" in [README.md](../README.md)); this page is
+comparisons and the 108-shape matrix ("The big matrix" in [shapes-and-matrix.md](../../fft-fusion/docs/shapes-and-matrix.md)); this page is
 the record of why.
 
 ![The station + XMAC paths and their layouts](../plots/xmac-paths.svg)

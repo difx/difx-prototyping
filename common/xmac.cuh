@@ -7,7 +7,7 @@
 //   staged   FP16 in, FP32 sums on the tensor cores, from FP16 spectra in the station kernel's own
 //            order (halfIndex, or anywhere a map says), each block rearranging its channels of the
 //            receivers it multiplies in shared memory.
-// (Retired after the comparisons in README.md and docs/xmac-paths.md: a register-tiled FP32 XMAC,
+// (Retired after the comparisons in xmac/docs/ (xmac-paths.md and the rest): a register-tiled FP32 XMAC,
 // a transpose into a tensor layout with a WMMA XMAC from it, the station kernel writing that layout
 // directly, and a WMMA version of the staged XMAC.)
 #pragma once

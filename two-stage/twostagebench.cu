@@ -1,4 +1,4 @@
-// twostagebench - two-stage channelisation (docs/two-stage.md, twostage.cuh): a polyphase filter
+// twostagebench - two-stage channelisation (docs/analysis.md and results.md, ../common/twostage.cuh): a polyphase filter
 // bank of Nc coarse channels, then an FFT of each coarse channel's series, from packed VDIF to FP16
 // spectra in the staged XMAC's order; checked against a double-precision reference of the same
 // chain and timed, against gpudifx today (decode, cuFFT, rotation) at the same channel count.

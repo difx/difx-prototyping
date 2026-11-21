@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plot_windows.py - pictures of the tapered-window choices (see README.md, "Window design").
+"""plot_windows.py - pictures of the tapered-window choices (see docs/windows.md).
 
 Usage:  python3 plot_windows.py [output directory, default plots/]
 

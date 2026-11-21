@@ -104,7 +104,7 @@ __device__ __forceinline__ void addVis(cuFloatComplex* vis, size_t i, float re, 
 // the map says), each block rearranging what it needs in shared memory: no transpose kernel, and no
 // layout the station kernel must write (the tensor layout, the transpose and the tensor XMAC from
 // them, the tiled FP32 XMAC and a WMMA version of this one were retired after the comparisons in
-// README.md and docs/xmac-paths.md).
+// xmac/docs/, xmac-paths.md and the rest).
 //
 // The receivers are taken in blocks of 16 (the tensor cores' rows), and the blocks in super-blocks
 // of KS.  A thread block takes CH consecutive channels of one frequency and one pair (A, B), A <= B,

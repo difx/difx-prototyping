@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """two_stage.py - what two-stage channelisation does to sensitivity and spectral leakage
-(docs/two-stage.md).
+(docs/analysis.md).
 
-Usage:  python3 two_stage.py          # the tables in docs/two-stage.md
+Usage:  python3 two_stage.py          # the tables in docs/analysis.md
         python3 two_stage.py offset   # leakage beyond 1, 2, 3, 5 coarse channels: two stages against one
         python3 two_stage.py ghost    # a line's largest spurious response against its place in its coarse channel
 

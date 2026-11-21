@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# run-twostage.sh - two-stage channelisation (twostagebench, docs/two-stage.md) over the PFB's
+# run-twostage.sh - two-stage channelisation (twostagebench, docs/results.md) over the PFB's
 # parameters: 16, 32, 64 coarse channels x oversampling 4:3 and 2 x 4, 8, 16 taps, for about 64k
 # final channels (65536 at O = 2, 49152 at 4:3: the nearest the oversampling allows), with the
 # double-precision check of the whole chain in each run.  For comparison: gpudifx today at the same
