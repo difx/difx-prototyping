@@ -16,7 +16,7 @@ evaluated.
 | [`fft-fusion/`](fft-fusion/README.md) | the station stage: the FFT and the fractional-sample correction fused into one cuFFTDx kernel, from the packed data, against gpudifx today; FP16 FFT input; windowed overlap-add front end; the whole chain over many shapes |
 | [`xmac/`](xmac/README.md) | the cross-multiply-accumulate: gpudifx's XMAC against the staged tensor-core XMAC, alone and after the station stage; stations with different band layouts |
 | [`two-stage/`](two-stage/README.md) | two-stage channelisation (PFB, then an FFT per coarse channel) for resolutions one cuFFTDx FFT cannot reach |
-| [`phase-centres/`](phase-centres/README.md) | GPU correlation to many phase centres at once (not started) |
+| [`phase-centres/`](phase-centres/README.md) | GPU correlation to many phase centres at once: the shift after the XMAC as a matrix product (`phasecentrebench`) |
 | [`pulsar-binning/`](pulsar-binning/README.md) | GPU pulsar gating and binning in the XMAC (not started) |
 
 Each sub-project has:
@@ -48,13 +48,13 @@ source <gpudifx>/setup.bash
 make -j8                                                     # as setup.bash says: every binary
 make -j8 SM=80                                               # A100, whatever setup.bash says
 make -j8 MATHDX=<mathdx dir> CUDA_HOME=/usr/local/cuda-13.2  # everything given explicitly
-make -j8 xmacbench twostagebench                             # only some (fusebench is the slow one)
+make -j8 xmacbench twostagebench phasecentrebench            # only some (fusebench is the slow one)
 make -j8 SIZES="256 2048" fusebench                          # only some FFT lengths in the fused kernel
 ```
 
 Each GPU architecture builds in its own `build-sm<SM>/`, so builds for different GPUs never
-touch each other.  `fft-fusion/fusebench`, `xmac/xmacbench` and `two-stage/twostagebench` are
-links to the last build's binaries, for running by hand; the `run-*.sh` scripts take the
+touch each other.  `fft-fusion/fusebench`, `xmac/xmacbench`, `two-stage/twostagebench` and
+`phase-centres/phasecentrebench` are links to the last build's binaries, for running by hand; the `run-*.sh` scripts take the
 binaries built for the GPU they find (`common/scripts/bench-bin.sh`).  `fusebench`'s fused
 kernel is compiled once per FFT length (`SIZES`, default 64 to 16384), in all its variants:
 about 4 minutes with `-j8` on a desktop, 25 on an OzSTAR node.  Every benchmark exits non-zero

@@ -9,6 +9,7 @@ __pycache__/
 fft-fusion/fusebench
 xmac/xmacbench
 two-stage/twostagebench
+phase-centres/phasecentrebench
 # local results, OzSTAR job logs and copy scripts
 */results-local/
 ozstar.*.log

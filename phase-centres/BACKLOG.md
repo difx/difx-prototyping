@@ -3,7 +3,28 @@
 mpifxcorr's implementation is read: [docs/mpifxcorr.md](docs/mpifxcorr.md).  The key ratio there:
 shift / XMAC ≈ 2 × centres / windows per piece.
 
-## The GPU design (to prototype)
+## Done
+
+- `phasecentrebench`, the shift after the XMAC, checked and swept on the 2070
+  ([docs/results.md](docs/results.md)).  It has the pieces from `maxNSBetweenUVShifts`, delays per
+  (antenna, centre), and the naive, SIMT and tensor shifts.
+
+## Next
+
+- **The A100** (OzSTAR): `run-centres.sh`.
+- **Short averages (8-16 channels)**: the outer phasor by recurrence along the output channels
+  instead of a sincos per element.  Fewer write-outs per product (more rows a block).
+- **Towards the tensor-core rate**: the shift is at 10-20% of it.  Try a larger tile per block
+  (128 rows, 64-128 centres), loads overlapping the MMAs, and the inner phasors from a table
+  per piece.
+- **The XMAC with K output slots in one launch** (the windows of each piece to its own slot)
+  instead of K launches, each zeroing and writing.  That is the short-piece cost.
+- **The shift in the XMAC's epilogue**, against the shift from DRAM.
+- **Lower sideband**, as mpifxcorr's channel frequencies.
+- **A check of the lag-window term** of the decorrelation estimate: time-domain data through a
+  station stage.
+
+## The GPU design (prototyped in phasecentrebench)
 
 - **Pieces from the same keyword.**  `maxNSBetweenUVShifts` sets the number of pieces a subint,
   K = ceil(subint / maxNS).  The subint's W windows are split as evenly as possible: piece k is

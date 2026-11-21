@@ -5,15 +5,15 @@ its `FINDINGS.md`.
 
 ## Now
 
-- [phase-centres](phase-centres/BACKLOG.md): a benchmark of the shift after the XMAC (direct, and as a matrix product).
+- [phase-centres](phase-centres/BACKLOG.md): phasecentrebench built and swept on the 2070; next the A100, then faster short averages.
 
 ## [phase-centres](phase-centres/BACKLOG.md)
 
 - Done: mpifxcorr's implementation read (docs/mpifxcorr.md).
-- Next: pieces from `maxNSBetweenUVShifts` (even split); delays per (antenna, centre); XMAC writing per piece.
-- Next: the shift after the XMAC, direct and as a tensor-core matrix product; then in the XMAC's epilogue.
-- Measure cost against centres (1-1000), windows per piece, averaging and stations, against a direct correlation.
-- Later: a NUFFT shift for centres far more than the channels averaged.
+- Done: phasecentrebench (pieces, delays per antenna, the shift naive / SIMT / tensor), swept on the 2070.
+- Next: the A100; the outer phasor by recurrence (short averages); larger tiles towards the tensor-core rate.
+- Next: the XMAC with K output slots in one launch (short pieces); the shift in the XMAC's epilogue.
+- Later: lower sideband; a time-domain check of the lag-window decorrelation; a NUFFT shift for centres ≫ channels averaged.
 
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)
 

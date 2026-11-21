@@ -13,10 +13,11 @@
 #
 # Each GPU architecture builds in its own build-sm<SM>/, objects and binaries both, so a build for
 # one never touches another's: build-sm80/fusebench and build-sm120/fusebench sit side by side and
-# switching between them rebuilds nothing.  fft-fusion/fusebench, xmac/xmacbench and
-# two-stage/twostagebench are links to the last build's binaries, for running by hand; the run-*.sh
-# scripts take the binaries for the GPU they find (common/scripts/bench-bin.sh), so jobs on
-# different GPUs sharing this checkout never run each other's.
+# switching between them rebuilds nothing.  fft-fusion/fusebench, xmac/xmacbench,
+# two-stage/twostagebench and phase-centres/phasecentrebench are links to the last build's
+# binaries, for running by hand; the run-*.sh scripts take the binaries for the GPU they find
+# (common/scripts/bench-bin.sh), so jobs on different GPUs sharing this checkout never run each
+# other's.
 #
 # Every setting can be given on the command line.  Without one:
 #   CUDA_HOME  $CUDAROOT (setup.bash), else $CUDA_HOME, else the CUDA holding the nvcc on PATH,
@@ -92,17 +93,19 @@ ifeq ($(filter clean mathdx,$(MAKECMDGOALS)),)
   $(info difx-prototyping: sm_$(SM) (from $(SM_FROM)), CUDA $(CUDA_HOME), MathDx $(MATHDX))
 endif
 
-all: fusebench xmacbench twostagebench
+all: fusebench xmacbench twostagebench phasecentrebench
 
 # the links to this architecture's binaries in each sub-project (always redone: the last build's
 # architecture wins)
-.PHONY: all fusebench xmacbench twostagebench mathdx clean
+.PHONY: all fusebench xmacbench twostagebench phasecentrebench mathdx clean
 fusebench: $(BUILD)/fusebench
 	ln -sfn ../$< fft-fusion/$@
 xmacbench: $(BUILD)/xmacbench
 	ln -sfn ../$< xmac/$@
 twostagebench: $(BUILD)/twostagebench
 	ln -sfn ../$< two-stage/$@
+phasecentrebench: $(BUILD)/phasecentrebench
+	ln -sfn ../$< phase-centres/$@
 
 # ---- fft-fusion: the station kernel (common/fused_inst.cu, once per FFT size) against gpudifx
 # today (common/unfused.cu), and the whole chain with the XMAC
@@ -139,6 +142,13 @@ $(BUILD)/twostagebench.o: two-stage/twostagebench.cu $(C)/twostage.cuh $(COMMON_
 $(BUILD)/twostage%.o: $(C)/twostage%.cu $(C)/twostage.cuh $(COMMON_H) | $(BUILD) $(MATHDX_DEP)
 	$(NVCC) $(FLAGS) $(DXFLAGS) -c $< -o $@
 
+# ---- phase-centres: the shift to many phase centres after the staged XMAC
+$(BUILD)/phasecentrebench: $(BUILD)/phasecentrebench.o $(BUILD)/xmac.o
+	$(NVCC) $(FLAGS) $^ -o $@
+
+$(BUILD)/phasecentrebench.o: phase-centres/phasecentrebench.cu $(C)/xmac.cuh $(C)/common.cuh $(C)/benchutil.cuh | $(BUILD)
+	$(NVCC) $(FLAGS) -c $< -o $@
+
 $(BUILD):
 	mkdir -p $@
 
@@ -156,5 +166,5 @@ $(MATHDX_STAMP):
 	touch $@
 
 clean:
-	rm -rf build-sm* fft-fusion/fusebench xmac/xmacbench two-stage/twostagebench
+	rm -rf build-sm* fft-fusion/fusebench xmac/xmacbench two-stage/twostagebench phase-centres/phasecentrebench
 
