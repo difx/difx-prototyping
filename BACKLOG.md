@@ -5,10 +5,7 @@ its `FINDINGS.md`.
 
 ## Now
 
-- Repository reorganisation (shared `common/`; `xmac/` and `two-stage/` split out of `fft-fusion/`;
-  README / FINDINGS / BACKLOG per sub-project): branch `refactor-layout`, to merge after an OzSTAR
-  test job.
-- Next up: [phase-centres](phase-centres/BACKLOG.md), starting from mpifxcorr's implementation.
+- [phase-centres](phase-centres/BACKLOG.md), starting from mpifxcorr's implementation.
 
 ## [phase-centres](phase-centres/BACKLOG.md)
 
