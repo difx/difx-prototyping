@@ -381,10 +381,31 @@ PFB first stage only (the WOLA option dropped).  `twostagebench` (`twostage.cuh`
     channel.
 - **Stage 2** (cuFFTDx, N2 = 128-8192): FFT, keep K bins (the in-band half for the DC and Nyquist
   coarse channels), FP16 in the staged XMAC's layout.
-- **The delay model:** an integer shift per coarse window, taken at the centre of its P x L1 window,
-  and a continuous fringe phase.
+- **The delay model, in the kernel:** an integer shift per coarse window, taken at the centre of its
+  P x L1 window, and a continuous fringe phase.  Nothing is uploaded or read per coarse window: the
+  kernel takes a delay polynomial per (antenna, subint) and a fringe polynomial per (antenna, band)
+  (`TwoStageModel`), plus the clock terms per (antenna, band).
+  - **Per block (thread 0, FP64):** the delay at window n0's centre, split into an integer and a
+    fraction, and the local rate; the fringe phase and rate at the block's first sample; the clock
+    terms of the fractional-sample phase.
+  - **Per window (FP32):** window n0 + k's delay is the block's fraction + rate x kH (+ d2 (kH)^2).
+    A block spans at most ~3500 samples, so this is at most 0.035 samples at 10 us/s and FP32
+    holds it to ~1e-9 samples.  Each thread that needs a window's shift or fraction (the fold, the
+    correction) recomputes it, with explicit round-to-nearest FMAs so every thread gets the same
+    bits.  Per-window arrays in shared memory instead (640 bytes a block) were slower where the
+    kernel sits at Turing's 64 KB of shared memory an SM: 32 coarse channels, 4/3, 4 taps,
+    0.427 ms/ms against 0.385 (by the arithmetic, 16.3 KB a block fits 4 blocks an SM and 17.0 KB
+    only 3; not profiled).
+  - **The limit:** a block's span has 16 samples of slack for shifts, so |rate| up to ~0.01 (100x
+    a spacecraft's); beyond that the kernel refuses the block and the check fails.
+  - **Before** (the "setup kernel" column): the host made an integer sample index, a fractional
+    delay and fringe terms per coarse window, and a separate FP64 kernel turned them into a
+    16-byte phase per (window, band) for stage 1 to read back: more bytes than the 2-bit data at
+    16-96 samples a window.
 - **The check:** a double-precision host reference of the whole chain (decode from the packed bytes,
   fold, DFT, corrections, stage-2 DFT) on 4 series per run, coarse channels 0 and Nc among them.
+  The bench nulls every per-window array stage 1 used to read.  Also checked at rates of
+  ±1e-4 and accelerations of ±0.5 s/s^2 (unphysical, to exercise the in-block quadratic term).
   All 18 configurations pass at about 4e-4 rms (FP16 rounding of the span, the folded rows, the
   coarse series and the spectra).
 - **What got it there.**  The first version decoded each sample once per window it is in (P x O
@@ -394,7 +415,8 @@ PFB first stage only (the WOLA option dropped).  `twostagebench` (`twostage.cuh`
   4.5x in all.
 
 6 antennas, 8 bands of 64 MHz, 2 bits, 16 stage-2 windows; ms per ms of data
-(`results-local/ar313-adeller-twostage-20261121-002831`).
+(`results-local/ar313-adeller-twostage-20261121-120407`; with the setup kernel,
+`results-local/ar313-adeller-twostage-20261121-002831`).
 - **Slowdown** is the total over the single-stage end-to-end kernel at its largest size, 8192
   channels (FP16 spectra, the fastest variant, 0.282 ms/ms).
 - **Against gpudifx today** is at the same channel count: 1.536 ms/ms at 49152 channels, 1.376 at
@@ -403,32 +425,35 @@ PFB first stage only (the WOLA option dropped).  `twostagebench` (`twostage.cuh`
   average fractional-delay residual (0.013, 0.003, 0.001% at Nc = 16, 32, 64).
 - **Alias** is the worst image and **ripple** the passband ripple (both for line work).
 
-| Nc | O | taps | channels | stage 1 | stage 2 | setup | total | slowdown | against gpudifx | loss | alias | ripple |
+| Nc | O | taps | channels | stage 1 | stage 2 | total | total, setup kernel | slowdown | against gpudifx | loss | alias | ripple |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 16 | 4/3 | 4 | 49152 | 0.469 | 0.094 | 0.060 | 0.618 | 2.19 | 2.49x | 0.22% | −25 dB | 0.76 dB |
-| 16 | 4/3 | 8 | 49152 | 0.513 | 0.094 | 0.060 | 0.662 | 2.34 | 2.32x | < 0.1% | −39 dB | 0.14 dB |
-| 16 | 4/3 | 16 | 49152 | 0.605 | 0.094 | 0.060 | 0.753 | 2.67 | 2.04x | < 0.1% | −65 dB | 0.004 dB |
-| 32 | 4/3 | 4 | 49152 | 0.387 | 0.091 | 0.030 | 0.500 | 1.77 | 3.07x | 0.22% | −25 dB | 0.76 dB |
-| **32** | **4/3** | **8** | **49152** | **0.490** | **0.091** | **0.030** | **0.601** | **2.13** | **2.55x** | **< 0.1%** | **−39 dB** | **0.14 dB** |
-| **32** | **4/3** | **16** | **49152** | **0.597** | **0.091** | **0.030** | **0.712** | **2.52** | **2.16x** | **< 0.1%** | **−65 dB** | **0.004 dB** |
-| 64 | 4/3 | 4 | 49152 | 0.494 | 0.089 | 0.015 | 0.590 | 2.09 | 2.61x | 0.22% | −25 dB | 0.76 dB |
-| 64 | 4/3 | 8 | 49152 | 0.568 | 0.089 | 0.015 | 0.662 | 2.34 | 2.32x | < 0.1% | −39 dB | 0.14 dB |
-| 64 | 4/3 | 16 | 49152 | 0.854 | 0.089 | 0.015 | 0.954 | 3.38 | 1.61x | < 0.1% | −65 dB | 0.004 dB |
-| 16 | 2 | 4 | 65536 | 0.640 | 0.178 | 0.089 | 0.903 | 3.20 | 1.52x | < 0.05% | −64 dB | 0.011 dB |
-| 16 | 2 | 8 | 65536 | 0.705 | 0.178 | 0.089 | 0.971 | 3.44 | 1.42x | < 0.05% | −115 dB | 0 |
-| 16 | 2 | 16 | 65536 | 0.837 | 0.178 | 0.089 | 1.103 | 3.91 | 1.25x | < 0.1% | −207 dB | 0 |
-| **32** | **2** | **4** | **65536** | **0.526** | **0.133** | **0.045** | **0.699** | **2.48** | **1.97x** | **< 0.05%** | **−64 dB** | **0.011 dB** |
-| 32 | 2 | 8 | 65536 | 0.605 | 0.133 | 0.045 | 0.777 | 2.75 | 1.77x | < 0.05% | −115 dB | 0 |
-| 32 | 2 | 16 | 65536 | 0.828 | 0.133 | 0.045 | 1.004 | 3.56 | 1.37x | < 0.1% | −207 dB | 0 |
-| 64 | 2 | 4 | 65536 | 0.667 | 0.131 | 0.023 | 0.819 | 2.90 | 1.68x | < 0.05% | −64 dB | 0.011 dB |
-| 64 | 2 | 8 | 65536 | 0.777 | 0.131 | 0.023 | 0.929 | 3.29 | 1.48x | < 0.05% | −115 dB | 0 |
-| 64 | 2 | 16 | 65536 | 0.990 | 0.131 | 0.023 | 1.143 | 4.05 | 1.20x | < 0.1% | −207 dB | 0 |
+| 16 | 4/3 | 4 | 49152 | 0.462 | 0.095 | 0.551 | 0.618 | 1.95 | 2.78x | 0.22% | −25 dB | 0.76 dB |
+| 16 | 4/3 | 8 | 49152 | 0.506 | 0.094 | 0.591 | 0.662 | 2.09 | 2.60x | < 0.1% | −39 dB | 0.14 dB |
+| 16 | 4/3 | 16 | 49152 | 0.597 | 0.093 | 0.685 | 0.753 | 2.43 | 2.24x | < 0.1% | −65 dB | 0.004 dB |
+| 32 | 4/3 | 4 | 49152 | 0.385 | 0.091 | 0.468 | 0.500 | 1.66 | 3.28x | 0.22% | −25 dB | 0.76 dB |
+| **32** | **4/3** | **8** | **49152** | **0.490** | **0.091** | **0.572** | **0.601** | **2.03** | **2.69x** | **< 0.1%** | **−39 dB** | **0.14 dB** |
+| **32** | **4/3** | **16** | **49152** | **0.603** | **0.090** | **0.682** | **0.712** | **2.42** | **2.25x** | **< 0.1%** | **−65 dB** | **0.004 dB** |
+| 64 | 4/3 | 4 | 49152 | 0.497 | 0.089 | 0.578 | 0.590 | 2.05 | 2.66x | 0.22% | −25 dB | 0.76 dB |
+| 64 | 4/3 | 8 | 49152 | 0.570 | 0.089 | 0.649 | 0.662 | 2.30 | 2.37x | < 0.1% | −39 dB | 0.14 dB |
+| 64 | 4/3 | 16 | 49152 | 0.863 | 0.089 | 0.937 | 0.954 | 3.32 | 1.64x | < 0.1% | −65 dB | 0.004 dB |
+| 16 | 2 | 4 | 65536 | 0.630 | 0.178 | 0.803 | 0.903 | 2.85 | 1.71x | < 0.05% | −64 dB | 0.011 dB |
+| 16 | 2 | 8 | 65536 | 0.692 | 0.178 | 0.870 | 0.971 | 3.08 | 1.58x | < 0.05% | −115 dB | 0 |
+| 16 | 2 | 16 | 65536 | 0.828 | 0.178 | 1.005 | 1.103 | 3.56 | 1.37x | < 0.1% | −207 dB | 0 |
+| **32** | **2** | **4** | **65536** | **0.523** | **0.133** | **0.651** | **0.699** | **2.31** | **2.11x** | **< 0.05%** | **−64 dB** | **0.011 dB** |
+| 32 | 2 | 8 | 65536 | 0.603 | 0.133 | 0.732 | 0.777 | 2.60 | 1.88x | < 0.05% | −115 dB | 0 |
+| 32 | 2 | 16 | 65536 | 0.834 | 0.133 | 0.966 | 1.004 | 3.43 | 1.42x | < 0.1% | −207 dB | 0 |
+| 64 | 2 | 4 | 65536 | 0.674 | 0.131 | 0.804 | 0.819 | 2.85 | 1.71x | < 0.05% | −64 dB | 0.011 dB |
+| 64 | 2 | 8 | 65536 | 0.782 | 0.131 | 0.912 | 0.929 | 3.23 | 1.51x | < 0.05% | −115 dB | 0 |
+| 64 | 2 | 16 | 65536 | 0.992 | 0.130 | 1.122 | 1.143 | 3.98 | 1.23x | < 0.1% | −207 dB | 0 |
 
-- **Cost.** Two stages cost 1.8-4x the single-stage kernel per ms of data, and are 1.2-3.1x faster
+- **Cost.** Two stages cost 1.7-4x the single-stage kernel per ms of data, and are 1.2-3.3x faster
   than gpudifx today at the same channel count.
+- **The in-kernel delay model** saved the whole setup (0.015-0.09 ms/ms, 2-11% of the total, most at
+  16 coarse channels) and left stage 1's own time unchanged (within 1-2%).
 - **The coarse channel count.** 32 coarse channels is the sweet spot.
-  - At 16, the per-coarse-window setup (the fractional-sample phases: FP64, slow on the 2070) and
-    the stage-2 FFT (8192 points at O = 2) cost more.
+  - At 16, stage 1 is up to 20% slower than at 32 (4 taps; the same at 16 taps) and the stage-2
+    FFT (8192 points at O = 2) costs more.  With the setup gone, 16 is within 5% of 32 at 8 and 16
+    taps at O = 4/3.
   - At 64, stage 1's blocks hold only 16 windows (L1 = 128), so the overlap between blocks is
     decoded up to 3x over, and 16 taps of 128 points make the fold heavy.
 - **The oversampling** costs about 1.3-1.5x (O = 2 against 4/3: 1.5x the coarse windows and twice
@@ -439,12 +464,10 @@ PFB first stage only (the WOLA option dropped).  `twostagebench` (`twostage.cuh`
   transition.  Everything else is within the exact model's ±0.07% of zero; the edge term 0.13 / K
   is 0.002-0.017% at these K.
 - **The choices** (bold):
-  - 32 coarse channels, O = 4/3, 8 taps: 2.1x the single stage, < 0.1% loss, −39 dB images.
-  - 16 taps if lines matter: 2.5x, −65 dB images.
-  - O = 2, 4 taps for powers of two: 2.5x, −64 dB images, 65536 channels.
+  - 32 coarse channels, O = 4/3, 8 taps: 2.0x the single stage, < 0.1% loss, −39 dB images.
+  - 16 taps if lines matter: 2.4x, −65 dB images.
+  - O = 2, 4 taps for powers of two: 2.3x, −64 dB images, 65536 channels.
 - **Not yet optimised:**
-  - The setup computes the fractional-sample phase per coarse window in FP64; in-kernel from a
-    per-block delay model would remove it.
   - Stage 1's blocks overlap by P x L1 − H samples, decoded twice.  A block sliding along the
     series, keeping its tail, would remove that.
   - The A100 and RTX PRO 6000 are still to run.
@@ -453,7 +476,8 @@ PFB first stage only (the WOLA option dropped).  `twostagebench` (`twostage.cuh`
 
 The single-stage kernel's largest size is 8192 channels, so the slowdown above compares 49152-65536
 channels with 8192.  The same sweep at about 8192 channels (`NCHAN=8192 NWIN=128 ./run-twostage.sh`,
-the same data per run; `results-local/ar313-adeller-twostage-8192-20261121-104326`):
+the same data per run; `results-local/ar313-adeller-twostage-8192-20261121-120452`; with the setup
+kernel, `results-local/ar313-adeller-twostage-8192-20261121-104326`):
 - **The channel counts.** O = 2 gives 8192 exactly at every Nc (N2 = 1024, 512, 256 at Nc = 16, 32,
   64).  O = 4/3 cannot: with power-of-two L1 and N2 the nearest is 6144 (N2 = 512, 256, 128),
   or 12288.  16 coarse channels with a 512-point stage 2 is 4096 channels at O = 2, 6144 at 4/3.
@@ -463,36 +487,37 @@ the same data per run; `results-local/ar313-adeller-twostage-8192-20261121-10432
   so 16 coarse channels lose less in all than 32.
 - **gpudifx today** is 1.540 ms/ms at 6144 channels (a 12288-point cuFFT) and 1.088 at 8192.
 
-| Nc | O | taps | N2 | channels | stage 1 | stage 2 | setup | total | slowdown | against gpudifx | edge b/K | frac. delay |
+| Nc | O | taps | N2 | channels | stage 1 | stage 2 | total | total, setup kernel | slowdown | against gpudifx | edge b/K | frac. delay |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 16 | 4/3 | 4 | 512 | 6144 | 0.466 | 0.093 | 0.060 | 0.627 | 2.22 | 2.46x | 0.034% | 0.013% |
-| 16 | 4/3 | 8 | 512 | 6144 | 0.518 | 0.093 | 0.060 | 0.661 | 2.34 | 2.33x | 0.032% | 0.013% |
-| 16 | 4/3 | 16 | 512 | 6144 | 0.605 | 0.093 | 0.060 | 0.752 | 2.67 | 2.05x | 0.036% | 0.013% |
-| 32 | 4/3 | 4 | 256 | 6144 | 0.387 | 0.080 | 0.030 | 0.488 | 1.73 | 3.15x | 0.068% | 0.003% |
-| **32** | **4/3** | **8** | **256** | **6144** | **0.490** | **0.079** | **0.030** | **0.590** | **2.09** | **2.61x** | **0.064%** | **0.003%** |
-| 32 | 4/3 | 16 | 256 | 6144 | 0.602 | 0.079 | 0.030 | 0.700 | 2.48 | 2.20x | 0.071% | 0.003% |
-| 64 | 4/3 | 4 | 128 | 6144 | 0.490 | 0.106 | 0.015 | 0.606 | 2.15 | 2.54x | 0.136% | 0.001% |
-| 64 | 4/3 | 8 | 128 | 6144 | 0.567 | 0.106 | 0.015 | 0.678 | 2.40 | 2.27x | 0.128% | 0.001% |
-| 64 | 4/3 | 16 | 128 | 6144 | 0.857 | 0.106 | 0.015 | 0.971 | 3.44 | 1.59x | 0.142% | 0.001% |
-| 16 | 2 | 4 | 1024 | 8192 | 0.636 | 0.136 | 0.090 | 0.860 | 3.05 | 1.27x | 0.018% | 0.013% |
-| 16 | 2 | 8 | 1024 | 8192 | 0.705 | 0.136 | 0.090 | 0.929 | 3.29 | 1.17x | 0.017% | 0.013% |
-| 16 | 2 | 16 | 1024 | 8192 | 0.837 | 0.136 | 0.090 | 1.061 | 3.76 | 1.03x | 0.018% | 0.013% |
-| **32** | **2** | **4** | **512** | **8192** | **0.526** | **0.133** | **0.045** | **0.699** | **2.48** | **1.56x** | **0.036%** | **0.003%** |
-| 32 | 2 | 8 | 512 | 8192 | 0.601 | 0.133 | 0.045 | 0.777 | 2.76 | 1.40x | 0.034% | 0.003% |
-| 32 | 2 | 16 | 512 | 8192 | 0.828 | 0.133 | 0.045 | 1.005 | 3.56 | 1.08x | 0.036% | 0.003% |
-| 64 | 2 | 4 | 256 | 8192 | 0.671 | 0.111 | 0.023 | 0.799 | 2.83 | 1.36x | 0.073% | 0.001% |
-| 64 | 2 | 8 | 256 | 8192 | 0.777 | 0.111 | 0.023 | 0.909 | 3.22 | 1.20x | 0.068% | 0.001% |
-| 64 | 2 | 16 | 256 | 8192 | 0.991 | 0.111 | 0.023 | 1.124 | 3.98 | 0.97x | 0.073% | 0.001% |
+| 16 | 4/3 | 4 | 512 | 6144 | 0.462 | 0.094 | 0.551 | 0.627 | 1.95 | 2.79x | 0.034% | 0.013% |
+| 16 | 4/3 | 8 | 512 | 6144 | 0.506 | 0.093 | 0.590 | 0.661 | 2.09 | 2.61x | 0.032% | 0.013% |
+| 16 | 4/3 | 16 | 512 | 6144 | 0.602 | 0.093 | 0.684 | 0.752 | 2.43 | 2.25x | 0.036% | 0.013% |
+| 32 | 4/3 | 4 | 256 | 6144 | 0.385 | 0.079 | 0.456 | 0.488 | 1.62 | 3.37x | 0.068% | 0.003% |
+| **32** | **4/3** | **8** | **256** | **6144** | **0.490** | **0.079** | **0.560** | **0.590** | **1.98** | **2.75x** | **0.064%** | **0.003%** |
+| 32 | 4/3 | 16 | 256 | 6144 | 0.603 | 0.079 | 0.671 | 0.700 | 2.38 | 2.29x | 0.071% | 0.003% |
+| 64 | 4/3 | 4 | 128 | 6144 | 0.497 | 0.105 | 0.594 | 0.606 | 2.10 | 2.59x | 0.136% | 0.001% |
+| 64 | 4/3 | 8 | 128 | 6144 | 0.570 | 0.105 | 0.665 | 0.678 | 2.36 | 2.31x | 0.128% | 0.001% |
+| 64 | 4/3 | 16 | 128 | 6144 | 0.855 | 0.106 | 0.954 | 0.971 | 3.38 | 1.61x | 0.142% | 0.001% |
+| 16 | 2 | 4 | 1024 | 8192 | 0.630 | 0.136 | 0.761 | 0.860 | 2.70 | 1.43x | 0.018% | 0.013% |
+| 16 | 2 | 8 | 1024 | 8192 | 0.692 | 0.136 | 0.831 | 0.929 | 2.95 | 1.31x | 0.017% | 0.013% |
+| 16 | 2 | 16 | 1024 | 8192 | 0.828 | 0.136 | 0.964 | 1.061 | 3.42 | 1.13x | 0.018% | 0.013% |
+| **32** | **2** | **4** | **512** | **8192** | **0.528** | **0.133** | **0.651** | **0.699** | **2.31** | **1.67x** | **0.036%** | **0.003%** |
+| 32 | 2 | 8 | 512 | 8192 | 0.600 | 0.133 | 0.733 | 0.777 | 2.60 | 1.49x | 0.034% | 0.003% |
+| 32 | 2 | 16 | 512 | 8192 | 0.834 | 0.133 | 0.967 | 1.005 | 3.43 | 1.13x | 0.036% | 0.003% |
+| 64 | 2 | 4 | 256 | 8192 | 0.675 | 0.111 | 0.785 | 0.799 | 2.78 | 1.39x | 0.073% | 0.001% |
+| 64 | 2 | 8 | 256 | 8192 | 0.782 | 0.111 | 0.892 | 0.909 | 3.16 | 1.22x | 0.068% | 0.001% |
+| 64 | 2 | 16 | 256 | 8192 | 0.992 | 0.111 | 1.103 | 1.124 | 3.91 | 0.99x | 0.073% | 0.001% |
 
-- **The slowdown hardly changes with the channel count** (2.09 here against 2.13 at 49152 for
-  Nc = 32, O = 4/3, 8 taps).  Stage 1 is 70-90% of the total, and its cost per sample does not
+- **The slowdown hardly changes with the channel count** (1.98 here against 2.03 at 49152 for
+  Nc = 32, O = 4/3, 8 taps).  Stage 1 is 80-90% of the total, and its cost per sample does not
   depend on the final channel count; stage 2 is 0.08-0.14 ms/ms at either size.  The ~2x is the
   cost of the PFB itself, against a single stage that does one pass over the data.
-- **16 coarse channels is not the fastest.** Its stage 1 is up to 20% slower than 32's (the same
-  at 16 taps), and its setup is twice 32's (twice the coarse windows, FP64 on the
-  2070).  The setup would go with the in-kernel phases; stage 1 would remain.
-- **Choices at about 8k:** the same as at 64k.  32 coarse channels, O = 4/3, 8 taps (6144 channels,
-  2.1x, < 0.1% loss); O = 2, 4 taps for 8192 exactly (2.5x).
+- **16 coarse channels is not the fastest, but close.** With the setup in the kernel it is 5% behind
+  32 at 8 taps and 2% at 16 (O = 4/3); at 4 taps its stage 1 is still 20% slower.  It also loses
+  less (the edge term above), so at about 8k channels 16 x 8 taps at 4/3 (2.09x) is as good a
+  choice as 32 x 8 (1.98x).
+- **Choices at about 8k:** 32 (or 16) coarse channels, O = 4/3, 8 taps (6144 channels, 2.0x,
+  < 0.1% loss); O = 2, 4 taps for 8192 exactly (2.3x).
 
 ## Implementation plan
 

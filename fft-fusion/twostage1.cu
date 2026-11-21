@@ -41,13 +41,39 @@ __device__ __forceinline__ float level(unsigned c) {
     } else return ((float)c - 7.5f) * (float)(1.0 / FourBit1sigma);
 }
 
-struct Stage1Block {            // per-block constants, computed by one thread
-    long base, frame0;
+struct Stage1Block {            // per-block constants, computed by one thread (FP64)
+    long base, frame0;          // window n0's first sample; its frame
     unsigned sif0, parity0;
-    unsigned long long A, B;    // fringe slope and phase, 2^-64 turns
+    unsigned long long A, B;    // fringe slope and phase at base, 2^-64 turns
+    unsigned long long slopeClk, offClk;   // the clock terms of the fractional-sample phase, 2^-64 turns
+    float f, r, c2;             // the delay at window n0's centre less its integer shift, the rate and
+                                // d2 there (samples): window n0 + k's delay is f + r kH + c2 (kH)^2 more
+    float offPerFrac;           // the phase offset per sample of fractional delay (fracFreqOffset / fs), turns
 };
 
+// Window n0 + k's first sample (from the block's base) and fractional delay (samples).  Explicit
+// round-to-nearest intrinsics, so every thread that computes it gets the same bits (no FMA
+// contraction differing between call sites): the fold's shift and the correction's fraction agree.
+__device__ __forceinline__ void windowDelay(const Stage1Block& b, int k, int H, int& off, float& frac) {
+    const float kh = (float)(k * H);
+    const float x = __fmaf_rn(kh, __fmaf_rn(kh, b.c2, b.r), b.f);
+    const float sh = rintf(x);
+    off = k * H + (int)sh;
+    frac = __fsub_rn(x, sh);
+}
+
+__device__ __forceinline__ unsigned long long turnsToFixed(double x) {    // [0, 1) turns -> 2^-64 turns
+    x -= floor(x);
+    return x < 1.0 ? __double2ull_rz(x * 18446744073709551616.0) : 0ull;
+}
+
 // Block: FPB consecutive coarse windows n0 .. of one (antenna, band), 256 threads.
+//  0. The delay model (TwoStageModel: a polynomial per antenna and subint) is evaluated in FP64 once,
+//     at window n0's centre, by thread 0 (with the fringe polynomial at the block's first sample and
+//     the clock terms).  Each window's integer shift and fractional delay follow in FP32 from that
+//     value and the local rate: across a block (at most ~3500 samples) the delay changes by
+//     rate x 3500 samples (0.035 at 10 us/s), so FP32 holds it to ~1e-9 samples.  Nothing is read
+//     per coarse window.
 //  1. The block's span of samples (from window n0's first to the last window's last) is decoded
 //     once into shared memory: level, ALTSIGN by the absolute sample's parity, the fringe rotation
 //     e^{-2 pi i (A s + B)} of window n0 (s from its first sample; with a continuous fringe model
@@ -61,30 +87,40 @@ struct Stage1Block {            // per-block constants, computed by one thread
 template<class FFT, int NBIT, unsigned ROW>
 __launch_bounds__(FFT::max_threads_per_block)
 __global__ void stage1_kernel(Geometry g1, PackedInput d, const float* __restrict__ taps, FracParams fp,
-                              int Nc, int P, int H, int spanMax, __half2* coarse, float scale) {
+                              TwoStageModel model, int Nc, int P, int H, int spanMax, __half2* coarse, float scale) {
     using complex_type = typename FFT::value_type;
     constexpr unsigned L1 = size_of<FFT>::value, FPB = FFT::ffts_per_block, EPT = FFT::input_ept;
     static_assert(FFT::stride * EPT == L1, "a thread's elements cover the FFT");
     extern __shared__ __align__(alignof(float4)) unsigned char smem[];
+    constexpr unsigned LOG2L1 = L1 == 32 ? 5 : L1 == 64 ? 6 : 7;
     __shared__ Stage1Block blk;
     const int band = blockIdx.y, ant = blockIdx.z, nwin = g1.nwin, nband = g1.nband;
     const int n0 = blockIdx.x * FPB, nLast = min(n0 + (int)FPB, nwin) - 1;
-    const int* sidx = d.sampleIndex + (size_t)ant * nwin;
     const unsigned nthreads = blockDim.x * blockDim.y, tid = threadIdx.y * blockDim.x + threadIdx.x;
     if (tid == 0) {
-        const long base = sidx[n0], fs = d.ms.framesamples;
+        const double* dm = model.delay + 3 * ant;
+        const double xc = (double)n0 * H + 0.5 * (P * (int)L1 - 1);       // window n0's centre
+        const double tau = dm[0] + xc * (dm[1] + xc * dm[2]);
+        const double I = rint(tau);
+        const long base = (long)n0 * H + (long)I, fs = d.ms.framesamples;
         const long frame0 = base >= 0 ? base / fs : -((-base + fs - 1) / fs);
-        const size_t sp0 = ((size_t)ant * nwin + n0) * nband + band;
-        double a = d.bigA[sp0], b = d.bigBred[sp0];
-        a -= floor(a);
-        b -= floor(b);
-        const double two64 = 18446744073709551616.0;
+        const double* fm = model.fringe + 3 * ((size_t)ant * nband + band);
+        const double xb = (double)base;
+        const int ab = ant * nband + band;
+        const double clk = -fp.clockOffsets[ab] + fp.clockOffsetsDelta[ab] / 2;     // us
         blk = {base, frame0, (unsigned)(base - frame0 * fs), (unsigned)((d.datasamples + base) & 1),
-               a < 1.0 ? __double2ull_rz(a * two64) : 0ull, b < 1.0 ? __double2ull_rz(b * two64) : 0ull};
+               turnsToFixed(fm[1] + 2 * fm[2] * xb), turnsToFixed(fm[0] + xb * (fm[1] + xb * fm[2])),
+               turnsToFixed(clk * fp.recordedBandwidth / Nc), turnsToFixed(clk * fp.fracFreqOffset[ab]),
+               (float)(tau - I), (float)(dm[1] + 2 * dm[2] * xc), (float)dm[2],
+               (float)(fp.fracFreqOffset[ab] / (2 * fp.recordedBandwidth))};
     }
     __syncthreads();
-    const long base = blk.base;
-    const int len = (int)(sidx[nLast] - base) + P * (int)L1;
+    int len;
+    {
+        float fr;
+        windowDelay(blk, nLast - n0, H, len, fr);
+        len += P * (int)L1;
+    }
     if (len > spanMax) {                                             // the whole block
         if (tid == 0) printf("stage 1: span %d > %d samples\n", len, spanMax);
         return;
@@ -130,7 +166,10 @@ __global__ void stage1_kernel(Geometry g1, PackedInput d, const float* __restric
 #pragma unroll
         for (unsigned k = 0; k < WPT; k++) {
             const int y = (int)(lane + k * LANES);
-            w[k] = span + (n0 + y <= nLast ? sidx[n0 + y] - base : 0) + t;
+            int off = 0;
+            float fr;
+            if (n0 + y <= nLast) windowDelay(blk, y, H, off, fr);
+            w[k] = span + off + t;
         }
         float2 acc[WPT];
 #pragma unroll
@@ -163,10 +202,22 @@ __global__ void stage1_kernel(Geometry g1, PackedInput d, const float* __restric
     FFT().execute(td, smem);
     __syncthreads();
     __half2* tile = reinterpret_cast<__half2*>(smem);                // [Nc + 1][FPB]
-    const bool valid = active && fp.validSamples[(size_t)ant * nwin + n];
-    const ulonglong2 ph = valid ? fp.fixedPhase[((size_t)ant * nwin + n) * nband + band] : make_ulonglong2(0, 0);
+    // window validity: invalid frames decode to zero (a per-(antenna, subint) flag for the delay model's
+    // validity would go here)
+    const bool valid = active;
+    ulonglong2 ph;
+    {
+        // FracRotateFixed's (offset, slope) with bigA = fractional delay (us) less the clock: the slope
+        // fse bw / Nc = frac / L1 turns a channel; frac / L1 x 2^64 in FP32 (2^64 / L1 a power of two)
+        int off;
+        float fr;
+        windowDelay(blk, (int)threadIdx.y, H, off, fr);
+        float v = fr * blk.offPerFrac;
+        v -= floorf(v);
+        ph = make_ulonglong2(blk.offClk + (v < 1.f ? __float2ull_rz(v * 18446744073709551616.f) : 0ull),
+                             blk.slopeClk + (unsigned long long)__float2ll_rn(fr * (float)(1ull << (64 - LOG2L1))));
+    }
     const bool conjDC = fp.bandFlags[ant * nband + band] & FUSE_BAND_CONJ_DC;
-    constexpr unsigned LOG2L1 = L1 == 32 ? 5 : L1 == 64 ? 6 : 7;
 #pragma unroll
     for (unsigned i = 0; i < FFT::output_ept; i++) {
         const unsigned c = threadIdx.x + i * FFT::stride;
@@ -199,7 +250,7 @@ __global__ void stage1_kernel(Geometry g1, PackedInput d, const float* __restric
 
 template<unsigned L1, int NBIT>
 static void launch(const TwoStagePlan& t, const Geometry& g1, const PreVariant& pre, const FracParams& p,
-                   __half2* coarse, float scale, cudaStream_t st) {
+                   const TwoStageModel& m, __half2* coarse, float scale, cudaStream_t st) {
     using C = Stage1FFT<L1>;
     using FFT = typename C::FFT;
     constexpr unsigned FPB = C::FPB;
@@ -213,17 +264,17 @@ static void launch(const TwoStagePlan& t, const Geometry& g1, const PreVariant& 
         set = smem;
     }
     const dim3 grid((g1.nwin + FPB - 1) / FPB, g1.nband, g1.nant);
-    kernel<<<grid, FFT::block_dim, smem, st>>>(g1, pre.pk, pre.window, p, t.Nc, t.P, t.H, spanMax, coarse, scale);
+    kernel<<<grid, FFT::block_dim, smem, st>>>(g1, pre.pk, pre.window, p, m, t.Nc, t.P, t.H, spanMax, coarse, scale);
     CHECK_CUDA(cudaGetLastError());
 }
 
 template<unsigned L1>
 static void byBits(const TwoStagePlan& t, const Geometry& g1, const PreVariant& pre, const FracParams& p,
-                   __half2* coarse, float scale, cudaStream_t st) {
+                   const TwoStageModel& m, __half2* coarse, float scale, cudaStream_t st) {
     switch (pre.pk.ms.nbit) {
-    case 1: launch<L1, 1>(t, g1, pre, p, coarse, scale, st); break;
-    case 2: launch<L1, 2>(t, g1, pre, p, coarse, scale, st); break;
-    case 4: launch<L1, 4>(t, g1, pre, p, coarse, scale, st); break;
+    case 1: launch<L1, 1>(t, g1, pre, p, m, coarse, scale, st); break;
+    case 2: launch<L1, 2>(t, g1, pre, p, m, coarse, scale, st); break;
+    case 4: launch<L1, 4>(t, g1, pre, p, m, coarse, scale, st); break;
     default: fprintf(stderr, "two-stage: 1, 2 or 4 bits\n"); exit(2);
     }
 }
@@ -233,11 +284,11 @@ bool twoStage1Supported(int L1, int nbit) {
 }
 
 void launchStage1(const TwoStagePlan& t, const Geometry& g1, const PreVariant& pre, const FracParams& p,
-                  __half2* coarse, float scale1, cudaStream_t st) {
+                  const TwoStageModel& m, __half2* coarse, float scale1, cudaStream_t st) {
     switch (t.L1) {
-    case 32: byBits<32>(t, g1, pre, p, coarse, scale1, st); break;
-    case 64: byBits<64>(t, g1, pre, p, coarse, scale1, st); break;
-    case 128: byBits<128>(t, g1, pre, p, coarse, scale1, st); break;
+    case 32: byBits<32>(t, g1, pre, p, m, coarse, scale1, st); break;
+    case 64: byBits<64>(t, g1, pre, p, m, coarse, scale1, st); break;
+    case 128: byBits<128>(t, g1, pre, p, m, coarse, scale1, st); break;
     default: fprintf(stderr, "two-stage: stage-1 FFT of 32, 64 or 128 points, not %d\n", t.L1); exit(2);
     }
 }

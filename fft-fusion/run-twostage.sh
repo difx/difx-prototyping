@@ -71,7 +71,7 @@ except (OSError, AttributeError):
 ref = {r["os"]: float(r["ms_per_ms"]) for r in rows if r["name"].startswith("gpudifx today")}
 print("ms per ms of data; slowdown: two-stage total / the single-stage end-to-end kernel at 8192 channels "
       f"({single:.4f} ms/ms)" if single else "ms per ms of data")
-print(f"{'Nc':>3} {'O':>4} {'taps':>4} {'nchan':>6} {'stage 1':>8} {'stage 2':>8} {'setup':>7} {'total':>7} "
+print(f"{'Nc':>3} {'O':>4} {'taps':>4} {'nchan':>6} {'stage 1':>8} {'stage 2':>8} {'total':>7} "
       f"{'slowdown':>8} {'vs gpudifx':>10}")
 key = lambda r: (r["os"], int(r["nc"]), int(r["taps"]))
 seen = {}
@@ -81,7 +81,7 @@ for r in rows:
 for (os, nc, taps), v in sorted(seen.items(), key=lambda kv: (kv[0][0] != "4:3", kv[0][1], kv[0][2])):
     tot = v.get("two stages: total")
     print(f"{nc:3d} {os:>4} {taps:4d} {v['nchan']:6d} {v.get('two stages: stage 1 (PFB, coarse FFT, corrections)', 0):8.4f} "
-          f"{v.get('two stages: stage 2 (fine FFT)', 0):8.4f} {v.get('two stages: setup (fractional-sample phases)', 0):7.4f} "
+          f"{v.get('two stages: stage 2 (fine FFT)', 0):8.4f} "
           f"{tot:7.4f} {tot / single if single else 0:8.2f} {ref.get(os, 0) / tot:9.2f}x")
 print(f"gpudifx today: {', '.join(f'{v:.4f} ms/ms at O = {k}' for k, v in ref.items())}"
       + (f"; at 8192 channels {single_gdx:.4f}" if single_gdx else ""))

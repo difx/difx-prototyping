@@ -1641,17 +1641,10 @@ All of these are `fusebench` options (`--taper`, `--overlap`, `--window tukey|si
     stage.  Two stages cost ~2x one per ms of data whatever the final channel count; their loss is
     < 0.1% except with 4 taps at O = 4/3.
   - **Next:** the A100 and RTX PRO 6000; the decode overlap between stage-1 blocks; the whole chain
-    with the staged XMAC; and the setup in the kernel.  The setup is now a separate kernel, one
-    thread per (antenna, coarse window, band), turning a host-made fractional delay per coarse
-    window into a fixed-point phase offset and slope (FP64, 16 bytes written and read back per
-    window and band), with an integer sample index per coarse window uploaded as well.  Per coarse
-    window (16-96 samples a band) that metadata is larger than the 2-bit data itself.  In the kernel: pass the
-    delay polynomial per (antenna, subint) (mpifxcorr's interpolator) and the clock and LO terms per
-    (antenna, band); stage 1's thread 0 evaluates it in FP64 once per block (as it already makes the
-    block's fringe constants), and each window's integer shift and fractional delay follow from the
-    block's value and the local rate in FP32 (a block spans a few thousand samples, so the change is
-    a few hundredths of a sample).  See the root README's "For DiFX proper" for reporting the
-    losses at startup.  The original note: (say above 512 channels): a coarse
+    with the staged XMAC.  Done: the delay model in the kernel (a polynomial per antenna and subint,
+    evaluated in FP64 once per block of coarse windows, each window's shift and fraction in FP32
+    from it; nothing per coarse window), which saved 2-11% (docs/two-stage.md).  See the root
+    README's "For DiFX proper" for reporting the losses at startup.  The original note: (say above 512 channels): a coarse
   first stage (e.g. 32 channels), then fringe rotation and fractional-sample correction, then a
   second stage of 32 x 32 channels. The fractional-sample correction stays accurate (it becomes
   inaccurate with very long windows and high fringe rates), and two short FFTs may be faster

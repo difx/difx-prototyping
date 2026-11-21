@@ -107,6 +107,7 @@ static void usage() {
 "  --bw MHz        bandwidth per band, default 64\n"
 "  --nwin N        stage-2 windows (the XMAC's) per subint, default 16\n"
 "  --rate R        delay rate, s/s (the integer shifts and fractional delays per coarse window follow it), default 3e-6\n"
+"  --accel A       delay acceleration, s/s^2, default 0\n"
 "  --reps N, --warmup N, --seed N, --device N\n"
 "  --check N       (antenna, band, coarse channel, window) series checked against a double-precision\n"
 "                  reference of the whole chain, default 4 (always coarse channels 0 and N among them)\n"
@@ -118,7 +119,7 @@ int main(int argc, char** argv) {
     int Nc = 32, P = 8, nant = 6, nband = 8, nbit = 2, nwin2 = 16, reps = 20, warmup = 3, ncheck = 4, device = 0;
     int target = 65536;
     std::string os = "4:3", csvPath;
-    double bw = 64.0, rate = 3e-6;
+    double bw = 64.0, rate = 3e-6, accel = 0;
     bool ref = true;
     unsigned long long seed = 1;
     for (int i = 1; i < argc; i++) {
@@ -137,6 +138,7 @@ int main(int argc, char** argv) {
         else if (a == "--bw") bw = std::stod(next());
         else if (a == "--nwin") nwin2 = std::stoi(next());
         else if (a == "--rate") rate = std::stod(next());
+        else if (a == "--accel") accel = std::stod(next());
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
         else if (a == "--check") ncheck = std::stoi(next());
@@ -180,12 +182,16 @@ int main(int argc, char** argv) {
            "windows per antenna and band\n", nant, nband, nbit, bw, nwin2, 2 * nchan, subintMs, ncoarse);
 
     // ---- packed input and the delay model ----
-    // per antenna a delay tau(t) = tau0 + rate t (samples): coarse window n (its taps centred at
-    // sample n H + (P L1 - 1) / 2) gets the integer shift round(tau) and the fractional rest (in
-    // microseconds); a fringe rate per (antenna, band) (turns a sample), its phase continuous.
+    // per antenna a delay tau(x) = tau0 + rate x + d2 x^2 (samples; x the sample, d2 = accel / 2 fs):
+    // coarse window n (its taps centred at x = n H + (P L1 - 1) / 2) gets the integer shift round(tau)
+    // and the fractional rest (in microseconds); a fringe rate per (antenna, band) (turns a sample),
+    // its phase continuous.  Stage 1 gets the polynomials (TwoStageModel); the host reference and
+    // gpudifx today the per-window values (Windows).
+    const double d2 = 0.5 * accel / (2 * bw * 1e6);
     const int framesamples = VDIF_PAYLOAD * 8 / (nband * nbit);
     const int span = P * t.L1;
-    const long lastSample = (long)(ncoarse - 1) * t.H + span + 64 + (long)(rate * (double)ncoarse * t.H) + 2;
+    const double xmax = (double)ncoarse * t.H + span;
+    const long lastSample = (long)(ncoarse - 1) * t.H + span + 64 + (long)(std::fabs(rate) * xmax + std::fabs(d2) * xmax * xmax) + 2;
     const int nframes = (int)((lastSample + framesamples - 1) / framesamples);
     const size_t bytesPerAnt = (size_t)nframes * (VDIF_HEADER + VDIF_PAYLOAD);
     if (!leanDecodeFits(framesamples, span, bytesPerAnt)) { fprintf(stderr, "the lean decode cannot take this shape\n"); return 2; }
@@ -221,7 +227,7 @@ int main(int argc, char** argv) {
         for (int a = 0; a < nant; a++)
             for (int n = 0; n < nwin; n++) {
                 const double centre = (double)n * hop + (len - 1) / 2.0;
-                const double tau = tau0[a] + rate * centre;
+                const double tau = tau0[a] + centre * (rate + d2 * centre);
                 const int shift = (int)std::lround(tau);
                 const size_t aw = (size_t)a * nwin + n;
                 w.sampleIndex[aw] = n * hop + shift;
@@ -277,7 +283,19 @@ int main(int argc, char** argv) {
     pre1.lean = true;
     pre1.window = devCopy(taps);
     pre1.pk = packedInput(g1, w1);
-    const FracParams p1 = fracParams(g1, w1);
+    // stage 1 reads nothing per coarse window: null those arrays (a read would fault)
+    pre1.pk.sampleIndex = nullptr;
+    pre1.pk.bigA = pre1.pk.bigBred = nullptr;
+    pre1.pk.fringePhase = nullptr;
+    pre1.pk.winDesc = nullptr;
+    FracParams p1 = fracParams(g1, w1);
+    p1.fracSampleError = nullptr;
+    p1.validSamples = nullptr;
+    p1.fixedPhase = nullptr;
+    std::vector<double> hDelay((size_t)nant * 3), hFringe((size_t)nant * nband * 3);
+    for (int a = 0; a < nant; a++) { hDelay[3 * a] = tau0[a]; hDelay[3 * a + 1] = rate; hDelay[3 * a + 2] = d2; }
+    for (size_t i = 0; i < (size_t)nant * nband; i++) { hFringe[3 * i] = fphase0[i]; hFringe[3 * i + 1] = frate[i]; hFringe[3 * i + 2] = 0; }
+    const TwoStageModel model{devCopy(hDelay), devCopy(hFringe)};
     double tapPower = 0;
     for (float v : taps) tapPower += (double)v * v;
     const float scale1 = ldexpf(1.f, -(int)std::lround(0.5 * log2(tapPower)));       // coarse values ~1
@@ -287,15 +305,13 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMemset(spectra, 0, (size_t)nant * nwin2 * nband * nchan * sizeof(__half2)));
     cudaStream_t st;
     CHECK_CUDA(cudaStreamCreate(&st));
-    auto setup1 = [&] { launchFixedPhase(g1, p1, st); };     // the fractional-sample phase per coarse window
-    auto stage1 = [&] { launchStage1(t, g1, pre1, p1, coarse, scale1, st); };
+    auto stage1 = [&] { launchStage1(t, g1, pre1, p1, model, coarse, scale1, st); };
     auto stage2 = [&] { launchStage2(t, g1, nwin2, coarse, spectra, scale2, st); };
-    setup1(); stage1(); stage2();
+    stage1(); stage2();
     CHECK_CUDA(cudaStreamSynchronize(st));
     const double gib = 1.0 / 1073741824.0;
-    printf("GPU memory: coarse series %.2f GiB, spectra %.2f GiB (FP16); per-coarse-window parameters %.2f GiB\n",
-           (size_t)nant * nband * (Nc + 1) * ncoarse * 4 * gib, (size_t)nant * nwin2 * nband * nchan * 4 * gib,
-           (double)g1.spectra() * 32 * gib);
+    printf("GPU memory: coarse series %.2f GiB, spectra %.2f GiB (FP16)\n",
+           (size_t)nant * nband * (Nc + 1) * ncoarse * 4 * gib, (size_t)nant * nwin2 * nband * nchan * 4 * gib);
 
     // ---- check: the whole chain in double precision on the host, for a few (ant, band, c, m) ----
     bool pass = true;
@@ -366,10 +382,9 @@ int main(int argc, char** argv) {
                          nbit, Nc, os.c_str(), P, t.N2, t.K, nchan, nwin2, subintMs, name, tm.median, tm.min,
                          tm.median / subintMs);
     };
-    line("two stages: setup (fractional-sample phases)", timeIt(setup1, warmup, reps, st));
     line("two stages: stage 1 (PFB, coarse FFT, corrections)", timeIt(stage1, warmup, reps, st));
     line("two stages: stage 2 (fine FFT)", timeIt(stage2, warmup, reps, st));
-    line("two stages: total", timeIt([&] { setup1(); stage1(); stage2(); }, warmup, reps, st));
+    line("two stages: total", timeIt([&] { stage1(); stage2(); }, warmup, reps, st));
 
     if (ref) {
         // gpudifx today at the same channel count: its decode + fringe kernel (FP64), cuFFT, rotation
