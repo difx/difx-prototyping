@@ -5,13 +5,14 @@ its `FINDINGS.md`.
 
 ## Now
 
-- [phase-centres](phase-centres/BACKLOG.md): phasecentrebench built and swept on the 2070; next the A100, then the shift's occupancy.
+- [phase-centres](phase-centres/BACKLOG.md): phasecentrebench built and swept on the 2070 and the A100; next the shift's occupancy.
 
 ## [phase-centres](phase-centres/BACKLOG.md)
 
 - Done: mpifxcorr's implementation read (docs/mpifxcorr.md).
 - Done: phasecentrebench (pieces, delays per antenna, the shift naive / SIMT / tensor), swept on the 2070.
-- Next: the A100; the shift's occupancy (latency-bound at 25%) towards the tensor-core rate.
+- Done: the A100 sweep (shift / XMAC ≈ 0.5-0.65 x centres / windows per piece).
+- Next: the shift's occupancy (latency-bound at 25%) towards the tensor-core rate.
 - Next: the XMAC with K output slots in one launch (short pieces); the shift in the XMAC's epilogue.
 - Later: lower sideband; a time-domain check of the lag-window decorrelation; a NUFFT shift for centres ≫ channels averaged.
 

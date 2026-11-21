@@ -5,13 +5,12 @@ shift / XMAC ≈ 2 × centres / windows per piece.
 
 ## Done
 
-- `phasecentrebench`, the shift after the XMAC, checked and swept on the 2070
+- `phasecentrebench`, the shift after the XMAC, checked and swept on the 2070 and the A100
   ([docs/results.md](docs/results.md)).  It has the pieces from `maxNSBetweenUVShifts`, delays per
   (antenna, centre), and the naive, SIMT and tensor shifts.
 
 ## Next
 
-- **The A100** (OzSTAR): `run-centres.sh`.
 - **Towards the tensor-core rate**: the shift is at 10-20% of it, latency-bound at 25%
   occupancy (151 registers at 64 centres a block, one block an SM; docs/results.md).
   - Fewer registers, or two blocks an SM.

@@ -1,4 +1,4 @@
-# phasecentrebench: the shift after the XMAC, first results
+# phasecentrebench: the shift after the XMAC, first results (RTX 2070 SUPER, A100)
 
 The benchmark (`phasecentrebench.cu`, [README](../README.md)) runs:
 1. The staged tensor XMAC once per piece, writing each piece's fine visibilities.
@@ -90,6 +90,53 @@ Each sweep below changes one parameter from that.  The table is in ms per ms of 
 - **One centre costs 0.009 ms per ms**, padded to 32 centres a block: nothing next to the XMAC.
 - **32 stations: shift / XMAC 1.5 at work 1.**  The XMAC is more efficient with more stations
   (569 Gcmac/s); the shift is not.
+
+## A100-SXM4-80GB (OzSTAR gina3)
+
+SLURM job 21341101, commit 7fc7d05 (the same kernels as the 2070 run), every run passing
+(`results-local/gina3-centres-20261121-233134`).  Columns as above, ms per ms of data:
+
+| sweep | value | windows a piece | xmac | delays | naive | simt | tensor | sh/xmac | work | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| centres | 1 | 100 | 0.0238 | 0.0004 | 0.0026 | 0.0088 | 0.0032 | 0.14 | 0.01 | 0.0274 |
+| centres | 10 | 100 | 0.0238 | 0.0005 | 0.0189 | 0.0091 | 0.0036 | 0.15 | 0.10 | 0.0278 |
+| centres | **100** | 100 | 0.0238 | 0.0005 | 0.1918 | 0.0327 | 0.0149 | 0.63 | 1.00 | **0.0393** |
+| centres | 1000 | 100 | 0.0217 | 0.0005 | 1.7414 | 0.2304 | 0.1149 | 5.29 | 10.00 | 0.1371 |
+| pieces | 2 | 50 | 0.0310 | 0.0005 | - | 0.0562 | 0.0209 | 0.68 | 2.00 | 0.0524 |
+| pieces | 4 | 25 | 0.0499 | 0.0006 | - | 0.1053 | 0.0351 | 0.70 | 4.00 | 0.0856 |
+| pieces | 10 | 10 | 0.1115 | 0.0011 | - | 0.2549 | 0.0778 | 0.70 | 10.00 | 0.1904 |
+| avg | 8 | 100 | 0.0217 | 0.0004 | - | 0.0878 | 0.0698 | 3.21 | 1.00 | 0.0920 |
+| avg | 16 | 100 | 0.0217 | 0.0004 | - | 0.0539 | 0.0381 | 1.76 | 1.00 | 0.0603 |
+| avg | 32 | 100 | 0.0217 | 0.0004 | - | 0.0390 | 0.0215 | 0.99 | 1.00 | 0.0437 |
+| avg | 128 | 100 | 0.0217 | 0.0004 | - | 0.0278 | 0.0101 | 0.47 | 1.00 | 0.0323 |
+| avg | 256 | 100 | 0.0238 | 0.0005 | - | 0.0292 | 0.0094 | 0.39 | 1.00 | 0.0337 |
+| nchan | 1024 (avg 8, 800 windows) | 800 | 0.0157 | 0.0005 | - | 0.0126 | 0.0103 | 0.66 | 0.12 | 0.0264 |
+| nchan | 65536 (avg 512, 13 windows) | 13 | 0.0912 | 0.0005 | - | 0.2020 | 0.0524 | 0.57 | 7.69 | 0.1440 |
+| nant | 32 | 100 | 0.1613 | 0.0005 | - | 0.3205 | 0.1454 | 0.90 | 1.00 | 0.3072 |
+
+(The XMAC's time for the same shape varies by 9% between runs here: 0.0217-0.0238.)
+
+- **Faster than the 2070 by 2.4-3.7x for the XMAC, 2.9-5.0x for the tensor shift, 2.2-2.9x for
+  the SIMT one.**
+  - The tensor shift runs at 1.5-3.4 Tcmac/s: 1.5 at the default, 2.0 at 1000 centres, 3.4 at
+    65536 channels.  The XMAC runs at about 1.0.
+  - That is 4-9% of the A100's FP16 tensor rate, so the shift is again far from its arithmetic
+    limit.
+- **Shift / XMAC ≈ 0.5-0.65 x centres / windows per piece**, a little below the 2070's 0.5-0.8.
+  - 100 centres at 100 windows: 0.039 ms per ms for the whole chain, against 0.024 for the
+    XMAC alone (+65%).
+  - 10 centres: +17%.  1000 centres: 5.8x.
+- **The tensor version gains more over the others than on the 2070**: 13x the naive port at the
+  default shape (as on the 2070), and 2.2x the SIMT version (1.3x on the 2070).  At 65536
+  channels it is 3.9x the SIMT version.
+- **Short pieces cost the XMAC more on the A100**: 1.4x at 50 windows a piece, 2.3x at 25, 5.1x
+  at 10 (2070: 1.27x, 1.8x, 3.7x).  The XMAC alone is faster, so its fixed cost per piece (zeroing
+  and writing the fine visibilities) weighs more.  The shift scales better than the work: 10
+  pieces cost 5.6x one piece.
+- **Short averages**, as on the 2070: SIMT and tensor close at 8-16, the tensor version ahead from
+  32 on.
+- **The checks** match the 2070's: tensor 9e-5 rms against the double shift, 3e-5 for the
+  source centre.
 
 ## The checks
 
