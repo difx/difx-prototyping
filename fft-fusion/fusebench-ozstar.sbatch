@@ -42,6 +42,12 @@
 #     sbatch --export=ALL,SCRIPTS="run-matrix.sh" fusebench-ozstar.sbatch   # the big matrix
 #         (bits x subbands x channels x stations, 108 shapes, 15 min on an A100): results-local/<host>-matrix-<stamp>/,
 #         and a summary CSV in results/ (copy it back with the tgz: it is in there too as summary.csv)
+#     sbatch --export=ALL,SCRIPTS=run-twostage.sh fusebench-ozstar.sbatch   # two-stage channelisation,
+#         ~64k channels; add NCHAN=8192,NWIN=128 for ~8k: results-local/<host>-twostage[-8192]-<stamp>/
+#
+# At the end the job writes copy-results.<jobid>.sh (make-copy-script.sh): run it once the job has
+# finished to scp the SLURM log and the .tgz files to RESULTS_DEST (default ar313's results-local/;
+# set it with --export=ALL,RESULTS_DEST=<host>:<dir>/).
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
@@ -106,9 +112,12 @@ run() {
         command mv "$log" "$results/"
         tar czf "$results.tgz" -C results-local "$(basename "$results")"
         echo "Packed: $BENCHDIR/$results.tgz"
+        packed+=("$results.tgz")
     fi
 }
+packed=()
 for script in ${SCRIPTS:-run-bench.sh run-nchan.sh run-xmac.sh run-staged.sh}; do
     run "$script"
 done
+SLURM_LOG="${SLURM_JOB_ID:+${SLURM_SUBMIT_DIR:-$BENCHDIR}/fusebench.$SLURM_JOB_ID.log}" ./make-copy-script.sh "${packed[@]}"
 exit $rc

@@ -519,6 +519,44 @@ kernel, `results-local/ar313-adeller-twostage-8192-20261121-104326`):
 - **Choices at about 8k:** 32 (or 16) coarse channels, O = 4/3, 8 taps (6144 channels, 2.0x,
   < 0.1% loss); O = 2, 4 taps for 8192 exactly (2.3x).
 
+### A100-SXM4-80GB (OzSTAR, gina301), about 64k channels
+
+`fusebench-ozstar.sbatch` with `SCRIPTS=run-twostage.sh`, SLURM job 21315678, commit 39e0886, all 18
+passing (`results-local/gina301-twostage-20261121-123215`).  The single-stage kernel at 8192
+channels: 0.0951 ms/ms; gpudifx today 0.326 ms/ms at 49152 channels, 0.249 at 65536.
+
+| Nc | O | taps | channels | stage 1 | stage 2 | total | slowdown | against gpudifx | 2070 slowdown |
+|---|---|---|---|---|---|---|---|---|---|
+| 16 | 4/3 | 4 | 49152 | 0.1237 | 0.0284 | 0.1520 | 1.60 | 2.15x | 1.95 |
+| 16 | 4/3 | 8 | 49152 | 0.1243 | 0.0258 | 0.1500 | 1.58 | 2.18x | 2.09 |
+| 16 | 4/3 | 16 | 49152 | 0.1507 | 0.0258 | 0.1765 | 1.86 | 1.85x | 2.43 |
+| 32 | 4/3 | 4 | 49152 | 0.1082 | 0.0254 | 0.1335 | 1.40 | 2.45x | 1.66 |
+| 32 | 4/3 | 8 | 49152 | 0.1239 | 0.0254 | 0.1492 | 1.57 | 2.19x | 2.03 |
+| 32 | 4/3 | 16 | 49152 | 0.1546 | 0.0254 | 0.1798 | 1.89 | 1.82x | 2.42 |
+| 64 | 4/3 | 4 | 49152 | 0.1211 | 0.0312 | 0.1522 | 1.60 | 2.15x | 2.05 |
+| 64 | 4/3 | 8 | 49152 | 0.1413 | 0.0312 | 0.1725 | 1.81 | 1.89x | 2.30 |
+| 64 | 4/3 | 16 | 49152 | 0.1820 | 0.0312 | 0.2131 | 2.24 | 1.53x | 3.32 |
+| 16 | 2 | 4 | 65536 | 0.1692 | 0.0610 | 0.2079 | 2.19 | 1.20x | 2.85 |
+| 16 | 2 | 8 | 65536 | 0.1901 | 0.0609 | 0.2506 | 2.63 | 0.99x | 3.08 |
+| 16 | 2 | 16 | 65536 | 0.2333 | 0.0608 | 0.2941 | 3.09 | 0.85x | 3.56 |
+| 32 | 2 | 4 | 65536 | 0.1477 | 0.0362 | 0.1837 | 1.93 | 1.35x | 2.31 |
+| 32 | 2 | 8 | 65536 | 0.1712 | 0.0362 | 0.2073 | 2.18 | 1.20x | 2.60 |
+| 32 | 2 | 16 | 65536 | 0.2170 | 0.0362 | 0.2531 | 2.66 | 0.98x | 3.43 |
+| 64 | 2 | 4 | 65536 | 0.1677 | 0.0364 | 0.2039 | 2.14 | 1.22x | 2.85 |
+| 64 | 2 | 8 | 65536 | 0.1975 | 0.0364 | 0.2338 | 2.46 | 1.06x | 3.23 |
+| 64 | 2 | 16 | 65536 | 0.2584 | 0.0364 | 0.2946 | 3.10 | 0.84x | 3.98 |
+
+- **The slowdown is smaller on the A100:** 1.4-3.1x against 1.7-4x on the 2070.  32 coarse
+  channels, O = 4/3: 1.40x at 4 taps, 1.57x at 8.
+- **Against gpudifx today** the margin is smaller (0.84-2.45x): gpudifx's FP64 decode and cuFFT
+  run well on the A100.  At O = 2 with 16 taps two stages are slower than gpudifx today; at
+  O = 4/3, 8 taps, 2.2x faster.
+- **16 and 32 coarse channels tie at 8 taps, O = 4/3** (0.150 and 0.149 ms/ms).  16's stage 1 costs
+  the same at 4 and 8 taps (0.124), so the fold is not what limits it there (not profiled).  At O = 2,
+  16's 8192-point stage 2 (0.061 against 0.036 ms/ms) puts it behind.
+- **The choices hold:** 32 coarse channels, O = 4/3, 8 taps (1.6x the single stage); 16 taps for
+  lines (1.9x); O = 2, 4 taps for powers of two (1.9x).
+
 ## Implementation plan
 
 1. **Python reference.**  A numpy model of the whole two-stage chain from a sample series (both

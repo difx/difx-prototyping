@@ -163,4 +163,5 @@ profilex xstaged-c1024-n32         xmac_staged_kernel --nchan 1024 --nwin 1000 -
 
 tar czf "$OUT.tgz" -C results-local "$(basename "$OUT")"
 echo "Packed: $BENCHDIR/$OUT.tgz"
+SLURM_LOG="${SLURM_JOB_ID:+${SLURM_SUBMIT_DIR:-$BENCHDIR}/fusebench-ncu.$SLURM_JOB_ID.log}" ./make-copy-script.sh "$OUT.tgz"
 [ $fail = 0 ] || { echo "SOME PROFILES FAILED: see the .run.log files" >&2; exit 1; }
