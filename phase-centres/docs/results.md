@@ -66,11 +66,22 @@ Each sweep below changes one parameter from that.  The table is in ms per ms of 
   - Per piece it zeroes and writes a full set of fine visibilities (44 MB here).
   - At 50 windows a piece the XMAC costs 1.27x, at 25 1.8x, at 10 3.7x.
   - The shift's cost tracks the work (centres x pieces), so short pieces cost twice.
-- **Short averages favour the CUDA cores.**
-  - The outer phasor (a sincos per output element per piece) and the product's write-out are
-    per output channel, so with 8 or 16 channels averaged they outweigh the product.
-  - The tensor version then loses to the SIMT one.
-  - A recurrence across output channels would cut the sincos; not done yet.
+- **Short averages favour the CUDA cores**, but only matter with many centres, which does not
+  happen in practice.
+  - The per-output work (the outer phasor, the product through shared memory, the running sums,
+    the write-out) outweighs the product when only 8 or 16 channels are averaged, and the tensor
+    version then loses to the SIMT one.
+  - With few centres it is cheap all the same: at 8 channels averaged the shift costs 0.037 ms
+    per ms for 1 centre and 0.045 for 10 (the XMAC 0.075); at 16 averaged, 0.021 and 0.025.
+- **Tried and dropped: the outer phasor by recurrence.**
+  - Each thread took one centre and 8-16 consecutive output channels, with one sincos per run
+    instead of one per element, and padded centres skipped.
+  - It was 4-10% slower everywhere, also at short averages: 1.69 against 1.54 ms at the default
+    shape, 9.1 against 8.2 at 8 averaged.
+  - Nsight Compute (`--clock-control none`, 1500 MHz): 4% more instructions.  The kernel is
+    latency-bound, not sincos-bound: 25% occupancy (151 registers at 64 centres a block, one
+    block an SM), 8.9 cycles per issued instruction, 22% of the SM's compute throughput, 32% of
+    DRAM bandwidth.
 - **Long channels are no problem.**
   - 65536 channels at 512 averaged: shift / XMAC is 1.10 at a work ratio of 7.7, 0.14 per unit of
     work.  The tensor shift runs at 730 Gcmac/s there, the best of any shape.

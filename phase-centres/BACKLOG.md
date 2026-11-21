@@ -12,11 +12,13 @@ shift / XMAC ≈ 2 × centres / windows per piece.
 ## Next
 
 - **The A100** (OzSTAR): `run-centres.sh`.
-- **Short averages (8-16 channels)**: the outer phasor by recurrence along the output channels
-  instead of a sincos per element.  Fewer write-outs per product (more rows a block).
-- **Towards the tensor-core rate**: the shift is at 10-20% of it.  Try a larger tile per block
-  (128 rows, 64-128 centres), loads overlapping the MMAs, and the inner phasors from a table
-  per piece.
+- **Towards the tensor-core rate**: the shift is at 10-20% of it, latency-bound at 25%
+  occupancy (151 registers at 64 centres a block, one block an SM; docs/results.md).
+  - Fewer registers, or two blocks an SM.
+  - Loads overlapping the MMAs (double buffering).
+  - The inner phasors from a table per piece.
+- (Short averages: not a priority, since they come with few centres, where they are cheap.  The
+  outer phasor by recurrence was tried and was slower; docs/results.md.)
 - **The XMAC with K output slots in one launch** (the windows of each piece to its own slot)
   instead of K launches, each zeroing and writing.  That is the short-piece cost.
 - **The shift in the XMAC's epilogue**, against the shift from DRAM.

@@ -27,5 +27,7 @@ Detail: [docs/mpifxcorr.md](docs/mpifxcorr.md) (how mpifxcorr does it),
   - 10 centres: +15%.  1000 centres: 7.7x.  ([results.md](docs/results.md))
 - **Short pieces cost the XMAC too**: 1.27x at 50 windows a piece, 1.8x at 25, 3.7x at 10.  With
   10s of ms pieces (O(100) windows) it does not matter.  ([results.md](docs/results.md))
-- **Averages of 8-16 channels: the per-output phasor dominates**, and the tensor version loses to
-  FP32 on the CUDA cores.  ([results.md](docs/results.md))
+- **Averages of 8-16 channels: the per-output work dominates**, and the tensor version loses to
+  FP32 on the CUDA cores.  But they come with few centres, where the shift is cheap (0.04 ms per
+  ms at 10 centres, against the XMAC's 0.075).  An outer phasor by recurrence was slower.  The
+  kernel is latency-bound: 25% occupancy.  ([results.md](docs/results.md))
