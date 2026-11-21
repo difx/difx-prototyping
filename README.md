@@ -15,3 +15,13 @@ evaluated.
 | `phase-centres/` | GPU correlation to many phase centres at once, shifted and averaged from high-resolution visibilities (backlog: not started) |
 
 Each directory has its own README with how to build and run it, and its results.
+
+## For DiFX proper
+
+Things the prototypes point to that belong in difx itself, not here:
+- **Report the channelisation's response at startup.** mpifxcorr (or gpudifx) should compute and
+  log, for the configuration it is about to run, the expected continuum sensitivity loss, the
+  passband ripple, the worst alias/ghost level, and the fractional-sample and delay-rate losses
+  (worst channel and average, at the job's largest delay rate).  These follow from the window
+  (WOLA, PFB taps, oversampling), the FFT sizes and the delay model, as `fft-fusion/two_stage.py`
+  computes them; see `fft-fusion/docs/two-stage.md`.
