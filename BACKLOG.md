@@ -5,13 +5,15 @@ its `FINDINGS.md`.
 
 ## Now
 
-- [phase-centres](phase-centres/BACKLOG.md), starting from mpifxcorr's implementation.
+- [phase-centres](phase-centres/BACKLOG.md): a benchmark of the shift after the XMAC (direct, and as a matrix product).
 
 ## [phase-centres](phase-centres/BACKLOG.md)
 
-- Check mpifxcorr's multiple-phase-centre implementation (time step, shift, per-centre cost).
-- Prototype and compare: shift after the XMAC, in the XMAC's epilogue, per station before it.
-- Measure cost against centres (1-1000), channel count and time step, against a direct correlation.
+- Done: mpifxcorr's implementation read (docs/mpifxcorr.md).
+- Next: pieces from `maxNSBetweenUVShifts` (even split); delays per (antenna, centre); XMAC writing per piece.
+- Next: the shift after the XMAC, direct and as a tensor-core matrix product; then in the XMAC's epilogue.
+- Measure cost against centres (1-1000), windows per piece, averaging and stations, against a direct correlation.
+- Later: a NUFFT shift for centres far more than the channels averaged.
 
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)
 

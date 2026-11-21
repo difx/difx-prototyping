@@ -136,3 +136,5 @@ A100 took 846 s.
   the stores) dominates, the tensor XMAC is 1.3-4.3x slower than the staged one, and the tiled
   FP32 XMAC beats both (the chain by 1.3-1.4x).  Not a regime DiFX gets into: even multiple
   phase centres at L band (8k channels in 32 MHz, 40 ms subints) have about 160 windows a subint.
+  (Revised 2026-11-21: with multiple phase centres the XMAC flushes once per shift piece, which
+  can be far fewer windows; see [../../phase-centres/BACKLOG.md](../../phase-centres/BACKLOG.md).)
