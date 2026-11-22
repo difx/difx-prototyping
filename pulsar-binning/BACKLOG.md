@@ -18,6 +18,9 @@ to keep arbitrary breakpoints.
   spilled, and gather covers long runs.
 - The A100 (job 21374617): the same picture; gather wins every separate-bin case; the stage costs
   relatively more (docs/results.md, "The A100").
+- The per-bin weights (count + a correction over flagged windows, exact against mpifxcorr's sum);
+  high DM in the sweep; gathering from window-major spectra (`gatherwm`): the station kernel need
+  not change (docs/results.md, "Per-bin weights, high DM ...").
 - Step 6 (part): channel averaging in the binned XMAC (a shared-memory sum over a block's channels)
   and accumulating over an integration; `run-bins.sh`, the whole matrix on the 2070: the gate
   0.45-1.13x, scrunched 1.04-1.37x, 16 separate 2.6-4.5x, 128 separate 2.7-6.5x (14x for bins
@@ -28,10 +31,23 @@ to keep arbitrary breakpoints.
 - **One sorted approach**: gather wins every separate-bin case on the A100 (job 21374617), the
   permuted copy only the shortest runs on the 2070 (6.5x against 12x): drop the copy, or keep it
   for the 2070 only.
-- **The weighted stage on the A100** (1.26-1.80x when nothing is skipped, against 1.04-1.37x on the
-  2070): fewer instructions in the copy (the classification pass, the scaling).
-- **The rest of the output side**: the per-bin weights (mpifxcorr's baseline weight per bin: a
-  histogram of the bins, with the windows' validity); phase centres per bin (the shift x nbins).
+- **Slimming the weighted copy** (the gate and scrunched output: 1.26-1.80x the XMAC on the A100
+  when nothing is skipped, 1.04-1.37x on the 2070):
+  1. the weight on the A operand in registers instead of on every value in the copy: the copy
+     becomes the plain one (no bins loaded, no table lookups, conversions or FP16 multiplies, no
+     sqrt|w| rounding); a few threads write each channel's 16 window weights (FP16) to shared
+     memory per stage, and each lane multiplies its A registers by its two windows' weights (four
+     HMUL2 per A fragment, the sign included): one code path instead of plain / scaled / signed;
+  2. the per-16-window-block classification (skip, or not) once per subint in the bins kernel, per
+     (frequency, 4-channel quad, block), instead of every block re-reading its bins;
+  3. the KS 2 kernel's spills rechecked; on both GPUs, against the plain XMAC (aim: about 1.1x with
+     nothing to skip).
+- **The per-bin weights' cost**: the count into the bins kernel (six small kernels now: 0.09-0.17 ms
+  with every weight 1); the correction (a matrix product over the flagged windows) on the tensor
+  cores if heavily flagged data matter (5.8 ms at 32 stations with half the windows flagged).
+- **Window-major or channel-major** for the sorted XMAC (both kept in binbench): window-major needs
+  nothing from the station kernel (up to 2x slower at 128 channels or high DM); a transpose in the
+  binning gives channel-major's speed for about the XMAC's time.  The A100 to decide.
 - **The bins kernel**: a lookup table on the phase's top bits instead of the binary search.
 - **Sorting over several subints** (or a longer XMAC interval in pulsar mode) where bins get few
   windows a subint (1024 channels, 128 bins at 1.5 ms: 11.5x at 102.4 ms against 14x).
@@ -93,8 +109,8 @@ Every parameter variable; these are the defaults and the sweep.
    change.  ~1x for long runs, ~nbins-per-chunk x for short.
 6. **The output side**: per-bin weights; channel averaging per bin; for the 500 ms pulsar the
    sparse bins (only those touched in a subint written or copied; the device-to-host copy of
-   all 128 bins x 1024 channels would be ~30 GB/s); phase centres per bin (the shift's cost x
-   nbins).
+   all 128 bins x 1024 channels would be ~30 GB/s).  (Phase centres with binning: not needed on the
+   GPU, one or the other.)
 7. **Sweep** on the 2070, then the A100 (OzSTAR), each version against the unbinned XMAC:
    cases x periods x stations, and DM 0 (no channel dependence) against DM 30.
 

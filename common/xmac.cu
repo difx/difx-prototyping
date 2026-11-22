@@ -352,8 +352,9 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
                 for (int k = 0; k < C::MAXR; k++) {
                     if (src[k] == NONE) { v[k][cq] = make_uint4(0, 0, 0, 0); continue; }
                     const unsigned* b = reinterpret_cast<const unsigned*>(spec + src[k] + (unsigned)cq * (unsigned)W.cstride);
-                    v[k][cq] = make_uint4(wi.x >= 0 ? __ldg(b + wi.x) : 0u, wi.y >= 0 ? __ldg(b + wi.y) : 0u,
-                                          wi.z >= 0 ? __ldg(b + wi.z) : 0u, wi.w >= 0 ? __ldg(b + wi.w) : 0u);
+                    const unsigned ws = (unsigned)W.wstride;
+                    v[k][cq] = make_uint4(wi.x >= 0 ? __ldg(b + (unsigned)wi.x * ws) : 0u, wi.y >= 0 ? __ldg(b + (unsigned)wi.y * ws) : 0u,
+                                          wi.z >= 0 ? __ldg(b + (unsigned)wi.z * ws) : 0u, wi.w >= 0 ? __ldg(b + (unsigned)wi.w * ws) : 0u);
                 }
             }
             return;
@@ -783,7 +784,7 @@ void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half
 }
 void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                             const int4* segs, int maxSeg, int nbins, int cstride, int sms, cudaStream_t st,
-                            const int* slotWin, int avg, bool accumulate) {
+                            const int* slotWin, int avg, bool accumulate, int wstride) {
     checkAvg(s, avg);
     if (nbins < 1 || !segs || maxSeg < 1 || (!slotWin && (cstride % 4 || cstride < s.nwin)) || s.nwin % 4 ||
         m.maxOff + (long long)s.nchan * cstride > 0xfffffffeLL) {
@@ -793,6 +794,7 @@ void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2*
     }
     XmacWeights w;
     w.cstride = cstride;
+    w.wstride = wstride;
     w.avg = avg;
     w.accumulate = accumulate;
     if (slotWin) { w.slotWin = slotWin; w.cap = s.nwin; }

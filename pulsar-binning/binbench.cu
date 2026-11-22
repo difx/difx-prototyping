@@ -20,6 +20,7 @@
 //           in pulsar mode; here a transpose, timed apart)
 //   gather  (separate bins) the same without the permuted copy: the XMAC's copy gathers each slot's
 //           window from the channel-major spectra
+//   gatherwm (separate bins) the same from the usual window-major spectra (no channel-major copy)
 // timed against the unbinned staged XMAC (common/xmac.cu), and checked: the bins against mpifxcorr's
 // rule in double on the host, the binned visibilities against the host's sums in double, their sum
 // over the bins against the unbinned XMAC, and the simulated pulse's power in each bin against the
@@ -204,6 +205,102 @@ __global__ void sort_permute(XmacShape s, int cap, int nslot, const int* __restr
     }
 }
 
+// ---- the per-bin weights ------------------------------------------------------------------------
+// As mpifxcorr's baselineweight (Core::processdata): for (frequency f, bin b, baseline, product p) the
+// sum over the bin's (window, channel) samples of w1 w2 / nchan, w1 and w2 the two stations' data
+// weights for the product's bands in that window (dw [station][band][window], 1 for a fully valid
+// window).  Summed directly that is nbins x windows x baselines; instead: each bin's count of samples /
+// nchan (every weight 1), less, for the few windows where some station's weight is below 1, that
+// window's samples of the bin x (1 - w1 w2) / nchan (a matrix product over the flagged windows).  Scrunched: the bins' weights times their bin
+// weights, the positive ones only (as mpifxcorr).  wt is [f][b][baseline][product].
+constexpr int WCHUNK = 64;                  // windows a block in the count
+__global__ void wt_count(int nwin, int nfreq, int nchan, int nbins, const uint8_t* __restrict__ bins, unsigned* cnt) {
+    __shared__ unsigned h[MAXBINS];
+    const int f = blockIdx.y, w0 = blockIdx.x * WCHUNK;
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) h[i] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < WCHUNK * nchan; i += blockDim.x) {
+        const int w = w0 + i / nchan, c = i % nchan;
+        if (w < nwin) atomicAdd(&h[bins[((size_t)w * nfreq + f) * nchan + c]], 1u);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x)
+        if (h[i]) atomicAdd(&cnt[(size_t)f * nbins + i], h[i]);
+}
+// the windows where some station's weight in some band is not 1
+__global__ void wt_flag(int nwin, int nrows, const float* __restrict__ dw, int* list, int* nlist) {
+    const int w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= nwin) return;
+    bool any = false;
+    for (int r = 0; r < nrows; r++) any |= dw[(size_t)r * nwin + w] != 1.f;
+    if (any) list[atomicAdd(nlist, 1)] = w;
+}
+__global__ void wt_init(int nfreq, int nbins, int nblp, int nchan, const unsigned* __restrict__ cnt, float* wt) {
+    const size_t n = (size_t)nfreq * nbins * nblp;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        wt[i] = (float)cnt[i / nblp] / nchan;
+}
+// the correction, a matrix product per frequency: C[b][blp] = sum over the flagged windows k of
+// H[k][b] (the window's samples in bin b) x G[k][blp] (1 - w1 w2), wt -= C / nchan.  First each flagged
+// window's histogram (a block per (k, frequency)), then the product in 32 x 32 tiles (no atomics).
+__global__ void wt_hist(XmacShape s, int nbins, const uint8_t* __restrict__ bins, const int* __restrict__ list,
+                        const int* __restrict__ nlist, int* H) {
+    __shared__ int h[MAXBINS];
+    const int k = blockIdx.x, f = blockIdx.y;
+    if (k >= *nlist) return;
+    const int w = list[k];
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) h[i] = 0;
+    __syncthreads();
+    for (int c = threadIdx.x; c < s.nchan; c += blockDim.x) atomicAdd(&h[bins[((size_t)w * s.nfreq + f) * s.nchan + c]], 1);
+    __syncthreads();
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) H[((size_t)f * s.nwin + k) * nbins + i] = h[i];
+}
+__global__ void wt_correct(XmacShape s, int nbins, const int2* __restrict__ bls, const float* __restrict__ dw,
+                           const int* __restrict__ list, const int* __restrict__ nlist, const int* __restrict__ H, float* wt) {
+    __shared__ float hs[32][33], gs[32][33];             // [window k][bin], [window k][(baseline, product)]
+    const int f = blockIdx.z, b0 = blockIdx.y * 32, q0 = blockIdx.x * 32;
+    const int nblp = s.nbaseline() * 4, nf = *nlist;
+    const int tx = threadIdx.x, ty = threadIdx.y;        // 32 x 8: tx a (baseline, product), ty 4 bins
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k0 = 0; k0 < nf; k0 += 32) {
+        for (int r = ty; r < 32; r += 8) {
+            const int k = k0 + r;
+            hs[r][tx] = k < nf && b0 + tx < nbins ? (float)H[((size_t)f * s.nwin + k) * nbins + b0 + tx] : 0.f;
+            float g = 0.f;
+            const int q = q0 + tx;
+            if (k < nf && q < nblp) {
+                const int w = list[k], bl = q / 4, p = q % 4;
+                const int pol1 = p == 1 || p == 3, pol2 = p == 1 || p == 2;
+                g = 1.f - dw[((size_t)bls[bl].x * s.nband() + 2 * f + pol1) * s.nwin + w] *
+                          dw[((size_t)bls[bl].y * s.nband() + 2 * f + pol2) * s.nwin + w];
+            }
+            gs[r][tx] = g;
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int r = 0; r < 32; r++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) acc[j] += hs[r][ty * 4 + j] * gs[r][tx];
+        __syncthreads();
+    }
+    const int q = q0 + tx;
+    if (q < nblp)
+        for (int j = 0; j < 4; j++) {
+            const int b = b0 + ty * 4 + j;
+            if (b < nbins) wt[((size_t)f * nbins + b) * nblp + q] -= acc[j] / s.nchan;
+        }
+}
+__global__ void wt_scrunch(int nfreq, int nbins, int nblp, const float* __restrict__ binw, const float* __restrict__ wt,
+                           float* wtS) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nfreq * nblp) return;
+    const int f = i / nblp, blp = i % nblp;
+    float sum = 0.f;
+    for (int b = 0; b < nbins; b++)
+        if (binw[b] > 0.f) sum += binw[b] * wt[((size_t)f * nbins + b) * nblp + blp];
+    wtS[i] = sum;
+}
+
 // ---- the naive port -----------------------------------------------------------------------------
 // A thread per output (frequency, baseline, product, channel), visIndex order; out is [bin][visCount]
 // (zeroed first) or, scrunched, [visCount].
@@ -272,7 +369,7 @@ __device__ inline float profileAmp(double ph, float sigma) {   // ph in [0, 1)
     return expf(-0.25f * d * d);                                // amplitude: the power is exp(-d^2 / 2)
 }
 __global__ void make_spectra(XmacShape s, const double* __restrict__ truePhase, const double* __restrict__ trueDm,
-                             float sigma, unsigned long long seed, float noise, __half2* h) {
+                             float sigma, unsigned long long seed, float noise, const float* __restrict__ dw, __half2* h) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < s.halfCount(); i += (size_t)gridDim.x * blockDim.x) {
         const int c = (int)(i % s.nchan);
         const size_t t = i / s.nchan;
@@ -291,6 +388,7 @@ __global__ void make_spectra(XmacShape s, const double* __restrict__ truePhase, 
             v.x += noise * g.x;
             v.y += noise * g.y;
         }
+        if (dw[((size_t)a * s.nband() + band) * s.nwin + w] == 0.f) v = make_float2(0.f, 0.f);    // no valid data
         h[i] = __floats2half2_rn(v.x, v.y);
     }
 }
@@ -318,8 +416,10 @@ static void usage() {
 "  --scrunch       write the weighted sum of the bins instead of each bin (gate: always)\n"
 "  --fwhm X        the simulated pulse's width, turns (FWHM of its power), default 0.03\n"
 "  --noise X       each station's own noise, relative to the pulse's peak amplitude, default 1\n"
-"  --only LIST     comma-separated versions to run: naive, stage (scrunched), passes (separate\n"
-"                  bins) (default all that apply)\n"
+"  --dropout P     each station's window invalid (data weight 0, spectra zero) with probability P\n"
+"  --partial P     each station's window half valid (data weight 0.5) with probability P (default 0, 0)\n"
+"  --only LIST     comma-separated versions to run: naive, stage (scrunched), passes, sorted, gather,\n"
+"                  gatherwm (separate bins) (default all that apply)\n"
 "  --noskip        the weighted XMAC runs every 16-window block (no skipping of all-zero weights)\n"
 "  --seg-len L     sorted: a bin's slot blocks (16 slots) a segment (an XMAC block), at most; default 32\n"
 "  --avg A         channels averaged (summed) into each output channel, a power of 2, default 1\n"
@@ -366,8 +466,9 @@ int main(int argc, char** argv) {
     u.period = 1.5e-3; u.fdot = 0; u.dm = 30; u.phase0 = NAN; u.fwhm = 0.03;
     int nwinArg = 0, reps = 20, warmup = 3, ncheck = 128, device = 0;
     unsigned long long seed = 1;
-    std::string only = "naive,stage,passes,sorted,gather", csv, bins = "128", phase = "start";
+    std::string only = "naive,stage,passes,sorted,gather,gatherwm", csv, bins = "128", phase = "start";
     int segLen = 32, avg = 1;
+    double dropout = 0, partial = 0;
     bool accumulate = false;
     bool scrunchArg = false, noskip = false;
     for (int i = 1; i < argc; i++) {
@@ -395,6 +496,8 @@ int main(int argc, char** argv) {
         else if (a == "--seg-len") segLen = std::stoi(next());
         else if (a == "--avg") avg = std::stoi(next());
         else if (a == "--accumulate") accumulate = true;
+        else if (a == "--dropout") dropout = std::stod(next());
+        else if (a == "--partial") partial = std::stod(next());
         else if (a == "--fwhm") u.fwhm = std::stod(next());
         else if (a == "--noise") noise = std::stod(next());
         else if (a == "--only") only = next();
@@ -427,8 +530,9 @@ int main(int argc, char** argv) {
     const bool runStage = only.find("stage") != std::string::npos && u.scrunch;
     const bool runPasses = only.find("passes") != std::string::npos && !u.scrunch;
     const bool runSorted = only.find("sorted") != std::string::npos && !u.scrunch;
-    const bool runGather = only.find("gather") != std::string::npos && !u.scrunch;
-    const bool sortAny = runSorted || runGather;
+    const bool runGather = (only.find("gather,") != std::string::npos || only.size() >= 6 && only.compare(only.size() - 6, 6, "gather") == 0) && !u.scrunch;
+    const bool runGatherWm = only.find("gatherwm") != std::string::npos && !u.scrunch;
+    const bool sortAny = runSorted || runGather || runGatherWm;
 
     XmacShape s{};
     s.nant = u.nant; s.nfreq = u.nfreq; s.nchan = u.nchan; s.nwin = u.nwin; s.fftchannels = 2 * u.nchan;
@@ -495,10 +599,30 @@ int main(int argc, char** argv) {
     bool anyNeg = false;
     for (double w : u.weights) anyNeg |= w < 0;
 
+    // ---- the stations' data weights [station][band][window]: 1, or 0 (dropout), or 0.5 (partial); the
+    // same in every band of a station's window ----
+    std::vector<float> dw((size_t)u.nant * s.nband() * u.nwin, 1.f);
+    {
+        Rng wr{seed * 13 + 11};
+        for (int a = 0; a < u.nant; a++)
+            for (int w = 0; w < u.nwin; w++) {
+                const double x = wr.uniform();
+                const float v = x < dropout ? 0.f : x < dropout + partial ? 0.5f : 1.f;
+                for (int band = 0; band < s.nband(); band++) dw[((size_t)a * s.nband() + band) * u.nwin + w] = v;
+            }
+    }
+    float* dDw = devCopy(dw);
+    const int nblp = u.nbl * 4;
+    unsigned* dCntW = devAlloc<unsigned>((size_t)u.nfreq * u.nbins);
+    int* dFlag = devAlloc<int>(u.nwin), * dNflag = devAlloc<int>(1);
+    int* dHist = devAlloc<int>((size_t)u.nfreq * u.nwin * u.nbins);     // the flagged windows' histograms
+    float* dWt = devAlloc<float>((size_t)u.nfreq * u.nbins * nblp);
+    float* dWtS = devAlloc<float>((size_t)u.nfreq * nblp);
+
     // ---- inputs ----
     __half2* spec = devAlloc<__half2>(s.halfCount());
     const float sigma = (float)(u.fwhm / (2 * std::sqrt(2 * std::log(2.0))));
-    make_spectra<<<4096, 256>>>(s, dTruePhase, dDmTurns, sigma, seed, (float)noise, spec);
+    make_spectra<<<4096, 256>>>(s, dTruePhase, dDmTurns, sigma, seed, (float)noise, dDw, spec);
     CHECK_CUDA(cudaGetLastError());
     XmacMap map = xmacUploadMap(xmacRegularMap(s));
     float2* vis = devAlloc<float2>(s.visCount());
@@ -511,6 +635,18 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaGetLastError());
     };
     auto runXmac = [&] { xmacTensorStagedMapped(s, map, spec, (cuFloatComplex*)vis, sms, st); };
+    auto runWeights = [&] {                        // the per-bin weights (and, scrunched, their weighted sum)
+        CHECK_CUDA(cudaMemsetAsync(dCntW, 0, (size_t)u.nfreq * u.nbins * sizeof(unsigned), st));
+        CHECK_CUDA(cudaMemsetAsync(dNflag, 0, sizeof(int), st));
+        wt_count<<<dim3((u.nwin + WCHUNK - 1) / WCHUNK, u.nfreq), 256, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, dBins, dCntW);
+        wt_flag<<<(u.nwin + 255) / 256, 256, 0, st>>>(u.nwin, u.nant * s.nband(), dDw, dFlag, dNflag);
+        wt_init<<<sms * 4, 256, 0, st>>>(u.nfreq, u.nbins, nblp, u.nchan, dCntW, dWt);
+        wt_hist<<<dim3(u.nwin, u.nfreq), 128, 0, st>>>(s, u.nbins, dBins, dFlag, dNflag, dHist);
+        wt_correct<<<dim3((nblp + 31) / 32, (u.nbins + 31) / 32, u.nfreq), dim3(32, 8), 0, st>>>(s, u.nbins, dBls, dDw, dFlag,
+                                                                                             dNflag, dHist, dWt);
+        if (u.scrunch) wt_scrunch<<<(u.nfreq * nblp + 127) / 128, 128, 0, st>>>(u.nfreq, u.nbins, nblp, dWts, dWt, dWtS);
+        CHECK_CUDA(cudaGetLastError());
+    };
     struct Variant { std::string key, name; std::function<void()> run; };
     std::vector<Variant> variants;
     if (runNaive) variants.push_back({"naive", "naive (a thread per output, over the windows)", [&] {
@@ -598,6 +734,12 @@ int main(int argc, char** argv) {
     };
     if (runGather) variants.push_back({"gather", "gather (sort, the XMAC gathering the slots)", [&] {
         runSort(); runGatherXmac(); }});
+    auto runGatherWmXmac = [&] {
+        xmacTensorStagedSorted(ss, map, spec, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, 1, sms, st, dSlotWin, avg,
+                               accumulate, s.nband() * s.nchan);
+    };
+    if (runGatherWm) variants.push_back({"gatherwm", "gatherwm (sort, gathering from window-major spectra)", [&] {
+        runSort(); runGatherWmXmac(); }});
 
     bool pass = true;
     if (sortAny) runTranspose();
@@ -758,6 +900,42 @@ int main(int argc, char** argv) {
         printf("signal: the pulse's power per bin vs the profile's, %d bins with samples: peak %.3f, worst %.1f sigma%s\n",
                nused, peak, worst, worst > 6 ? "  (high: baselines share the signal, so this sigma is a lower bound)" : "");
     }
+    // ---- check: the per-bin weights against mpifxcorr's sum over the samples (double) ----
+    {
+        runWeights();
+        CHECK_CUDA(cudaStreamSynchronize(st));
+        std::vector<float> hWt((size_t)u.nfreq * u.nbins * nblp), hWtS((size_t)u.nfreq * nblp);
+        CHECK_CUDA(cudaMemcpy(hWt.data(), dWt, hWt.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        if (u.scrunch) CHECK_CUDA(cudaMemcpy(hWtS.data(), dWtS, hWtS.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        int nflag = 0;
+        CHECK_CUDA(cudaMemcpy(&nflag, dNflag, sizeof(int), cudaMemcpyDeviceToHost));
+        double emax = 0, wmax = 0, smax = 0;
+        std::vector<double> ref(u.nbins);
+        for (size_t q = 0; q < picks.size(); q++) {
+            const Pick& k = picks[q];
+            const int pol1 = k.p == 1 || k.p == 3, pol2 = k.p == 1 || k.p == 2;
+            std::fill(ref.begin(), ref.end(), 0.0);
+            for (int w = 0; w < u.nwin; w++) {
+                const double w12 = (double)dw[((size_t)bls[k.bl].x * s.nband() + 2 * k.f + pol1) * u.nwin + w] *
+                                   dw[((size_t)bls[k.bl].y * s.nband() + 2 * k.f + pol2) * u.nwin + w] / u.nchan;
+                for (int c = 0; c < u.nchan; c++) ref[hBins[((size_t)w * u.nfreq + k.f) * u.nchan + c]] += w12;
+            }
+            double rs = 0;
+            for (int b = 0; b < u.nbins; b++) {
+                const double g = hWt[((size_t)k.f * u.nbins + b) * nblp + k.bl * 4 + k.p];
+                emax = std::max(emax, std::fabs(g - ref[b]));
+                wmax = std::max(wmax, ref[b]);
+                if (u.weights[b] > 0) rs += u.weights[b] * ref[b];
+            }
+            if (u.scrunch) smax = std::max(smax, std::fabs(hWtS[(size_t)k.f * nblp + k.bl * 4 + k.p] - rs) / std::max(rs, 1e-30));
+        }
+        const bool ok = emax <= 1e-5 * std::max(wmax, 1.0) && smax < 1e-5;
+        printf("check: per-bin weights vs mpifxcorr's sum (%d windows with a weight below 1): max error %.2e (of up to %.4g)",
+               nflag, emax, wmax);
+        if (u.scrunch) printf("; scrunched %.2e (relative)", smax);
+        printf("  %s\n", ok ? "OK" : "FAIL");
+        pass &= ok;
+    }
     if (pass) printf("check: PASS\n");
     else printf("check: FAIL\n");
 
@@ -780,10 +958,13 @@ int main(int argc, char** argv) {
     const Timing tx = timeIt(runXmac, warmup, reps, st);
     line("xmac", "xmac (staged tensor, unbinned)", tx);
     line("bins", "bins (per window, frequency, channel)", timeIt(runBins, warmup, reps, st));
+    line("weights", "per-bin weights (count, flagged windows, correction)", timeIt(runWeights, warmup, reps, st));
     for (auto& v : variants) {
         const Timing t = timeIt(v.run, warmup, reps, st);
         line(v.key, "binned: " + v.name, t);
         printf("    %.2f x the unbinned XMAC\n", t.median / tx.median);
+        if (v.key == "gatherwm")
+            line("gatherwm-xmac", "  the XMAC gathering from window-major", timeIt(runGatherWmXmac, warmup, reps, st));
         if (v.key == "gather") {
             line("gather-sort", "  of which the sort", timeIt(runSort, warmup, reps, st));
             line("gather-xmac", "  the XMAC gathering the slots", timeIt(runGatherXmac, warmup, reps, st));

@@ -135,6 +135,7 @@ struct XmacWeights {
     int cstride = 0;                    // sorted: __half2 from one channel to the next (channel-major)
     const int* slotWin = nullptr;       // sorted, gathered: [frequency][channel][cap] each slot's window or -1
     int cap = 0;
+    int wstride = 1;                    // sorted, gathered: __half2 from one window to the next
     // the output (weighted and sorted): avg channels (a power of 2) summed into each output channel,
     // vis [freq][baseline][product][nchan / avg] (a bin's); accumulate: added to vis, not zeroed first
     int avg = 1;
@@ -151,11 +152,12 @@ void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half
 // -1 past its last; a block runs one segment, adding its sums to that bin's visibilities (atomically
 // when the bin has several).  vis is [nbins][visCount], zeroed here.
 // With slotWin ([frequency][channel][s.nwin] the window of each slot, -1 padding), the spectra are not
-// permuted: channel-major in time order, a channel's windows at off + c cstride + window, and the copy
-// gathers each slot's window (4-byte loads).
+// permuted: a receiver's channel c, window w at off + c cstride + w wstride (channel-major: cstride the
+// windows, wstride 1; the usual window-major spectra: cstride 1, wstride nband nchan, off as
+// xmacRegularMap's), and the copy gathers each slot's window (4-byte loads).
 void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                             const int4* segs, int maxSeg, int nbins, int cstride, int multiprocessors, cudaStream_t st,
-                            const int* slotWin = nullptr, int avg = 1, bool accumulate = false);
+                            const int* slotWin = nullptr, int avg = 1, bool accumulate = false, int wstride = 1);
 int xmacTensorStagedChannels(const XmacShape& s);
 int xmacTensorStagedTile(const XmacShape& s);
 int xmacTensorStagedStages(const XmacShape& s);

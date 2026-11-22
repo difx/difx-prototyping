@@ -19,7 +19,9 @@ output; `passes`: one a bin), bins sorted per channel (`sorted`: a permuted copy
 spectra; `gather`: the XMAC gathering them), timed against the unbinned staged XMAC and checked
 against the host in double.  Bins: `gate` (2, scrunched with weights 0 / 1), `16` (unequal, the narrowest 1/1024; on - off
 when `--scrunch`ed), `128`, `even:N`.  `--avg A` sums A channels into each output channel,
-`--accumulate` adds into the output instead of zeroing it each subint.  `--help` lists the rest
+`--accumulate` adds into the output instead of zeroing it each subint, `--dropout P` / `--partial P`
+give stations invalid or half-valid windows (for the per-bin weights, checked against mpifxcorr's
+sum).  `gatherwm` is the sorted XMAC gathering straight from the usual window-major spectra.  `--help` lists the rest
 (stations, channels, subint, period, DM, the phase convention).  `run-bins.sh` runs the whole test
 matrix (results-local/<host>-bins-<stamp>/).  Results: [docs/results.md](docs/results.md); in short,
 [FINDINGS.md](FINDINGS.md); the approaches side by side, with a diagram: [docs/approaches.md](docs/approaches.md).

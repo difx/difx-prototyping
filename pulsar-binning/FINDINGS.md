@@ -6,9 +6,11 @@
   plus the channel's dispersion offset (fixed per subint); the binconfig's bin ends are arbitrary
   phases.  Separate bins are written each with its weight (its share of the samples); scrunched
   bins are summed with their weights.  gpudifx does not bin.  ([docs/mpifxcorr.md](docs/mpifxcorr.md))
-- **Arbitrary breakpoints, kept**: the bin of each (window, channel) is computed once per subint for
-  every baseline, in 32-bit integer turns, so its cost does not depend on the breakpoints; the
-  precision is set by the window and the within-channel smearing, not by them.
+- **Arbitrary breakpoints, kept**: the bin of each (window, frequency, channel) is computed once per
+  subint, in 32-bit integer turns, and is the same for every station and baseline (DiFX delays the
+  data to the geocentre, where the polyco is evaluated); so its cost is tiny next to the XMAC's
+  and does not depend on the breakpoints.  The precision is set by the window and the
+  within-channel smearing, not by them.
 - To investigate in mpifxcorr: the phase at the window's start (half a window's bias), the
   dispersion offsets of LSB bands, the normalisation of binned and gated output.  (BACKLOG.md)
 
@@ -26,16 +28,24 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   unbinned XMAC for 16 bins and for the 500 ms pulsar (the XMAC gathering each slot's window), 6-7x
   for 128 bins of the 1.5 ms pulsar at 128 channels (a permuted copy), 14x at 1024 channels (bins
   narrower than a window).  ([docs/results.md](docs/results.md), steps 4, 6)
-- **The data layout is the crux**: from the usual window-major spectra, sorting a channel's windows
-  is a 4-byte gather each (dispersion keeps neighbouring channels apart): the permuted copy cost
-  17-28 ms against 3-6 ms from channel-major.  So in pulsar mode the station kernel should write
-  channel-major spectra.
+- **The data layout matters, but the station kernel need not change**: a permuted copy from the
+  usual window-major spectra cost 17-28 ms against 3-6 ms from channel-major ones.  But gathering
+  straight from window-major spectra in the XMAC (`gatherwm`) is as fast as from channel-major at
+  1024 channels and low DM, and up to 2x slower at 128 channels or high DM; or the binning can keep
+  its own transpose (about the XMAC's time on the 2070).
 - **One pass per bin** (one-hot weights): 3.3-70x; **the naive port** (a thread per output): 3.8-188x.
   Neither is the way for many bins.
 - **The output** (nbins x the visibilities per subint) is a large part for many bins: averaging
   channels in the XMAC and accumulating over the integration (no zeroing each subint) help where it
   dominates (the 500 ms pulsar's empty bins: 4.2x to 3.1x).
 - **The bins kernel**: 3-9% of the unbinned XMAC at 10 stations (a binary search over the ends).
+- **The per-bin weights** (mpifxcorr's baseline weight per bin): a count of each bin's samples less a
+  correction over the windows with a station weight below 1 (a matrix product): exact against
+  mpifxcorr's sum; 0.09-0.17 ms a subint with every weight 1, growing with the flagged windows.
+- **High DM** (300 at 1.5 ms: the bin changes at every channel at 1024 channels; 1000 at 500 ms): the
+  sorted approaches are unchanged (each channel sorted on its own); the gate loses its skipping
+  (1.17-1.31x instead of 0.46-0.70x); gathering from window-major spectra, a pass per bin and the
+  naive port get worse.
 
 ## The A100 (2026-11-22, OzSTAR job 21374617)
 

@@ -234,3 +234,62 @@ shape here, 0.321-0.352 ms):
 - **In real time** every binned case but that one is at most 0.08 ms per ms of data (2.1 ms a
   25.6 ms subint); that one 0.27.
 - **The bins kernel**: 0.018-0.037 ms, 5-12% of the XMAC.
+
+## Per-bin weights, high DM, and gathering from window-major spectra (2026-11-22, RTX 2070 SUPER)
+
+`run-bins.sh` (results-local/ar313-adeller-bins-20261122-144706, every run passing) now also runs a
+high DM (300 for the 1.5 ms pulsar, 1000 for the 500 ms one), the per-bin weights and `gatherwm`.
+
+**The per-bin weights** (as mpifxcorr's baselineweight per bin: for each (frequency, bin, baseline,
+product) the sum over the bin's samples of w1 w2 / nchan, w1 and w2 the stations' data weights in
+that window): each bin's count of samples / nchan, from a histogram of the bins, less a correction
+over the windows where some station's weight is below 1, a matrix product [bins x flagged windows]
+x [flagged windows x baseline-products] in 32 x 32 tiles.  Scrunched: the bins' weights times their
+bin weights, the positive ones only.  Checked against mpifxcorr's sum over the samples, in double:
+no differences (`--dropout P`: a station's window invalid, weight 0, spectra zero; `--partial P`:
+weight 0.5).
+- 0.09-0.17 ms a subint with every weight 1 (7-14% of the XMAC: six small kernels; the count could
+  go into the bins kernel).
+- With flagged windows the correction grows with their number: 0.29 ms at 1161 flagged windows
+  (16 scrunched), 0.67 ms at 2527 (128 bins), 1.03 ms with every window flagged, 5.8 ms at 32
+  stations with 3095 (a direct atomic version was 4.4 ms at 2527).  Real data have few windows
+  with weights below 1; a matrix product on the tensor cores, if it mattered.
+
+**High DM** (ratios to the unbinned XMAC; DM 30 in brackets):
+
+| P | ch | bins | DM | best | stage | sorted | gather | gatherwm | naive |
+|---|---|---|---|---|---|---|---|---|---|
+| 1.5 ms | 128 | gate | 300 | 1.31 (0.46) | 1.31 | | | | 5.0 |
+| | | 16 | 300 | 3.33 (3.32) gather | | 4.78 | 3.33 | 8.31 | 15.0 |
+| | | 128 | 300 | 6.51 (6.44) sorted | | 6.51 | 12.2 | 15.0 | 186 |
+| | 1024 | gate | 300 | 1.17 (0.70) | 1.17 | | | | 5.8 |
+| | | 16 | 300 | 4.26 (3.84) gather | | 4.60 | 4.26 | 6.53 | 18.8 |
+| | | 128 | 300 | 14.1 (14.1) sorted | | 14.1 | 24.4 | 30.9 | 409 |
+| 500 ms | 128 | 16 | 1000 | 2.54 (2.65) gather | | 4.73 | 2.54 | 3.77 | 5.5 |
+| | | 128 | 1000 | 3.16 (2.98) gather | | 5.59 | 3.16 | 9.95 | 5.8 |
+| | 1024 | 16 | 1000 | 2.16 (2.76) gather | | 3.99 | 2.16 | 2.86 | 7.2 |
+| | | 128 | 1000 | 4.13 (4.12) gather | | 5.71 | 4.13 | 7.91 | 8.5 |
+
+- **The sorted approaches do not care**: each channel is sorted on its own, so the bins changing at
+  every channel (1.5 ms, 1024 channels, DM 300: adjacent channels 28 µs apart, 2.4 bins) costs them
+  nothing.
+- **The gate loses its skipping**: at DM 300 the on-pulse windows of a block's 8 channels cover
+  every block, so it costs the weighted kernel's overhead, 1.17-1.31x (0.46-0.70x at DM 30).  (At
+  DM 1000 the 500 ms gate is 0.34-0.38x: this subint's phase puts most channels off-pulse.)
+- **Gathering from window-major spectra suffers most**: at low DM neighbouring channels' slots read
+  nearly the same windows and share sectors; at high DM they do not.
+- **A pass per bin and the naive port** get worse (up to 409x).
+
+**Gathering from the window-major spectra** (`gatherwm`: the sorted XMAC's copy gathers each slot's
+window from the station kernel's usual output, no channel-major copy; the only change a stride):
+| case (DM 30) | gather (channel-major) | gather + a transpose in the binning | gatherwm |
+|---|---|---|---|
+| 1.5 ms, 128 ch, 16 bins | 3.3x | 4.5x | 6.1x |
+| 1.5 ms, 128 ch, 128 bins | 12.1x | 13.2x | 15.2x |
+| 500 ms, 1024 ch, 128 bins | 4.1x | 5.2x | 4.2x |
+| 1.5 ms, 1024 ch, 16 bins | 4.3x | 5.3x | 3.8x |
+
+At 1024 channels and low DM it is as fast as gathering from channel-major spectra (the fastest
+version in five rows of the sweep); at 128 channels and at high DM it costs up to 2x more.  So the station kernel
+need not change: the binning can read its usual output (gatherwm), or keep its own transpose to
+channel-major (1.4-1.5 ms on the 2070, about the XMAC's time).

@@ -210,7 +210,8 @@ box(PX, y + 8, PW_, ROWH - 16, "kernel", "sort → permute → the XMAC over the
      "each bin gets the same slots, padded to 16 (the most windows any channel has);",
      "a permute writes the spectra in slot order (zeros in the padding); the staged",
      "XMAC runs a block per segment of a bin and writes that bin once.",
-     "Needs channel-major spectra: from window-major the permute is 4-byte gathers."])
+     "From channel-major spectra (a transpose in the binning; from window-major the",
+     "permute is 4-byte gathers: 17-28 ms)."])
 box(PX + PW_ - 186, y + ROWH - 42, 178, 26, "cm", None, rx=4)
 text(PX + PW_ - 180, y + ROWH - 25, "in: [station][band][channel][window]", size=9.5)
 SX = 0.5
@@ -226,8 +227,9 @@ box(PX, y + 8, PW_, ROWH - 16, "kernel", "sort → the XMAC gathering the slots"
     ["the same sort and slots, no permuted copy: the XMAC's copy into its stage reads",
      "each slot's window through the slot table (a 16-B index load per channel and",
      "4 slots, then 4-byte loads) from the channel-major spectra in time order.",
-     "Saves the permute's pass over the spectra; with long runs the loads are nearly",
-     "contiguous; with runs of 1-3 windows they are scattered (12x at 128 bins, 1.5 ms)."])
+     "Saves the permute's pass; with long runs the loads are nearly contiguous, with runs",
+     "of 1-3 windows scattered.  Also from the usual window-major spectra (gatherwm, no",
+     "copy at all): as fast at 1024 channels, up to 2x slower at 128 or at high DM."])
 grid(GX, gy(y), 128, CW2 * 0.28, CH2, lambda w, c: slots(w, c))
 for k, (sl, src) in enumerate([(3, 1), (21, 25), (40, 49)]):    # a few index arrows, illustrative
     xs = GX + (sl + 0.5) * CW2 * 0.28
@@ -261,8 +263,8 @@ y += 6
 text(16, y, "Which", size=15, weight="bold")
 text(16, y + 20, ["The gate and scrunched output (any weights, negative too): weights in the stage, one pass: 0.33-1.37x the "
                   "unbinned XMAC on the 2070, 0.77-1.80x on the A100.",
-                  "Separate bins: sorted per channel, from channel-major spectra (the station kernel should write them in "
-                  "pulsar mode), gathered: 3-5x on the A100 in every case but one",
+                  "Separate bins: sorted per channel and gathered, from channel-major spectra (the binning's own transpose) "
+                  "or the usual window-major ones: 3-5x on the A100 in every case but one",
                   "(on the 2070 the permuted copy wins for short runs, 6.5x against 12x; on the A100 gather wins there too, "
                   "6.6x against 7.1x).  Bins narrower than a window (1.5 ms,",
                   "1024 channels, 128 bins: 14x / 18x) sample rather than resolve the pulse: warn, do not optimise.  "
@@ -272,8 +274,8 @@ text(16, y, "The layouts, slowest index first (the last is contiguous)", size=14
 key = [
     ("f16", "FP16 spectra, window-major", "[station] [window] [band] [channel]   what the station kernel writes now; "
      "the stage and passes read it (16-B loads of 4 channels x 1 window)"),
-    ("cm", "FP16 spectra, channel-major", "[station] [band] [channel] [window]   a channel's windows contiguous: what the "
-     "sorted paths start from (here a transpose; the station kernel, in pulsar mode)"),
+    ("cm", "FP16 spectra, channel-major", "[station] [band] [channel] [window]   a channel's windows contiguous: what "
+     "sorted and gather start from (a transpose in the binning; gatherwm reads window-major)"),
     ("cm", "slots (sorted, permuted copy)", "[station] [band] [channel] [slot]   each channel's windows in bin order, bins "
      "padded to 16 slots, the same slots across a channel group"),
     ("chip", "bins, slot table, segments", "bins [window][freq][chan] u8;  slotWin [freq][chan][slot] window or -1;  "

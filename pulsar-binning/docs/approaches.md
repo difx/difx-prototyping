@@ -27,7 +27,8 @@ checked against the host in double.  Full tables: [results.md](results.md).
 
 ## The bins (every approach)
 
-A kernel gives every (window, frequency, channel) its bin, once per subint, for every baseline: the
+A kernel gives every (window, frequency, channel) its bin, once per subint, the same for every station
+and baseline (the data are delayed to the geocentre, where the polyco is evaluated): the
 phase as a 32-bit fraction of a turn (the window's phase + the channel's dispersion offset, integer
 adds, the wrap free), then a binary search over the bin ends (arbitrary, as mpifxcorr's binconfig).
 0.04-0.10 ms a subint (3-9% of the XMAC at 10 stations; the search's depth sets it).  The sorted
@@ -69,6 +70,8 @@ weight 0), copied as is (every weight 1), scaled, or scaled with signs.
   blocks are 16 windows wide, so about half the blocks remain (0.46x); at 1024 channels the windows
   are 8x longer against the period, and fewer blocks are all off (0.70x).  An off-pulse subint of the
   500 ms pulsar costs almost nothing.  Per window it does, it is no faster.
+- **At high DM the skipping goes**: at DM 300 a block's 8 channels hold on-pulse windows in every
+  block, and the gate costs 1.17-1.31x on the 2070 (0.46-0.70x at DM 30).
 
 ## 3. A pass per bin (separate bins)
 
@@ -98,7 +101,8 @@ multiplies is one bin, for every channel, and writes that bin once at the end.
   window-major order the permute is a 4-byte gather per value, a sector each, and dispersion keeps
   neighbouring channels from sharing them: 17-28 ms.  From channel-major, a channel's windows in a
   bin come in runs and the permute reads them nearly contiguously.  Here a transpose makes them
-  (1.4-1.5 ms, not counted); in DiFX the station kernel would write them in pulsar mode.
+  (1.4-1.5 ms on the 2070, not counted): the binning's own, or (not needed, see 5) the station
+  kernel's in pulsar mode.
 - *Measured:* 6.5x / 7.1x (1.5 ms, 128 channels, 128 bins: the best there on the 2070), 14x / 20x at
   1024 channels (bins narrower than a window), 5.6x / 5.6x (500 ms, 1024 channels, 128 bins),
   4.6x / 4.1x (1.5 ms, 16 bins).
@@ -115,6 +119,16 @@ loads) from the channel-major spectra in time order.
   3.3x / 3.2x (1.5 ms, 16 bins): the best there; 12.1x / 6.6x (1.5 ms, 128 channels, 128 bins), where
   on the 2070 the permuted copy wins and on the A100 gather still does (its 40 MB of L2 against the
   2070's 4 MB).  On the A100 gather is the fastest for every separate-bin case.
+
+**5b. Gathered from the window-major spectra** (`gatherwm`): the same, reading the station kernel's
+usual output (the only change a stride), so neither the station kernel nor a transpose changes
+anything.  As fast as from channel-major at 1024 channels and low DM (3.8x, 4.2x on the 2070); up to
+2x slower at 128 channels (6.1x, 15.2x) and at high DM (neighbouring channels then read different
+windows and share no sectors).  With a transpose of its own the binning gets channel-major's speed
+for about the XMAC's time more.
+
+**Dispersion does not change the sorted approaches**: each channel is sorted on its own, so the bin
+changing at every channel (1.5 ms, 1024 channels, DM 300) costs them nothing (14.1x either way).
 
 ## 6. Splitting the 16-window blocks at bin changes (not built)
 
@@ -147,7 +161,9 @@ smaller output saves.
 | separate bins | bins narrower than a window | warn: such bins sample the pulse rather than resolve it | 14x | 18x |
 
 So one sorted approach, gathered, covers separate bins on the A100, and costs the 2070 2x only for
-the shortest runs.
+the shortest runs.  It can read the station kernel's usual window-major output (5b) at some cost
+(up to 2x at 128 channels or high DM), or a channel-major copy the binning makes itself: either
+way the station kernel stays as it is.
 
 The sorted approaches need channel-major spectra from the station kernel in pulsar mode.  32
 stations (where the XMAC is 4x larger) give the same picture or better: the gate 0.33x, 16 scrunched

@@ -44,7 +44,8 @@ the GPU uses it.
   at the shift each bin is scaled by its weight and they are summed into one output.  Its weight
   is Σ (w1 w2 / nchan) x weight[bin] over the samples, **positive weights only** (negative ones
   are left out of the weight, by design).
-- Phase centres and binning combine: the shift runs per bin.
+- Phase centres and binning combine: the shift runs per bin.  (Not needed on the GPU: a job uses one
+  or the other.)
 - **Normalisation**: the weights count samples, so a gated or binned visibility's amplitude, and
   a scrunched one's noise, are not normalised so that the noise comes out right (a weighted sum
   Σ w_b V_b has noise ∝ √(Σ w_b² n_b), its weight Σ_{w_b > 0} w_b n_b).  To fix (BACKLOG.md).
@@ -54,7 +55,8 @@ the GPU uses it.
 **Keep arbitrary breakpoints (mpifxcorr's binconfig, unchanged).**  The reasons:
 
 1. **The cost does not depend on it.**  The bin index is computed once per (window, channel,
-   frequency) per subint and shared by every baseline and product: nwin x nchan x nfreq values,
+   frequency) per subint, the same for every station, baseline and product (the data are delayed to
+   the geocentre, where the polyco is evaluated): nwin x nchan x nfreq values,
    against the XMAC's nwin x nchan x nfreq x nbaseline x 4 multiply-accumulates.  Every GPU
    approach below takes a bin index (or a weight) per (window, channel), however it was computed.
    - 1/2^N would simplify the phase-to-bin step (the top N bits of the phase).  Integer phase gets
