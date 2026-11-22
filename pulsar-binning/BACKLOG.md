@@ -3,6 +3,12 @@
 mpifxcorr's implementation is read: [docs/mpifxcorr.md](docs/mpifxcorr.md), with the decision
 to keep arbitrary breakpoints.
 
+## Done
+
+- binbench steps 1-2 (below): the bins (integer phase, arbitrary ends: exact against mpifxcorr's
+  rule; 3-9% of the unbinned XMAC at 10 stations) and the naive port (3.8-6.2x the XMAC with one
+  sum, 96-188x for 128 separate bins at 1.5 ms), checked on the 2070 ([docs/results.md](docs/results.md)).
+
 ## The test cases
 
 Every parameter variable; these are the defaults and the sweep.
@@ -30,7 +36,7 @@ Every parameter variable; these are the defaults and the sweep.
    window's step and the channel's dispersion offset added as integers, the wrap free), arbitrary
    breakpoints by a 1024-cell table on the top bits plus one comparison.  mpifxcorr's convention
    by default (the window's start; its channel frequencies), an option for the window's middle.
-   Its cost against the XMAC's (expected: negligible).
+   Its cost against the XMAC's: 3-9% at 10 stations (the binary search); a lookup table to try.
 2. **The reference**: a naive port of mpifxcorr (a thread per (baseline, product, channel),
    looping over windows into its bins), checked against the host in double.
 3. **Weights in the stage** (the staged XMAC, `common/xmac.cu`, behind a template flag so the

@@ -23,7 +23,8 @@ its `FINDINGS.md`.
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)
 
 - Done: mpifxcorr's binning read (docs/mpifxcorr.md); arbitrary breakpoints kept, phase in integer math.
-- Next: binbench: the bins per (window, channel); a naive reference; weights in the XMAC's stage (gate, scrunch, a pass per bin); bins sorted per channel; the output side.
+- Done: binbench's bins (exact against mpifxcorr's rule) and naive port (3.8-188x the unbinned XMAC), on the 2070.
+- Next: weights in the XMAC's stage (gate, scrunch, a pass per bin); bins sorted per channel; the output side.
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 

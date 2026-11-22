@@ -10,6 +10,7 @@ fft-fusion/fusebench
 xmac/xmacbench
 two-stage/twostagebench
 phase-centres/phasecentrebench
+pulsar-binning/binbench
 # local results; OzSTAR job and build logs and copy scripts are in logfiles/ (its own .gitignore)
 */results-local/
 # where they were before logfiles/
