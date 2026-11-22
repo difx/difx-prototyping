@@ -576,3 +576,31 @@ help: at DM 300 a quad's channels mostly do not share a window).  From channel-m
 gather is 4.0x at 128 channels (1.73x the chain, before a transpose of about the XMAC's time) but
 6.8x at 1024 channels (2.38x) whatever the DM: 1024 channels' 32 bins (47 us each, 1.5 windows) cost
 more than the layout explains.
+
+**Nsight Compute** (`results-local/ncu-gina17-20261122-220753`, the pb-32-* cases, the gathering
+XMAC alone, 32 bins of the 1.5 ms pulsar; ncu's clock):
+
+| | window-major, DM 30, 128 ch | window-major, DM 300, 128 ch | channel-major, DM 300, 128 ch | channel-major, DM 300, 1024 ch |
+|---|---|---|---|---|
+| duration (ms) | 1.34 | 2.51 | 0.95 | 2.71 |
+| DRAM read (GB) | 1.33 | 3.93 | 0.39 | 2.98 |
+| DRAM write (GB) | 0.06 | 0.06 | 0.05 | 0.47 |
+| L2 hit rate | 70% | 48% | 68% | 59% |
+| DRAM throughput | 51% | 78% | 23% | 63% |
+| instructions | 139M | 141M | 141M | 480M |
+
+The same instructions and L1 sectors in the three 128-channel cases; the difference is DRAM.  The
+spectra are about 0.39 GB: window-major at DM 300 reads them 10 times over.  A 32-byte sector holds a
+window's 8 channels (a channel group); at high DM those 8 channels fall in different bins, and each
+block covers one bin over the whole subint, so the blocks that need a sector run at different times
+and it is fetched from DRAM for each.  At 1024 channels from channel-major the same happens along
+the windows (a bin is 1.5 windows a period, so a channel's slots are runs of 1-2 windows, a sector
+holding 8), with 3.4x the instructions (5x the blocks, each with fewer slots) and 0.47 GB of output.
+
+**Segments in time order** (`sort_layout`, `--seg-len`, `run-seglen.sh`): each bin's slots split into
+segments of L slot blocks, ordered time first, then bin, so that the blocks running together read
+the same windows and L2 keeps the sectors between bins.  Correct (every run passing); with the default
+L = 32 a bin is one segment, as before.  On the 2070 (4 MB of L2, too small for a time chunk) shorter
+segments only add blocks and output atomics (`results-local/ar313-adeller-seglen-20261122-222423`: 32
+bins, 128 channels, DM 300, window-major 10.4x at L 32, 10.9x at 8, 12.4x at 2); the A100 (40 MB) is
+the test.

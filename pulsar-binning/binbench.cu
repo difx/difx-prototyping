@@ -130,16 +130,26 @@ __global__ void sort_layout(int nfreq, int nchan, int CH, int nbins, int L, int 
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nfreq * ncg) return;
     const int f = i / ncg, g = i % ncg;
-    int pos = 0, k = 0;
-    for (int b = 0; b < nbins; b++) {
+    auto nsbOf = [&](int b) {
         int mx = 0;
         for (int c = g * CH; c < min(nchan, g * CH + CH); c++) mx = max(mx, cnt[((size_t)f * nchan + c) * nbins + b]);
+        return (mx + 15) / 16;
+    };
+    int pos = 0, k = 0, maxNseg = 0;
+    for (int b = 0; b < nbins; b++) {
         segStart[(size_t)i * nbins + b] = pos;
-        const int nsb = (mx + 15) / 16, nseg = (nsb + L - 1) / L;
-        for (int j = 0; j < nseg && k < maxSeg; j++, k++)
-            segs[(size_t)i * maxSeg + k] = make_int4(b, pos / 16 + j * L, pos / 16 + min(nsb, (j + 1) * L), nseg);
+        const int nsb = nsbOf(b);
+        maxNseg = max(maxNseg, (nsb + L - 1) / L);
         pos += 16 * nsb;
     }
+    // the segments in time order, then bin: a bin's slots are its windows in order, so segment j of
+    // every bin covers about the same windows, and the blocks running together share the spectra's
+    // sectors in L2 (at high DM a window's channels in a group fall in different bins)
+    for (int j = 0; j < maxNseg; j++)
+        for (int b = 0; b < nbins && k < maxSeg; b++) {
+            const int nsb = nsbOf(b), nseg = (nsb + L - 1) / L, s0 = segStart[(size_t)i * nbins + b] / 16;
+            if (j < nseg) segs[(size_t)i * maxSeg + k++] = make_int4(b, s0 + j * L, s0 + min(nsb, (j + 1) * L), nseg);
+        }
     for (; k < maxSeg; k++) segs[(size_t)i * maxSeg + k] = make_int4(-1, 0, 0, 0);
     atomicMax(maxSlots, pos);
 }
