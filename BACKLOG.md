@@ -5,16 +5,17 @@ its `FINDINGS.md`.
 
 ## Now
 
-- [phase-centres](phase-centres/BACKLOG.md): phasecentrebench built and swept on the 2070 and the A100; next the shift's occupancy.
+- [phase-centres](phase-centres/BACKLOG.md): phasecentrebench optimised (shift 2-3x at 100+ centres); next the A100 again.
 
 ## [phase-centres](phase-centres/BACKLOG.md)
 
 - Done: mpifxcorr's implementation read (docs/mpifxcorr.md).
 - Done: phasecentrebench (pieces, delays per antenna, the shift naive / SIMT / tensor), swept on the 2070.
 - Done: the A100 sweep (shift / XMAC ≈ 0.5-0.65 x centres / windows per piece).
-- Next: the shift's occupancy (latency-bound at 25%) towards the tensor-core rate.
-- Next: the XMAC with K output slots in one launch (short pieces); the shift in the XMAC's epilogue.
-- Later: lower sideband; a time-domain check of the lag-window decorrelation; a NUFFT shift for centres ≫ channels averaged.
+- Done: the optimisation round on the 2070 (shift 2-3x at 100+ centres, XMAC zeroing skipped); lower sideband; lag-window term checked.
+- Dropped: the XMAC's pieces in one launch (0-1%); the shift in the XMAC's epilogue (atomics 2-260x the shift).
+- Next: the A100 after the optimisation round.
+- Later: pieces in multiples of 16 windows (only for very short pieces); a NUFFT shift for centres ≫ channels averaged.
 
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)
 

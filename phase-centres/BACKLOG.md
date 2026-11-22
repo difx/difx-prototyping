@@ -8,22 +8,34 @@ shift / XMAC ≈ 2 × centres / windows per piece.
 - `phasecentrebench`, the shift after the XMAC, checked and swept on the 2070 and the A100
   ([docs/results.md](docs/results.md)).  It has the pieces from `maxNSBetweenUVShifts`, delays per
   (antenna, centre), and the naive, SIMT and tensor shifts.
+- The optimisation round (2070, docs/results.md "The optimisation round"):
+  - the shift's occupancy: 32 centres a block, 3 blocks an SM; outputs stored once; inner phasors
+    by recurrence (2-3x at 100+ centres);
+  - the staged XMAC skips zeroing when every visibility is stored (5-20%).
+- Lower sideband (`--sideband`).
+- The lag-window term of the decorrelation estimate checked by simulation (`lagwindow.py`).
+
+## Tried and dropped
+
+- The XMAC with the pieces in one launch: 0-1%.  The short pieces' cost is the 16-window MMA
+  tile and a full set of fine visibilities a piece, not the launches.
+- The shift in the XMAC's epilogue: a block has 8-16 channels, an output 64+; the atomics alone
+  cost 2-260x the whole shift.
+- Outer phasors by recurrence: slower.  Centre tiles fastest in the grid: no gain.
+- Double buffering: not tried (3 blocks an SM overlap the loads already; 2 chunks a piece at 64
+  averaged; a second buffer would cost the third block).
 
 ## Next
 
-- **Towards the tensor-core rate**: the shift is at 10-20% of it, latency-bound at 25%
-  occupancy (151 registers at 64 centres a block, one block an SM; docs/results.md).
-  - Fewer registers, or two blocks an SM.
-  - Loads overlapping the MMAs (double buffering).
-  - The inner phasors from a table per piece.
-- (Short averages: not a priority, since they come with few centres, where they are cheap.  The
-  outer phasor by recurrence was tried and was slower; docs/results.md.)
-- **The XMAC with K output slots in one launch** (the windows of each piece to its own slot)
-  instead of K launches, each zeroing and writing.  That is the short-piece cost.
-- **The shift in the XMAC's epilogue**, against the shift from DRAM.
-- **Lower sideband**, as mpifxcorr's channel frequencies.
-- **A check of the lag-window term** of the decorrelation estimate: time-domain data through a
-  station stage.
+- **The A100** again, after the optimisation round (`run-centres.sh`): it has more shared memory
+  a SM (164 KB), so possibly 4+ blocks an SM.
+- **Short pieces** (only if a user wants pieces of a few ms): windows per piece not a multiple of
+  16 pay for the whole MMA tile; pieces rounded to multiples of 16 windows would avoid it.
+
+## Later
+
+- A NUFFT shift for centres far more than the channels averaged.
+- In DiFX: the shift kernel after gpudifx's XMAC; `maxNSBetweenUVShifts` to pieces as here.
 
 ## The GPU design (prototyped in phasecentrebench)
 

@@ -32,6 +32,18 @@ Detail: [docs/mpifxcorr.md](docs/mpifxcorr.md) (how mpifxcorr does it),
 - **Short pieces cost the XMAC too**: 1.27x at 50 windows a piece, 1.8x at 25, 3.7x at 10 on the
   2070, 1.4x / 2.3x / 5.1x on the A100.  With 10s of ms pieces (O(100) windows) it does not
   matter.  ([results.md](docs/results.md))
+- **The optimisation round (2026-11-22, 2070): the tensor shift 2.0-3.0x faster with 100+ centres**
+  (1.4-1.5x at 1-10, where it was cheap already), the XMAC 5-20%.
+  - 32 centres a block, 3 blocks an SM (80 registers, 21 KB), each output stored once instead of
+    zeroed and added, inner phasors by a short recurrence.  23-34% of the tensor-core rate.
+  - Shift / XMAC ≈ 0.25-0.36 x centres / windows per piece.  100 centres at 100 windows: +37% over
+    the XMAC alone (was +80%); 1000 centres: 3.8x (was 7.7x).
+  - The staged XMAC no longer zeroes its output when every visibility is stored anyway (5-20%).
+  - Ruled out: the shift in the XMAC's epilogue (its atomics alone cost 2-260x the whole shift);
+    the XMAC's pieces in one launch (0-1%).  ([results.md](docs/results.md), "The optimisation round")
+- **Lower sideband** works through a base frequency per band, as mpifxcorr's rotator.
+- **mpifxcorr's lag-window term, 1 - |Δτ| / (nchan / bw), is right** to 5e-4 in a time-domain
+  simulation (`lagwindow.py`).  ([results.md](docs/results.md))
 - **Averages of 8-16 channels: the per-output work dominates**, and the tensor version loses to
   FP32 on the CUDA cores.  But they come with few centres, where the shift is cheap (0.04 ms per
   ms at 10 centres, against the XMAC's 0.075).  An outer phasor by recurrence was slower.  The

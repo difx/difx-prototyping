@@ -455,7 +455,8 @@ static void launchStaged(const XmacShape& s, const XmacMap& m, const StagedPlan&
     const unsigned nx = (unsigned)((s.nchan + CH - 1) / CH * nsp);
     const int ntb = (s.nwin + 15) / 16;
     const int nchunk = windowChunks((long long)nx * s.nfreq * threads, ntb, 4, sms);
-    CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
+    if (nchunk > 1 || !m.complete)        // else every block stores its sums, and every visibility has one
+        CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
     kernel<<<dim3(nx, s.nfreq, nchunk), threads, P.smem, st>>>(s, m, spec, (float2*)vis, superPairs, nsp, P.srows,
                                                               P.nbuf, nchunk);
     CHECK_CUDA(cudaGetLastError());
@@ -483,6 +484,7 @@ XmacMap xmacUploadMap(const XmacMapHost& h) {
         }
     XmacMap m;
     m.rmax = h.rmax;
+    m.complete = std::all_of(h.nrecv.begin(), h.nrecv.end(), [&](int n) { return n == h.rmax; });
     for (size_t i = 0; i < h.off.size(); i++) {
         m.maxOff = std::max(m.maxOff, h.off[i]);
         m.maxStride = std::max(m.maxStride, (long long)h.wstride[i]);

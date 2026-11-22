@@ -41,3 +41,11 @@ different band layouts).  Hardware eras: [../README.md](../README.md#benchmark-h
   stride, a station): different bandwidths and band counts, stations missing a frequency, checked
   against a double-precision reference with `xmacbench --messy`; the map costs nothing measurable
   (32-bit offsets per row: 64-bit pointers spilled registers).  ([messy.md](docs/messy.md))
+
+## Zeroing (2026-11-22)
+
+- **The staged XMAC no longer zeroes its output when it need not**: unsplit (one chunk of windows a
+  block) each block stores its sums, and with a complete map every visibility is written.
+  5-20% off the XMAC in phasecentrebench (more with short pieces, 32 stations, 13 windows a subint).
+  ([../phase-centres/docs/results.md](../phase-centres/docs/results.md), "The optimisation round")
+

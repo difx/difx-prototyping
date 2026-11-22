@@ -1,4 +1,4 @@
-# phasecentrebench: the shift after the XMAC, first results (RTX 2070 SUPER, A100)
+# phasecentrebench: the shift after the XMAC (RTX 2070 SUPER, A100)
 
 The benchmark (`phasecentrebench.cu`, [README](../README.md)) runs:
 1. The staged tensor XMAC once per piece, writing each piece's fine visibilities.
@@ -8,7 +8,99 @@ The benchmark (`phasecentrebench.cu`, [README](../README.md)) runs:
    - `simt`: an FP32 matrix product;
    - `tensor`: an FP16 WMMA matrix product.
 
-## The run
+## The optimisation round (2026-11-22, RTX 2070 SUPER)
+
+The backlog's items in turn, each measured on the 2070 (150 W, 1500 MHz) and kept only if it paid
+for itself.  The resulting sweep (`results-local/ar313-adeller-centres-20261122-000946`, every
+run passing), as the tables below:
+
+| sweep | value | windows a piece | xmac | delays | naive | simt | tensor | sh/xmac | work | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| centres | 1 | 100 | 0.0707 | 0.0004 | 0.0086 | 0.0185 | 0.0068 | 0.10 | 0.01 | 0.0779 |
+| centres | 10 | 100 | 0.0711 | 0.0005 | 0.0789 | 0.0187 | 0.0071 | 0.10 | 0.10 | 0.0788 |
+| centres | **100** | 100 | 0.0704 | 0.0005 | 0.7775 | 0.0708 | 0.0254 | 0.36 | 1.00 | **0.0963** |
+| centres | 1000 | 100 | 0.0702 | 0.0032 | 7.6998 | 0.5617 | 0.1959 | 2.79 | 10.00 | 0.2693 |
+| pieces | 2 | 50 | 0.0862 | 0.0009 | - | 0.1345 | 0.0477 | 0.55 | 2.00 | 0.1348 |
+| pieces | 4 | 25 | 0.1175 | 0.0015 | - | 0.2652 | 0.0910 | 0.77 | 4.00 | 0.2101 |
+| pieces | 10 | 10 | 0.2298 | 0.0034 | - | 0.6505 | 0.2242 | 0.98 | 10.00 | 0.4575 |
+| avg | 8 | 100 | 0.0709 | 0.0006 | - | 0.1573 | 0.1074 | 1.51 | 1.00 | 0.1789 |
+| avg | 16 | 100 | 0.0706 | 0.0006 | - | 0.1061 | 0.0579 | 0.82 | 1.00 | 0.1290 |
+| avg | 32 | 100 | 0.0710 | 0.0006 | - | 0.0811 | 0.0346 | 0.49 | 1.00 | 0.1062 |
+| avg | 128 | 100 | 0.0713 | 0.0006 | - | 0.0646 | 0.0206 | 0.29 | 1.00 | 0.0925 |
+| avg | 256 | 100 | 0.0710 | 0.0006 | - | 0.0618 | 0.0179 | 0.25 | 1.00 | 0.0894 |
+| nchan | 1024 (avg 8, 800 windows) | 800 | 0.0583 | 0.0006 | - | 0.0193 | 0.0134 | 0.23 | 0.12 | 0.0722 |
+| nchan | 65536 (avg 512, 13 windows) | 13 | 0.1812 | 0.0005 | - | 0.4555 | 0.1424 | 0.79 | 7.69 | 0.3241 |
+| nant | 32 | 100 | 0.3832 | 0.0036 | - | 0.7662 | 0.2721 | 0.71 | 1.00 | 0.6588 |
+
+**Against the first version (below): the tensor shift 1.4-3.0x faster, the XMAC 0-20%.**
+- Tensor shift: 2.0-3.0x with 100 or more centres in one piece: 0.0598 -> 0.0254 ms per ms at the
+  default shape (2.4x), 0.4985 -> 0.1959 at 1000 centres (2.5x), 0.6535 -> 0.2721 at 32 stations
+  (2.4x), 0.3235 -> 0.1074 at 8 channels averaged (3.0x).  1.4-1.5x at 1-10 centres (where it was
+  cheap already), 1.7-2.0x with 2-10 pieces, 1.7x at 65536 channels.
+- With 100 or more centres it runs at 0.9-1.29 Tcmac/s: 23-34% of the 2070's tensor-core rate
+  (FP16 in, FP32 sums: about 3.8 Tcmac/s at 1500 MHz).
+- XMAC: 5-6% with one piece (the zeroing skipped, below), 10-20% with 2-10 pieces, 65536 channels
+  (13 windows) or 32 stations.
+- Whole chain at 100 centres: 0.135 -> 0.096 ms per ms, +37% over the XMAC alone (was +80%).
+  10 centres: +11%.  1000 centres: 3.8x the XMAC (was 7.7x).
+- **Shift / XMAC ≈ 0.25-0.36 x centres / windows per piece** for averages of 64 or more (was
+  0.5-0.8).
+
+What each step did, at the default shape (tensor shift, ms per subint of 25.6 ms; the first
+version 1.55):
+
+| step | default | 1000 centres | kept |
+|---|---|---|---|
+| 32 centres a block instead of 64 (101 registers, 28 KB: 2 blocks an SM instead of 1) | 1.22 | 10.0 | yes |
+| the tensor kernel's shared memory sized for itself (it had the SIMT kernel's), and `__launch_bounds__(256, 3)`: 80 registers, 21 KB, 3 blocks an SM; 73% achieved occupancy | 1.00 | 8.30 | yes |
+| store each output once instead of zeroing it and adding (every output has one owner; the pieces are summed in registers) | 0.69 | 5.35 | yes |
+| inner phasors by a short recurrence (a thread's 4 channels of one centre: 1 sincos and 3 multiplies instead of 4 sincos) | 0.67 | 5.11 | yes (3-4%, no more code) |
+| the centre tiles fastest in the grid (blocks sharing fine visibilities together in L2) | 0.67 | 5.17 | no (no gain) |
+| outer phasors by recurrence (tried on the first version) | slower | slower | no |
+
+- **Nsight Compute after the steps** (`--clock-control none`, 1500 MHz): 74% occupancy, 55% of the
+  SM's compute throughput, 42% of DRAM bandwidth, the stalls spread over fixed latency, global
+  loads, the math pipes and barriers; 0.56 instructions issued a cycle per scheduler.  About 24%
+  of the instructions are the outer phasors, 16% were the inner phasors (before their
+  recurrence), 6% the loads of V; the MMAs themselves are few.  No single limit is left.
+- **Not tried: double buffering** of the chunks' loads.  With 3 blocks an SM one block's loads
+  overlap the others' products already, there are only A / 32 chunks a piece (2 at 64 averaged),
+  and a second buffer would cost the third block.
+
+**The XMAC with the pieces in one launch** (the backlog item: each piece to its own slot, grid z =
+pieces x window chunks): bitwise the same visibilities, but only 0-1% faster than a launch a
+piece.  The short pieces' cost is not the launches: it is the 16-window MMA tile (10 windows pay
+for 16) and the output, a full set of fine visibilities a piece.  Reverted.  What it showed instead:
+**the staged XMAC zeroed its output first even when nothing needed it.**  Unsplit (one chunk of
+windows a block) each block stores its sums, and with a complete map every visibility is written,
+so `common/xmac.cu` now skips the zeroing then (`XmacMap::complete`).  XMAC: 6% faster with one
+piece, 14% with 4, 16% with 10.  xmacbench (regular, `--messy`, `--invalid`, 32 stations) and
+fusebench `--xmac` checks pass.
+
+**The shift in the XMAC's epilogue: ruled out.**  A staged XMAC block holds 8 (at most 16)
+channels of sums, a shift output averages A >= 64.  So the epilogue could only form partial sums
+over its channels and add them atomically into every centre's outputs: nfreq x baselines x 4 x
+nchan / 8 x centres complex atomic adds a piece.  Those adds alone (a one-off kernel doing nothing else,
+a thread per (baseline-product, centre, 8-channel group), default shape): 2.5 ms at 10 centres, 113 ms at 100, 1363 ms at 1000 with 8
+channels a block (0.37 / 58 / 687 with 16), against 0.19 / 0.67 / 5.2 ms for the whole shift from
+DRAM.  A block holding all A channels (no atomics) would need 8x the XMAC's accumulators.  The
+fine visibilities' round trip through DRAM is the right design.
+
+**Lower sideband** (`--sideband L` or `mixed`): mpifxcorr's rotator puts an LSB band's channel c
+at LO - (nchan - 1 - c) df, the same as an upper sideband from LO - (nchan - 1) df, so the
+kernels only take a base frequency per band (`cBase`); the decorrelation estimate keeps the LO
+(as mpifxcorr's).  Every check passes for USB, LSB and mixed.  As for USB, the convention is
+mpifxcorr's, tested for consistency, not against the sky.
+
+**The lag-window term of mpifxcorr's decorrelation estimate is right** (`lagwindow.py`): in a
+time-domain simulation (white noise, a fractional delay d between two stations, the same
+rectangular N-sample windows, the shift to d, averaged) the coherence is 1 - |d| / N to within
+5e-4, for d from 1% to 50% of the window, at 512 and 128 channels.  So the gap between the
+estimate and the coherence phasecentrebench measures (0.949 against 0.997) is that term, which
+its per-channel synthetic data does not have.  (For windows that overlap or taper, as WOLA, the
+term would differ.)
+
+## The first version (2026-11-21)
 
 RTX 2070 SUPER, ar313, at the 150 W cap and the 1500 MHz clock lock (2026-11-21, every run
 passing: `results-local/ar313-adeller-centres-20261121-230101`, `run-centres.sh`).
@@ -91,7 +183,7 @@ Each sweep below changes one parameter from that.  The table is in ms per ms of 
 - **32 stations: shift / XMAC 1.5 at work 1.**  The XMAC is more efficient with more stations
   (569 Gcmac/s); the shift is not.
 
-## A100-SXM4-80GB (OzSTAR gina3)
+## A100-SXM4-80GB (OzSTAR gina3), the first version
 
 SLURM job 21341101, commit 7fc7d05 (the same kernels as the 2070 run), every run passing
 (`results-local/gina3-centres-20261121-233134`).  Columns as above, ms per ms of data:

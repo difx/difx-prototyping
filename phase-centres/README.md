@@ -50,7 +50,7 @@ Depends on [`../xmac`](../xmac/README.md)'s staged XMAC and, for fine channels, 
    `[frequency][baseline][centre][product][output channel]`:
    - `naive`: a thread per output, a sincos per fine channel (the obvious port);
    - `simt`: the shift as a matrix product per baseline, FP32 on the CUDA cores;
-   - `tensor`: the same with FP16 WMMA (FP32 sums).
+   - `tensor`: the same with FP16 WMMA (FP32 sums), 32 centres a block, 3 blocks an SM.
 
    The product is [frequencies x products x output channels, A] x [A, centres] for A channels
    averaged.  Then an outer phasor per output, computed in FP32 from split constants (no FP64 per
@@ -66,8 +66,12 @@ phase-centres/phasecentrebench --centres 1000 --pieces 4 --avg 128 --only simt,t
 phase-centres/run-centres.sh           # the sweeps of docs/results.md
 ```
 
-`--help` lists the options: stations, frequencies, channels, bandwidth, windows, pieces,
-averaging, centres, the field's delay spread, the source's centre, noise.
+`--help` lists the options: stations, frequencies, channels, bandwidth, sideband, windows, pieces,
+averaging, centres, the field's delay spread, the source's centre, noise, the tensor shift's
+centres a block.
+
+`lagwindow.py` checks the lag-window term of mpifxcorr's decorrelation estimate by a time-domain
+simulation (numpy).
 
 **Checks** (the run fails if any fails):
 - the delays and the decorrelation estimate against the host, in double;

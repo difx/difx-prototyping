@@ -77,7 +77,8 @@ struct XmacGpudifx {
 
 // The staged XMAC splits the windows over several blocks when the baselines and channels alone
 // would not fill the GPU (as gpudifx's launch does), and adds the partial sums atomically: vis is
-// zeroed first.
+// zeroed first.  Unsplit, each block stores its sums, and with a complete map (every frequency has
+// every station) every visibility is written: no zeroing.
 // Where the staged XMAC finds each receiver's FP16 spectra, per correlated frequency: the stations
 // need not share one layout (different bandwidths and numbers of bands, a frequency some stations
 // lack).  Per frequency f, receivers r = 2 k + pol for the k-th station present (stations in
@@ -96,6 +97,7 @@ struct XmacMapHost {
 struct XmacMap {                                 // the same on the device
     int rmax = 0;
     long long maxOff = 0, maxStride = 0;         // (host) the largest offset and window stride
+    bool complete = false;                       // (host) every frequency has every station's receivers
     const int* nrecv = nullptr, * wstride = nullptr, * station = nullptr;
     const long long* off = nullptr;
 };

@@ -44,12 +44,17 @@ __host__ __device__ inline double Dof(const Poly* poly, int S, int a, int s, dou
 
 struct Setup {
     int nant, nfreq, nchan, nwin, K, A, G, S, nbl;
-    double bwHz, flo0, df, twin;      // band width, the lowest band's (USB) edge, fine channel width (Hz); window (s)
+    double bwHz, flo0, df, twin;      // band width, the lowest band's lower edge, fine channel width (Hz); window (s)
+    std::vector<char> lsb;            // per frequency: lower sideband
     std::vector<int> w0;              // the pieces' first windows, K + 1 (the last = nwin)
     int R() const { return nfreq * 4 * G; }      // rows of the product per baseline: (frequency, product, g)
     double tmid(int k) const { return 0.5 * (w0[k] + w0[k + 1]) * twin; }
     double width(int k) const { return (w0[k + 1] - w0[k]) * twin; }
-    double flo(int f) const { return flo0 + f * bwHz; }
+    // the band's LO (its lower edge for USB, upper for LSB), and the sky frequency of its channel 0:
+    // as mpifxcorr's rotator, channel c is at LO + c df (USB) or LO - (nchan - 1 - c) df (LSB), so
+    // either way base + c df
+    double lo(int f) const { return flo0 + (f + (lsb[f] ? 1 : 0)) * bwHz; }
+    double base(int f) const { return lsb[f] ? lo(f) - (nchan - 1) * df : lo(f); }
     size_t outCount() const { return (size_t)nfreq * nbl * S * 4 * G; }
     size_t outIndex(int f, int bl, int s, int p, int g) const {
         return ((((size_t)f * nbl + bl) * S + s) * 4 + p) * G + g;
@@ -82,6 +87,10 @@ __device__ inline float2 phasor(double turns) {      // e^{2πi turns}
 // ---- the delays: Δτ per (piece, baseline, centre), and mpifxcorr's decorrelation estimate -------
 // decorr[f][bl][s] += width x sinc(π Δτ' width fLO_f) x (1 - |Δτ| / (nchan / bw)), per piece, as
 // mpifxcorr accumulates its baselineshiftdecorr (the band's edge frequency, as it does).
+// per frequency (at most MAXFREQ): the LO and the sky frequency of channel 0 (Setup::lo, base)
+constexpr int MAXFREQ = 64;
+__constant__ double cLO[MAXFREQ], cBase[MAXFREQ];
+
 __host__ __device__ inline double decorrOf(double dt, double dr, double width, double flo, double nchan, double bwHz) {
     double ts = 1, dd = 1;
     const double x = M_PI * dr * width * flo;
@@ -102,7 +111,7 @@ __global__ void delays_kernel(Geo g, const Poly* poly, const int2* bls, const in
         dtau[((size_t)k * g.nbl + bl) * g.S + s] = dt;
         for (int f = 0; f < g.nfreq; f++)
             decorr[((size_t)f * g.nbl + bl) * g.S + s] +=
-                (float)decorrOf(dt, dr, width, g.flo0 + f * g.bwHz, g.nchan, g.bwHz);
+                (float)decorrOf(dt, dr, width, cLO[f], g.nchan, g.bwHz);
     }
 }
 
@@ -118,7 +127,7 @@ __global__ void shift_naive(Geo g, const float2* __restrict__ vis, const double*
         float2 run = make_float2(0.f, 0.f);
         for (int k = 0; k < g.K; k++) {
             const double dt = dtau[((size_t)k * g.nbl + bl) * g.S + s];
-            const double e = dt * (g.flo0 + f * g.bwHz + (double)gc * g.A * g.df);
+            const double e = dt * (cBase[f] + (double)gc * g.A * g.df);
             const float e0 = (float)(e - floor(e)), x = (float)(dt * g.df);
             const float2* v = vis + k * g.visCount + visIdx(g, f, bl, p, gc * g.A);
             for (int c = 0; c < g.A; c++) {
@@ -132,8 +141,7 @@ __global__ void shift_naive(Geo g, const float2* __restrict__ vis, const double*
             }
         }
         const float inv = 1.f / g.A;
-        out[i].x += run.x * inv;
-        out[i].y += run.y * inv;
+        out[i] = make_float2(run.x * inv, run.y * inv);
     }
 }
 
@@ -141,26 +149,28 @@ __global__ void shift_naive(Geo g, const float2* __restrict__ vis, const double*
 // Per piece: the A channels in chunks of KC (<= 32): the chunk of V (64 rows x KC) and of the inner
 // phasors U (KC x TN centres) into shared memory, the product summed over the chunks; then each
 // element times its outer phasor e^{2πi Δτ_s (fLO_f + g A df)}, added to the running sums (registers,
-// over the pieces).  At the end, out += the sums / A.
+// over the pieces).  At the end, out = the sums / A (every output written once: no zeroing first).
 // tensor: V in FP16 (scaled by 1 / the piece's windows), the complex product as a real one,
 //   [Vre Vim interleaved] x [[cos sin], [-sin cos] per (k, s)] -> [re im interleaved], 16x16x16 WMMA,
-//   8 warps each 16 rows x TN real columns; TN = 64 (32 for fewer centres).
+//   8 warps each 16 rows x TN real columns; TN = 32, at most 80 registers for 3 blocks an SM (64
+//   with --tile-centres 64: one block an SM, slower; docs/results.md).
 // simt: FP32, TN = 32, a thread 2 rows x 4 centres.
 // The outer phase in FP32 without losing the bits a double would keep: Δτ fLO_f mod 1 per (frequency,
 // centre), and y = Δτ A df mod 1 as yh + yl (two floats), g y mod 1 = frac(g yh) + (the fma's
 // rounding error of g yh) + g yl.
 constexpr int TM = 64, KCMAX = 32, NT = 256, MAXF = 16;
-template<int TN> struct TileSizes {
+template<bool TC, int TN> struct TileSizes {
     static constexpr int LDV = 2 * KCMAX + 8, LDU = 2 * TN + 8, LDC = 2 * TN + 4, LDVF = KCMAX + 1;
-    static constexpr int BUF_TC = (TM * LDV + 2 * KCMAX * LDU) * 2, BUF_SIMT = (TM * LDVF + KCMAX * TN) * 8;
+    static constexpr int BUF_AB = TC ? (TM * LDV + 2 * KCMAX * LDU) * 2 : (TM * LDVF + KCMAX * TN) * 8;
     static constexpr int BUF_C = TM * LDC * 4;
-    static constexpr int BUF = BUF_TC > BUF_SIMT ? (BUF_TC > BUF_C ? BUF_TC : BUF_C) : (BUF_SIMT > BUF_C ? BUF_SIMT : BUF_C);
+    static constexpr int BUF = BUF_AB > BUF_C ? BUF_AB : BUF_C;
 };
 
+
 template<bool TC, int TN>
-__global__ void __launch_bounds__(NT) shift_tile(Geo g, const float2* __restrict__ vis, const double* __restrict__ dtau,
+__global__ void __launch_bounds__(NT, TC ? 3 : 1) shift_tile(Geo g, const float2* __restrict__ vis, const double* __restrict__ dtau,
                                                  const float* __restrict__ wk, float2* out) {
-    using Z = TileSizes<TN>;
+    using Z = TileSizes<TC, TN>;
     constexpr int LDV = Z::LDV, LDU = Z::LDU, LDC = Z::LDC, LDVF = Z::LDVF, NJ = TN / 4;
     __shared__ float sx[TN], syh[TN], syl[TN], sef[MAXF][TN];
     __shared__ long long rowOff[TM];
@@ -190,7 +200,7 @@ __global__ void __launch_bounds__(NT) shift_tile(Geo g, const float2* __restrict
                 syh[sl] = yh;
                 syl[sl] = (float)(y - yh);
             } else {
-                const double e = dt * (g.flo0 + f * g.bwHz);
+                const double e = dt * cBase[f];
                 sef[f][sl] = (float)(e - floor(e));
             }
         }
@@ -216,17 +226,23 @@ __global__ void __launch_bounds__(NT) shift_tile(Geo g, const float2* __restrict
                     V[1] = make_float2(v.z, v.w);
                 }
             }
-            for (int i = tid; i < KC * TN; i += NT) {        // U: KC x TN centres
-                const int kk = i / TN, sl = i % TN;
-                float t = sx[sl] * (float)(c0 + kk);
+            {                                                // U: KC x TN centres; a thread's channels
+                constexpr int KSTEP = NT / TN;               // kk0, kk0 + KSTEP, ... by recurrence
+                const int sl = tid % TN, kk0 = tid / TN;
+                float t = sx[sl] * (float)(c0 + kk0), ts = sx[sl] * (float)KSTEP;
                 t -= floorf(t);
-                float sn, cs;
-                sincospif(2.f * t, &sn, &cs);
-                if (TC) {
-                    __half2* U = reinterpret_cast<__half2*>(reinterpret_cast<__half*>(buf) + TM * LDV);
-                    U[((2 * kk) * LDU + 2 * sl) / 2] = __floats2half2_rn(cs, sn);
-                    U[((2 * kk + 1) * LDU + 2 * sl) / 2] = __floats2half2_rn(-sn, cs);
-                } else reinterpret_cast<float2*>(buf)[TM * LDVF + kk * TN + sl] = make_float2(cs, sn);
+                ts -= floorf(ts);
+                float2 u, st;
+                sincospif(2.f * t, &u.y, &u.x);
+                sincospif(2.f * ts, &st.y, &st.x);
+                for (int kk = kk0; kk < KC; kk += KSTEP) {
+                    if (TC) {
+                        __half2* U = reinterpret_cast<__half2*>(reinterpret_cast<__half*>(buf) + TM * LDV);
+                        U[((2 * kk) * LDU + 2 * sl) / 2] = __floats2half2_rn(u.x, u.y);
+                        U[((2 * kk + 1) * LDU + 2 * sl) / 2] = __floats2half2_rn(-u.y, u.x);
+                    } else reinterpret_cast<float2*>(buf)[TM * LDVF + kk * TN + sl] = u;
+                    u = cmul(u, st);
+                }
             }
             __syncthreads();
             if (TC) {
@@ -295,9 +311,7 @@ __global__ void __launch_bounds__(NT) shift_tile(Geo g, const float2* __restrict
     for (int j = 0; j < NJ; j++) {
         const int s = s0 + tid / TM + 4 * j;
         if (s >= g.S) continue;
-        float2& o = out[outIdx(g, fr, bl, s, p, gr)];
-        o.x += run[j].x * invA;
-        o.y += run[j].y * invA;
+        out[outIdx(g, fr, bl, s, p, gr)] = make_float2(run[j].x * invA, run[j].y * invA);
     }
 }
 
@@ -326,7 +340,7 @@ __global__ void make_spectra(XmacShape s, Geo g, const double* Dw, unsigned long
         const unsigned long long r = splitmix(seed * 0x9e3779b97f4a7c15ull + ((size_t)w * s.nband() + band) * s.nchan + c);
         float sn, cs;
         sincospif(2.f * (float)((r >> 11) * (1.0 / 9007199254740992.0)), &sn, &cs);
-        float2 v = cmul(make_float2(cs, sn), phasor(Dw[aw] * (g.flo0 + f * g.bwHz + c * g.df)));
+        float2 v = cmul(make_float2(cs, sn), phasor(Dw[aw] * (cBase[f] + c * g.df)));
         if (noise > 0) {
             const float2 n = gauss(seed + 7 + 1000ull * a, i);
             v.x += noise * n.x;
@@ -344,7 +358,8 @@ static void usage() {
 "  --nfreq N       dual-polarisation frequencies (2 bands each), default 4\n"
 "  --nchan N       fine channels per band, default 8192\n"
 "  --bw MHz        bandwidth per band, default 32 (real data: a window is nchan / bw)\n"
-"  --flo MHz       the lowest band's lower edge, default 1400 (upper sideband; the bands contiguous)\n"
+"  --flo MHz       the lowest band's lower edge, default 1400 (the bands contiguous)\n"
+"  --sideband X    U (default), L, or mixed (odd frequencies L): an LSB band's LO is its upper edge\n"
 "  --nwin N        FFT windows in the subint, default 100\n"
 "  --pieces K      pieces the subint's windows are split into (as evenly as possible), each shifted\n"
 "                  at its midpoint, default 1\n"
@@ -358,6 +373,7 @@ static void usage() {
 "  --noise X       each station's own noise, relative to the source, default 0 (the source-centre\n"
 "                  check is exact only without it)\n"
 "  --only LIST     comma-separated versions to run: naive,simt,tensor (default all)\n"
+"  --tile-centres N  the tensor version's centres a block, 32 or 64 (default 32)\n"
 "  --reps N        timed repetitions, default 20; --warmup N, default 3\n"
 "  --check N       outputs checked against the double-precision shift, default 256 (x 4 products)\n"
 "  --csv FILE      append one row per timing\n"
@@ -371,6 +387,8 @@ int main(int argc, char** argv) {
     int src = 1, reps = 20, warmup = 3, ncheck = 256, device = 0;
     unsigned long long seed = 1;
     std::string only = "naive,simt,tensor", csv;
+    int tileCentres = 0;
+    std::string sideband = "U";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -391,6 +409,8 @@ int main(int argc, char** argv) {
         else if (a == "--source") src = std::stoi(next());
         else if (a == "--noise") noise = std::stod(next());
         else if (a == "--only") only = next();
+        else if (a == "--tile-centres") tileCentres = std::stoi(next());
+        else if (a == "--sideband") sideband = next();
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
         else if (a == "--check") ncheck = std::stoi(next());
@@ -403,12 +423,15 @@ int main(int argc, char** argv) {
     u.flo0 = floMHz * 1e6;
     u.df = u.bwHz / u.nchan;
     u.twin = u.nchan / u.bwHz;
+    u.lsb.assign(u.nfreq, 0);
+    for (int f = 0; f < u.nfreq; f++) u.lsb[f] = sideband == "L" || (sideband == "mixed" && f % 2);
     const double subintMs = u.nwin * u.twin * 1e3;
     if (uvshiftNs > 0) u.K = (int)std::ceil(subintMs * 1e6 / uvshiftNs - 1e-9);
     const bool runNaive = only.find("naive") != std::string::npos, runSimt = only.find("simt") != std::string::npos,
                runTensor = only.find("tensor") != std::string::npos;
     if (u.nant < 2 || u.nfreq < 1 || u.nchan % 4 || u.nwin < 1 || u.K < 1 || u.K > u.nwin || u.S < 1 || u.A < 1 ||
-        (u.A & (u.A - 1)) || u.nchan % u.A || src < 1 || src > u.S || reps < 1) {
+        (u.A & (u.A - 1)) || u.nchan % u.A || src < 1 || src > u.S || reps < 1 || u.nfreq > MAXFREQ ||
+        (sideband != "U" && sideband != "L" && sideband != "mixed")) {
         usage(); return 2;
     }
     const bool tiles = u.A >= 8 && u.nfreq <= MAXF;
@@ -417,6 +440,12 @@ int main(int argc, char** argv) {
     u.nbl = u.nant * (u.nant - 1) / 2;
     for (int k = 0; k <= u.K; k++) u.w0.push_back((int)std::lround((double)k * u.nwin / u.K));
     const XmacShape s{u.nant, u.nfreq, u.nchan, u.nwin, u.nchan};
+    {
+        std::vector<double> lo(MAXFREQ), base(MAXFREQ);
+        for (int f = 0; f < u.nfreq; f++) { lo[f] = u.lo(f); base[f] = u.base(f); }
+        CHECK_CUDA(cudaMemcpyToSymbol(cLO, lo.data(), sizeof(double) * MAXFREQ));
+        CHECK_CUDA(cudaMemcpyToSymbol(cBase, base.data(), sizeof(double) * MAXFREQ));
+    }
     const Geo G = geo(u, s);
 
     CHECK_CUDA(cudaSetDevice(device));
@@ -427,8 +456,9 @@ int main(int argc, char** argv) {
     int wmin = u.nwin, wmax = 0;
     for (int k = 0; k < u.K; k++) { wmin = std::min(wmin, u.w0[k + 1] - u.w0[k]); wmax = std::max(wmax, u.w0[k + 1] - u.w0[k]); }
     printf("GPU %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, sms);
-    printf("%d stations x %d frequencies x 2 pols, %g MHz bands from %g MHz, %d channels (%.4g kHz), %d windows of %.4g us "
-           "(subint %.4g ms)\n", u.nant, u.nfreq, bwMHz, floMHz, u.nchan, u.df * 1e-3, u.nwin, u.twin * 1e6, subintMs);
+    printf("%d stations x %d frequencies x 2 pols, %g MHz %s bands from %g MHz, %d channels (%.4g kHz), %d windows of %.4g us "
+           "(subint %.4g ms)\n", u.nant, u.nfreq, bwMHz,
+           sideband == "U" ? "USB" : sideband == "L" ? "LSB" : "USB/LSB", floMHz, u.nchan, u.df * 1e-3, u.nwin, u.twin * 1e6, subintMs);
     printf("%d piece%s of %d-%d windows (%.4g-%.4g ms); %d centres; %d channels averaged into %d output channels "
            "(%.4g kHz)\n", u.K, u.K > 1 ? "s" : "", wmin, wmax, wmin * u.twin * 1e3, wmax * u.twin * 1e3, u.S, u.A, u.G,
            u.A * u.df * 1e-3);
@@ -496,23 +526,22 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaGetLastError());
     };
     auto tgrid = [&](int tn) { return dim3((u.R() + TM - 1) / TM, (u.S + tn - 1) / tn, u.nbl); };
-    const bool wide = u.S > 32;      // the tensor version: 64 centres a block when there are more than 32
-    auto zeroOut = [&] { CHECK_CUDA(cudaMemsetAsync(out, 0, u.outCount() * sizeof(float2), st)); };
+    const bool wide = tileCentres == 64;     // the tensor version's centres a block: 32 unless asked
     struct Variant { std::string name; double tol; std::function<void()> run; };
     std::vector<Variant> variants;
     if (runNaive) variants.push_back({"naive (a thread per output, sincos per channel)", 1e-4, [&] {
-        zeroOut(); shift_naive<<<sms * 16, 256, 0, st>>>(G, fine, dTau, out); CHECK_CUDA(cudaGetLastError()); }});
+        shift_naive<<<sms * 16, 256, 0, st>>>(G, fine, dTau, out); CHECK_CUDA(cudaGetLastError()); }});
     if (runSimt && tiles) variants.push_back({"simt (matrix product, FP32)", 1e-4, [&] {
-        zeroOut(); shift_tile<false, 32><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out); CHECK_CUDA(cudaGetLastError()); }});
+        shift_tile<false, 32><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out); CHECK_CUDA(cudaGetLastError()); }});
     if (runTensor && tiles) variants.push_back({"tensor (matrix product, FP16 WMMA)", 3e-3, [&] {
-        zeroOut(); if (wide) shift_tile<true, 64><<<tgrid(64), NT, 0, st>>>(G, fine, dTau, dWk, out);
+        if (wide) shift_tile<true, 64><<<tgrid(64), NT, 0, st>>>(G, fine, dTau, dWk, out);
         else shift_tile<true, 32><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out);
         CHECK_CUDA(cudaGetLastError()); }});
 
+    bool pass = true;
     runXmac();
     runDelays();
     CHECK_CUDA(cudaStreamSynchronize(st));
-    bool pass = true;
 
     // ---- check: the delays and the decorrelation estimate against the host ----
     std::vector<double> hTau((size_t)u.K * u.nbl * u.S);
@@ -533,7 +562,7 @@ int main(int argc, char** argv) {
                     eT = std::max(eT, fabs(hTau[((size_t)k * u.nbl + bl) * u.S + c] - dt));
                     maxTau = std::max(maxTau, fabs(dt));
                     for (int f = 0; f < u.nfreq; f++)
-                        dec[((size_t)f * u.nbl + bl) * u.S + c] += decorrOf(dt, dr, u.width(k), u.flo(f), u.nchan, u.bwHz);
+                        dec[((size_t)f * u.nbl + bl) * u.S + c] += decorrOf(dt, dr, u.width(k), u.lo(f), u.nchan, u.bwHz);
                 }
         for (size_t i = 0; i < dec.size(); i++) {
             eD = std::max(eD, fabs(hDec[i] - dec[i]) / (u.nwin * u.twin));
@@ -564,7 +593,7 @@ int main(int argc, char** argv) {
                                           u.A * sizeof(float2), cudaMemcpyDeviceToHost));
                     const double dt = hTau[((size_t)k * u.nbl + pk.bl) * u.S + pk.s];
                     for (int c = 0; c < u.A; c++) {
-                        const double ph = dt * (u.flo(pk.f) + (pk.g * u.A + c) * u.df);
+                        const double ph = dt * (u.base(pk.f) + (pk.g * u.A + c) * u.df);
                         sum += cd(row[c].x, row[c].y) * std::polar(1.0, 2 * M_PI * (ph - std::floor(ph)));
                     }
                 }
@@ -587,7 +616,7 @@ int main(int argc, char** argv) {
                 for (int w = u.w0[k]; w < u.w0[k + 1]; w++) {
                     const double d = Dw[(size_t)a * u.nwin + w] - Dw[(size_t)b * u.nwin + w] + dtm;
                     for (int c = 0; c < u.A; c++) {
-                        const double ph = d * (u.flo(pk.f) + (pk.g * u.A + c) * u.df);
+                        const double ph = d * (u.base(pk.f) + (pk.g * u.A + c) * u.df);
                         sum += std::polar(1.0, 2 * M_PI * (ph - std::floor(ph)));
                     }
                 }
@@ -647,7 +676,7 @@ int main(int argc, char** argv) {
                         u.A, u.S, key.c_str(), t.median, t.median / subintMs);
     };
     const Timing tx = timeIt(runXmac, warmup, reps, st);
-    line("xmac", "xmac (staged tensor, per piece)", tx, xmacCmacs);
+    line("xmac", "xmac (staged tensor, a launch a piece)", tx, xmacCmacs);
     line("delays", "delays (+ decorrelation estimate)", timeIt(runDelays, warmup, reps, st), 0);
     double best = 1e30;
     for (const auto& v : variants) {
