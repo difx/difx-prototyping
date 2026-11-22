@@ -1610,11 +1610,11 @@
 <tspan x='234' dy='0'>the staged XMAC, weighted (xmacTensorStagedWeighted)</tspan>
 </text>
 <text x='234' y='519' font-family='Helvetica, Arial, sans-serif' font-size='10.5' text-anchor='start' font-weight='normal' fill='#1d1d1d'>
-<tspan x='234' dy='0'>the copy into shared memory scales each (window, channel) by sqrt|w| of its bin</tspan>
-<tspan x='234' dy='13.65'>(FP16); a negative weight's sign goes into the A operand (one XOR a window).</tspan>
-<tspan x='234' dy='13.65'>Each 16-window block is classified first: skipped (all weights 0), copied as is</tspan>
-<tspan x='234' dy='13.65'>(all 1), scaled, or scaled with signs.  Sum over bins = one weighted sum: one pass.</tspan>
-<tspan x='234' dy='13.65'>Costs: the classification, the scaling, a few spilled registers (1.04-1.37x).</tspan>
+<tspan x='234' dy='0'>the plain copy into shared memory, with each (window, channel)'s weight beside it</tspan>
+<tspan x='234' dy='13.65'>(FP16, a thread each); each lane multiplies its A registers by its two windows'</tspan>
+<tspan x='234' dy='13.65'>weights (4 HMUL2, the sign included).  Each 16-window block is classified first:</tspan>
+<tspan x='234' dy='13.65'>skipped (all weights 0), as is (all 1), or weighted.  Sum over bins = one weighted</tspan>
+<tspan x='234' dy='13.65'>sum: one pass.  Costs: the classification, the multiplies (0.99-1.16x on the 2070).</tspan>
 </text>
 <rect x='716.0' y='510.0' width='8.0' height='9.5' fill='#ffffff' stroke='#ffffff' stroke-width='0.5'/>
 <rect x='724.0' y='510.0' width='8.0' height='9.5' fill='#ffffff' stroke='#ffffff' stroke-width='0.5'/>
@@ -2013,7 +2013,7 @@
 <tspan x='1150' dy='0'>gate; 16 scr. (1.5 ms, 128)</tspan>
 </text>
 <text x='1380' y='592' font-family='Helvetica, Arial, sans-serif' font-size='12.5' text-anchor='end' font-weight='bold' fill='#2e8540'>
-<tspan x='1380' dy='0'>0.46; 1.37x / 0.77; 1.79x</tspan>
+<tspan x='1380' dy='0'>0.40; 1.15x / 0.77; 1.79x*</tspan>
 </text>
 <text x='1150' y='610' font-family='Helvetica, Arial, sans-serif' font-size='10' text-anchor='start' font-weight='normal' fill='#2e8540' font-style='italic'>
 <tspan x='1150' dy='0'>the gate does less than the unbinned XMAC:</tspan>
@@ -4857,7 +4857,7 @@
 <tspan x='16' dy='0'>Which</tspan>
 </text>
 <text x='16' y='1326' font-family='Helvetica, Arial, sans-serif' font-size='12' text-anchor='start' font-weight='normal' fill='#333'>
-<tspan x='16' dy='0'>The gate and scrunched output (any weights, negative too): weights in the stage, one pass: 0.33-1.37x the unbinned XMAC on the 2070, 0.77-1.80x on the A100.</tspan>
+<tspan x='16' dy='0'>The gate and scrunched output (any weights, negative too): weights in the stage, one pass: 0.31-1.16x the unbinned XMAC on the 2070 (slimmed), 0.77-1.80x on the A100 (the first version).</tspan>
 <tspan x='16' dy='16'>Separate bins: sorted per channel and gathered straight from the station kernel's usual window-major spectra (gatherwm): 3.1-4.7x on the A100 for long runs, 10-11x</tspan>
 <tspan x='16' dy='16'>for the shortest (where a transpose to channel-major does better, 7.8x, and on the 2070 the permuted copy, 6.5x).  Bins narrower than a window (1.5 ms,</tspan>
 <tspan x='16' dy='16'>1024 channels, 128 bins: 14x / 18x) sample rather than resolve the pulse: warn, do not optimise.  A pass per bin and the naive port: not for many bins.</tspan>
@@ -4894,6 +4894,6 @@
 <tspan x='16' dy='0'>Ratios: run-bins.sh, commit fafcd29: results-local/ar313-adeller-bins-20261122-140307 (2070) and gina8-bins-20261122-142203 (A100, job 21374617); each version's ms per 25.6 ms subint over the unbinned staged XMAC's (2070 1.19-1.50 ms, A100 0.32-0.40);</tspan>
 </text>
 <text x='16' y='1593' font-family='Helvetica, Arial, sans-serif' font-size='10.5' text-anchor='start' font-weight='normal' fill='#555'>
-<tspan x='16' dy='0'>sorted counts the sort, permute and XMAC, not the channel-major spectra (as a transpose here: 1.4-1.5 ms on the 2070); gatherwm on the A100: gina5-bins-20261122-160540 (commit bc93212, job 21375824).</tspan>
+<tspan x='16' dy='0'>sorted counts the sort, permute and XMAC, not the channel-major spectra (as a transpose here: 1.4-1.5 ms on the 2070); * approach 2 on the A100: the first version's; gatherwm on the A100: gina5-bins-20261122-160540 (commit bc93212, job 21375824).</tspan>
 </text>
 </svg>

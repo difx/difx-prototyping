@@ -120,16 +120,17 @@ void xmacTensorStagedMapped(const XmacShape& s, const XmacMap& m, const __half2*
                             int multiprocessors, cudaStream_t st);
 // Weighted (pulsar binning, pulsar-binning/): each (window, frequency, channel) product times a weight,
 // weights[bins[(window * nfreq + f) * nchan + c]] (the subint's windows; bins < nbins <= 256).  The copy
-// into the stage scales each value by sqrt|w| (so the product gets |w|) and a negative weight's sign
-// goes into the A operand.  With skip, a block skips the 16-window blocks in which every one of its
-// channels has weight 0 (a gate's off-pulse; one bin a pass).  Weights of 1 and 0 are exact; others
-// scale in FP16 (each value times sqrt|w| rounded to FP16, the product rounded to FP16).
+// into the stage is the plain one; the A operand (the baseline's first station) is multiplied by w in
+// registers, the sign included.  With skip, a block skips the 16-window blocks in which every one of its
+// channels has weight 0 (a gate's off-pulse; one bin a pass), and multiplies nothing in those whose
+// weights are all 1.  Weights of 1 and 0 are exact; others in FP16 (w rounded to FP16, the first
+// station's value times it rounded to FP16; |w| below 65504).
 struct XmacWeights {
     const uint8_t* bins = nullptr;      // [window][frequency][channel]
     const float* weights = nullptr;     // [nbins], any sign
     int nbins = 0;
     bool skip = false;
-    bool negative = false;              // some weight is negative
+    bool negative = false;              // some weight is negative (no longer needed: the sign is in w)
     const int4* segs = nullptr;         // sorted (below)
     int maxSeg = 0;
     int cstride = 0;                    // sorted: __half2 from one channel to the next (channel-major)

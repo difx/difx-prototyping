@@ -21,6 +21,10 @@ to keep arbitrary breakpoints.
 - The per-bin weights (count + a correction over flagged windows, exact against mpifxcorr's sum);
   high DM in the sweep; gathering from window-major spectra (`gatherwm`): the station kernel need
   not change (docs/results.md, "Per-bin weights, high DM ...").
+- The weights (docs/results.md, "The weights"): the per-bin weights in two kernels (the count in
+  the bins kernel; scrunched, a matrix-vector product): bins + weights 3-22% of the XMAC on the
+  2070, from 12-28%.  The weighted copy slimmed (the weight on the A operand in registers): 0.99-1.16x
+  the XMAC with nothing to skip, from 1.04-1.37x; the gate 0.40x (from 0.47x).
 - The A100 again (job 21375824): gathering from window-major spectra beats a transpose to
   channel-major in 19 of 24 separate-bin runs, so window-major is the layout; high DM as on the
   2070; the per-bin weights 18-31% of the A100's XMAC (docs/results.md, "The A100 again").
@@ -35,20 +39,15 @@ to keep arbitrary breakpoints.
   counting the transpose the others need, in 19 of 24 separate-bin runs, and at most 1.6x the
   fastest in the rest (128 channels, short runs or high DM); the permuted copy never wins there.  Kept (2026-11-22): drop the
   permuted copy and the channel-major path in DiFX; the 128-channel millisecond pulsar below.
-- **Slimming the weighted copy** (the gate and scrunched output: 1.26-1.80x the XMAC on the A100
-  when nothing is skipped, 1.04-1.37x on the 2070):
-  1. the weight on the A operand in registers instead of on every value in the copy: the copy
-     becomes the plain one (no bins loaded, no table lookups, conversions or FP16 multiplies, no
-     sqrt|w| rounding); a few threads write each channel's 16 window weights (FP16) to shared
-     memory per stage, and each lane multiplies its A registers by its two windows' weights (four
-     HMUL2 per A fragment, the sign included): one code path instead of plain / scaled / signed;
-  2. the per-16-window-block classification (skip, or not) once per subint in the bins kernel, per
-     (frequency, 4-channel quad, block), instead of every block re-reading its bins;
-  3. the KS 2 kernel's spills rechecked; on both GPUs, against the plain XMAC (aim: about 1.1x with
-     nothing to skip).
-- **The per-bin weights' cost**: the count into the bins kernel (six small kernels now: 0.09-0.17 ms
-  with every weight 1 on the 2070, 0.06-0.12 ms on the A100, where that is 18-31% of the XMAC); the correction (a matrix product over the flagged windows) on the tensor
-  cores if heavily flagged data matter (5.8 ms at 32 stations with half the windows flagged).
+- **The A100 with the new weights** (the slimmed weighted copy and the two-kernel per-bin weights:
+  the A100 was where the copy's instructions cost most, 1.26-1.80x, and the six weights kernels
+  18-31% of the XMAC).
+- **The weighted kernel's rest**: the per-16-window-block classification once per subint in the bins
+  kernel (per frequency, 4-channel quad and block) instead of in every XMAC block: at most the 2-4%
+  it costs on the 2070; the weighted kernel's other 2-7% over the plain one (with no multiplies)
+  unexplained, an Nsight Compute comparison if it matters (the A100 first).
+- **The per-bin weights' correction** on the tensor cores, if heavily flagged data matter (0.26 ms at
+  1161 flagged windows, 128 bins, 10 stations; it grows with flagged windows x bins x baselines).
 - **The millisecond pulsar at fewer channels, from window-major spectra** (kept: window-major; 128
   channels, 1.5 ms: 10.9x the XMAC for 128 bins, 5.7x for 16 at DM 300, against 7.8x and 4.4x with a
   transpose to channel-major).  To try: 16-byte loads of 4 channels where a quad's channels share a

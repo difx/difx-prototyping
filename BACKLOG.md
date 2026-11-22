@@ -30,7 +30,8 @@ its `FINDINGS.md`.
 - Done: the A100 (gather wins every separate-bin case; the weighted stage relatively dearer); docs/approaches.md, the approaches with a diagram.
 - Done: per-bin weights (exact); high DM in the sweep; gathering from window-major spectra (the station kernel need not change).
 - Done: the A100 again: window-major spectra (gatherwm) beat a transpose in 19 of 24 runs, so the station kernel stays as it is.
-- Next: slimming the weighted copy; one sorted approach (gather from window-major); the per-bin weights' count into the bins kernel.
+- Done: the weights: the per-bin weights in two kernels (3-22% of the XMAC, from 12-28%); the weighted copy slimmed (0.99-1.16x with nothing to skip, from 1.04-1.37x; 2070).
+- Next: the A100 with the new weights; one sorted approach (gather from window-major).
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 

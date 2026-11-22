@@ -51,19 +51,23 @@ the sum into that bin's output in global memory.  mpifxcorr's loop, nearly line 
 
 The staged XMAC, weighted (`xmacTensorStagedWeighted`).  A scrunched output is one weighted sum
 over all the windows, so it needs no bins in the XMAC at all, only a weight per (window, channel).
-The copy into shared memory multiplies each value by sqrt|w| of its bin (the tile feeds both sides
-of X1 X2*, so the product gets |w|); a negative weight's sign goes into the A operand's registers,
-one XOR a window.  Each block first classifies its 16-window blocks from the bins: skipped (every
-weight 0), copied as is (every weight 1), scaled, or scaled with signs.
+The copy into shared memory is the plain one; beside each stage go its (window, channel)s'
+weights in FP16 (a thread each, from the bins), and each lane multiplies its A fragment by its two
+windows' weights in registers, sign included (four HMUL2; B as it is, so each product X1 X2* gets w
+once).  Each block first classifies its 16-window blocks from the bins: skipped (every weight 0),
+as is (every weight 1: no multiplies), or weighted.  (The first version scaled every value in the
+copy by sqrt|w| and put negative weights' signs into A: 1.04-1.37x the XMAC with nothing to skip
+on the 2070, 1.26-1.80x on the A100.)
 - *Saves:* the whole binning: one pass, the XMAC's own speed for the scaled windows, and nothing
   at all for the windows whose weight is 0.
-- *Costs:* the classification pass over the bins, the FP16 scaling and its extra rounding (weights
-  0 and 1 exact), a few spilled registers in the weighted kernel.  With nothing to skip that is
-  1.04-1.37x the unbinned XMAC.
-- *Measured:* the gate 0.46x / 0.77x (1.5 ms, 128 channels) to 0.70x / 0.96x (1024); 1.10-1.13x /
-  1.26-1.33x for the 500 ms pulsar's all-on-pulse subint; 16 bins on - off (negative weights)
-  1.24-1.37x / 1.65-1.80x at 1.5 ms, 1.04-1.14x / 1.26-1.34x at 500 ms.  The A100's tensor cores
-  are 16x its FP32 rate (the 2070's about 4x), so the copy's extra instructions weigh more there.
+- *Costs:* the classification pass over the bins (2-4%), the multiplies (about 5%) and their FP16
+  rounding (weights 0 and 1 exact), and 2-7% more for the weighted kernel itself.  With nothing to
+  skip that is 0.99-1.16x the unbinned XMAC on the 2070.
+- *Measured (the 2070, slimmed):* the gate 0.40x (1.5 ms, 128 channels) to 0.64x (1024); 1.03-1.09x
+  for the 500 ms pulsar's all-on-pulse subint; 16 bins on - off (negative weights) 1.11-1.15x at
+  1.5 ms, 1.04-1.10x at 500 ms.  The A100 has not run the slimmed version yet: the first version was
+  0.77-0.96x for the gate there and 1.26-1.80x with nothing to skip (its tensor cores are 16x its FP32
+  rate, the 2070's about 4x, so the copy's extra instructions weighed more).
 - **Why the gate is "faster" than the unbinned XMAC:** it does less.  It skips every 16-window
   block in which all 8 channels' windows have weight 0, which the unbinned XMAC sums anyway.  The
   1.5 ms gate keeps 10% of the period, but dispersion spreads it across a block's channels and the
@@ -71,7 +75,7 @@ weight 0), copied as is (every weight 1), scaled, or scaled with signs.
   are 8x longer against the period, and fewer blocks are all off (0.70x).  An off-pulse subint of the
   500 ms pulsar costs almost nothing.  Per window it does, it is no faster.
 - **At high DM the skipping goes**: at DM 300 a block's 8 channels hold on-pulse windows in every
-  block, and the gate costs 1.17-1.31x on the 2070 (0.46-0.70x at DM 30).
+  block, and the gate costs 1.09-1.12x on the 2070 (0.40-0.64x at DM 30).
 
 ## 3. A pass per bin (separate bins)
 
@@ -157,7 +161,7 @@ smaller output saves.
 
 | output | regime | approach | 2070 | A100 |
 |---|---|---|---|---|
-| gate, scrunched (any weights) | any | 2, weights in the stage | 0.33-1.37x | 0.77-1.80x |
+| gate, scrunched (any weights) | any | 2, weights in the stage | 0.31-1.16x | 0.77-1.80x (the first version) |
 | separate bins | long runs: few bins, slow pulsars | 5b, gathered from window-major | 2.7-7.1x (to 10x at high DM) | 3.1-4.7x (to 8.7x) |
 | separate bins | short runs: many bins of a millisecond pulsar | 5b | 15x (the permuted copy 6.1-6.5x) | 10.4-11.2x (5 with a transpose 7.8x) |
 | separate bins | bins narrower than a window | warn: such bins sample the pulse rather than resolve it | 14x | 18x |

@@ -48,25 +48,43 @@ for p in 1.5 500; do
         done
     done
 done
+# the per-bin weights with flagged windows (station weights below 1): the bins and weights only
+for o in "--period-ms 1.5 --nchan 128 --bins 128 --dropout 0.02" "--period-ms 1.5 --nchan 1024 --bins 128 --dropout 0.1 --partial 0.1" \
+         "--period-ms 500 --nchan 128 --bins gate --dropout 0.05 --partial 0.05" "--period-ms 1.5 --nchan 128 --bins 16 --scrunch --dropout 0.3"; do
+    set -- $o
+    run "flag-p$2-n$4-$6$([ "$7" = --scrunch ] && echo s)-${@: -1}" $o --only none --dm 30
+done
 
 python3 - "$CSV" > "$OUT/table.txt" <<'EOF'
 import csv, sys
 from collections import OrderedDict
 rows = list(csv.DictReader(open(sys.argv[1])))
-runs = OrderedDict()
+runs, flagged = OrderedDict(), OrderedDict()
 for r in rows:
     k = (r['period_ms'], r['dm'], r['nchan'], r['bins'], r['scrunch'], r['avg'], r['accumulate'])
-    runs.setdefault(k, {})[r['what']] = float(r['ms'])
+    if float(r.get('dropout') or 0) or float(r.get('partial') or 0):
+        flagged.setdefault(k + (r['dropout'], r['partial']), {})[r['what']] = float(r['ms'])
+    else:
+        runs.setdefault(k, {})[r['what']] = float(r['ms'])
 vers = ['naive', 'stage', 'passes', 'sorted', 'gather', 'gatherwm']
 print("ms per subint (25.6 ms); best / xmac: the fastest binned version against the unbinned staged XMAC (gatherwm: gather")
 print("from the window-major spectra; sorted and gather start from channel-major ones, not counted)")
-print("%-6s %5s %5s %-10s %4s %4s  %8s %7s %7s  " % ("P ms", "DM", "nchan", "bins", "avg", "acc", "xmac", "bins", "weights") +
+print("bins: the bins kernel with each bin's count and the flagged windows' histograms; weights: the per-bin weights after it;")
+print("old b+w: the bins alone and the six weights kernels before")
+print("%-6s %5s %5s %-10s %4s %4s  %8s %7s %7s %7s  " % ("P ms", "DM", "nchan", "bins", "avg", "acc", "xmac", "bins", "weights", "old b+w") +
       " ".join("%8s" % v for v in vers) + "  %-7s %6s" % ("best", "/xmac"))
 for (p, dm, n, b, sc, a, ac), d in runs.items():
     name = b + (" scr" if sc == '1' else "")
     best = min((d[v], v) for v in vers if v in d)
-    print("%-6s %5s %5s %-10s %4s %4s  %8.3f %7.3f %7.3f  " % (p, dm, n, name, a, ac, d['xmac'], d['bins'], d.get('weights', 0)) +
+    print("%-6s %5s %5s %-10s %4s %4s  %8.3f %7.3f %7.3f %7.3f  " % (p, dm, n, name, a, ac, d['xmac'], d['bins'], d.get('weights', 0),
+          d.get('bins-only', 0) + d.get('weights-old', 0)) +
           " ".join("%8.2f" % d[v] if v in d else "%8s" % "-" for v in vers) + "  %-7s %6.2f" % (best[1], best[0] / d['xmac']))
+print()
+print("with flagged windows (--dropout P: a station's window weight 0; --partial P: 0.5), ms")
+print("%-6s %5s %-10s %7s %7s  %7s %7s %7s %7s" % ("P ms", "nchan", "bins", "dropout", "partial", "xmac", "bins", "weights", "old b+w"))
+for (p, dm, n, b, sc, a, ac, dr, pa), d in flagged.items():
+    print("%-6s %5s %-10s %7s %7s  %7.3f %7.3f %7.3f %7.3f" % (p, n, b + (" scr" if sc == '1' else ""), dr, pa, d['xmac'], d['bins'],
+          d['weights'], d['bins-only'] + d['weights-old']))
 EOF
 cat "$OUT/table.txt"
 echo "Results in $OUT (table.txt, bins.csv)"

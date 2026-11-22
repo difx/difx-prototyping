@@ -189,15 +189,13 @@ struct MmaCfg {
     static_assert(32 * KS % RSTEP == 0, "whole copy tasks");
 };
 
-// WT: weighted (xmacTensorStagedWeighted): the copy scales each value by sqrt|w| of its (window,
-// channel)'s bin, the A fragments take negative weights' signs, and (W.skip) the block runs only the
-// 16-window blocks with some non-zero weight in its channels (a list made first, when they fit MAXTL).
+// WT: weighted (xmacTensorStagedWeighted): the copy is the plain one; with each stage, the weight w of
+// each (window, channel)'s bin in FP16 (CH x 16 of them, a thread each), and the A fragments multiplied
+// by their windows' weights in registers (the sign included; B as it is, so each product gets w once).
+// (W.skip) the block runs only the 16-window blocks with some non-zero weight in its channels (a list
+// made first, when they fit MAXTL), and blocks whose weights are all 1 without the multiplies.
 constexpr int MAXWBINS = 256, MAXTL = 1024;
-constexpr size_t WEIGHTED_SMEM = MAXWBINS * 4 + MAXTL * 2 + MAXTL + 2 * 16 * 4 + 16;
-__device__ __forceinline__ uint32_t scaleHalf2(uint32_t w, __half2 sc) {    // FP16 product, rounded
-    const __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&w), sc);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
+constexpr size_t WEIGHTED_SMEM = MAXWBINS * 4 + MAXTL * 2 + MAXTL + 2 * 16 * 16 * 2 + 16;
 // MODE 0 plain, 1 weighted (WT), 2 sorted (xmacTensorStagedSorted: the windows are slots sorted by bin
 // per channel, channel-major (a receiver's channel c at off + c W.cstride, its slots contiguous: the
 // copy loads 4 slots of a channel, no transpose); blockIdx.z is a segment of the block's channel
@@ -248,28 +246,24 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
         if (recvOf(row) < 0) *reinterpret_cast<uint32_t*>(smraw + bc * CSb + row * SROW + 4 * word) = 0u;
     }
 
-    // weighted: the table (sqrt|w| with w's sign); per 16-window block a mode, 0 skip (every weight 0),
-    // 1 plain (every weight 1: copied as is), 2 scaled, 3 scaled with negative weights (their signs to
-    // the A operand), and the list of blocks to run with their modes (W.skip; else every block, mode 2
-    // or 3); the signs of the stage's windows, per channel 4 nibbles.  In the dynamic shared memory past
-    // the stages (WEIGHTED_SMEM more; the unweighted kernel has none of it).
+    // weighted: the bins' weights; per 16-window block a mode, 0 skip (every weight 0), 1 plain (every
+    // weight 1: no multiplies), 2 weighted, and the list of blocks to run with their modes (W.skip; else
+    // every block, mode 2); each stage's weights, [buf][channel][16] FP16, in the order the A fragments
+    // take them (wPos).  In the dynamic shared memory past the stages (WEIGHTED_SMEM more; the
+    // unweighted kernel has none of it).
     float* swt = reinterpret_cast<float*>(smraw + nbuf * BUFb);
     short* tlist = reinterpret_cast<short*>(swt + MAXWBINS);
     unsigned char* tflag = reinterpret_cast<unsigned char*>(tlist + MAXTL);
-    unsigned char* sgnb = tflag + MAXTL;                                // [buf][channel][window quad]
-    int& tcount = *reinterpret_cast<int*>(sgnb + 2 * 16 * 4);
+    __half* wst = reinterpret_cast<__half*>(tflag + MAXTL);             // [buf][channel][16]
+    int& tcount = *reinterpret_cast<int*>(wst + 2 * 16 * 16);
     bool useList = false;
-    int defMode = 2;
+    constexpr int defMode = 2;
     if constexpr (WT) {
-        defMode = W.negative ? 3 : 2;
-        for (int i = threadIdx.x; i < W.nbins; i += blockDim.x) {
-            const float w = W.weights[i];
-            swt[i] = copysignf(sqrtf(fabsf(w)), w);
-        }
+        for (int i = threadIdx.x; i < W.nbins; i += blockDim.x) swt[i] = W.weights[i];
         __syncthreads();
         if (W.skip && tb1 - tb0 <= MAXTL) {
             useList = true;
-            // flags per 16-window block: 1 some weight non-zero, 2 some weight not 1, 4 some negative.
+            // flags per 16-window block: 1 some weight non-zero, 2 some weight not 1.
             // A half-warp a block's 16 windows, each lane its window's CH channels
             const int nwi = (tb1 - tb0) * 16;
             for (int base = 0; base < nwi; base += blockDim.x) {
@@ -282,7 +276,7 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
 #pragma unroll
                         for (int e = 0; e < 4; e++) {
                             const float w = swt[(b4 >> (8 * e)) & 255];
-                            fl |= (w != 0.f ? 1u : 0u) | (w != 1.f ? 2u : 0u) | (w < 0.f ? 4u : 0u);
+                            fl |= (w != 0.f ? 1u : 0u) | (w != 1.f ? 2u : 0u);
                         }
                     }
                 }
@@ -298,7 +292,7 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
                     const unsigned fl = t < tb1 - tb0 ? tflag[t] : 0u;
                     const bool on = fl & 1u;
                     const unsigned bal = __ballot_sync(0xffffffffu, on);
-                    const int mode = !(fl & 2u) ? 1 : (fl & 4u) ? 3 : 2;
+                    const int mode = !(fl & 2u) ? 1 : 2;
                     if (on) tlist[n + __popc(bal & ((1u << threadIdx.x) - 1))] = (short)(t | mode << 12);
                     n += __popc(bal);
                 }
@@ -328,7 +322,13 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     }
     // windows 16 tb + 4 wq .. + 3 of each task into registers (zero past the last window) ...
     uint4 v[C::MAXR][4];
-    uint32_t bq[WT ? 4 : 1];                    // weighted: the 4 channels' bins of each of the 4 windows
+    // weighted: thread tid < CH x 16 fetches the bin of window tid / CH, channel tid % CH of the block
+    // (adjacent threads adjacent bytes) and puts its weight at wPos in the stage's weights: window
+    // 8 ks + 4 h + t at 8 ks + 2 t + h, so that lane t's two windows (A registers 0, 1 and 2, 3) are one word
+    const int wCh = threadIdx.x % CH, wWin = threadIdx.x / CH;
+    const bool wThread = WT && (int)threadIdx.x < CH * 16;
+    const int wPos = (wWin & 8) + 2 * (wWin & 3) + ((wWin >> 2) & 1);
+    int wBin = -1;
     auto fetch = [&](int tb, int mode = 1) {
         if constexpr (MODE == 2) {            // channel-major slots: v[k][cq] is channel cq's 4 slots
 #pragma unroll
@@ -359,14 +359,9 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
             }
             return;
         }
-        if (WT && mode >= 2) {
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int wg = tb * 16 + 4 * wq + e;
-                bq[e] = wg < s.nwin && c0 + 4 * q < s.nchan
-                      ? __ldg(reinterpret_cast<const unsigned*>(W.bins + ((size_t)wg * s.nfreq + f) * s.nchan + c0 + 4 * q))
-                      : 0u;
-            }
+        if (WT && mode >= 2 && wThread) {
+            const int wg = tb * 16 + wWin;
+            wBin = wg < s.nwin && c0 + wCh < s.nchan ? (int)__ldg(W.bins + ((size_t)wg * s.nfreq + f) * s.nchan + c0 + wCh) : -1;
         }
 #pragma unroll
         for (int k = 0; k < C::MAXR; k++)
@@ -380,27 +375,9 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     };
     // ... and from there into a stage: channel cq's 4 windows are word cq of each, one chunk
     auto put = [&](int buf, int mode = 1) {
-        if (WT && mode >= 2) {                  // weighted: channel cq's 4 windows times their sqrt|w|
-#pragma unroll
-            for (int cq = 0; cq < 4; cq++) {
-                __half2 sc[4];
-                unsigned neg = 0;
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const float w = swt[(bq[e] >> (8 * cq)) & 255];
-                    sc[e] = __float2half2_rn(fabsf(w));
-                    neg |= (w < 0.f ? 1u : 0u) << e;
-                }
-                if (mode == 3 && row0 == 0) sgnb[(buf * 16 + 4 * q + cq) * 4 + wq] = (unsigned char)neg;
-#pragma unroll
-                for (int k = 0; k < C::MAXR; k++) {
-                    if (src[k] == NONE) continue;
-                    *reinterpret_cast<uint4*>(smraw + buf * BUFb + dofs[k] + cq * CSb) = make_uint4(
-                        scaleHalf2((&v[k][0].x)[cq], sc[0]), scaleHalf2((&v[k][1].x)[cq], sc[1]),
-                        scaleHalf2((&v[k][2].x)[cq], sc[2]), scaleHalf2((&v[k][3].x)[cq], sc[3]));
-                }
-            }
-        } else if constexpr (MODE >= 2) {
+        if (WT && mode >= 2 && wThread)         // weighted: this thread's (window, channel)'s weight
+            wst[(buf * CH + wCh) * 16 + wPos] = __float2half_rn(wBin >= 0 ? swt[wBin] : 0.f);
+        if constexpr (MODE >= 2) {
 #pragma unroll
             for (int k = 0; k < C::MAXR; k++) {
                 if (src[k] == NONE) continue;
@@ -453,13 +430,12 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
         const unsigned char* base = smraw + buf * BUFb + cw * CSb;
 #pragma unroll
         for (int ks = 0; ks < 2; ks++) {                                // windows 8 ks .. 8 ks + 7
-            // weighted, negative weights: A's registers 0, 1 hold window 8 ks + t, 2, 3 window 8 ks + 4 + t
-            // (ldmatrix: t = lane & 3), whose sign they take (window quads 2 ks and 2 ks + 1 of the stage)
-            uint32_t sgn[2] = {0u, 0u};
-            if (WT && mode == 3) {
-#pragma unroll
-                for (int h = 0; h < 2; h++)
-                    if ((sgnb[(buf * 16 + cw) * 4 + 2 * ks + h] >> (lane & 3)) & 1u) sgn[h] = 0x80008000u;
+            // weighted: A's registers 0, 1 hold window 8 ks + t, 2, 3 window 8 ks + 4 + t (ldmatrix:
+            // t = lane & 3), times those windows' weights (one word of the stage's weights)
+            __half2 wA = __float2half2_rn(1.f), wB = wA;
+            if (WT && mode >= 2) {
+                const __half2 w2 = *reinterpret_cast<const __half2*>(wst + (buf * CH + cw) * 16 + 8 * ks + 2 * (lane & 3));
+                wA = __low2half2(w2); wB = __high2half2(w2);
             }
             uint32_t Bf[NJ][4];
 #pragma unroll
@@ -474,8 +450,9 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
                 if (!anyI[i]) continue;
                 uint32_t Af[4];
                 ldsm4(Af, base + stagedChunk(16 * i + aRow, 2 * ks + aHalf));
-                if constexpr (WT) {
-                    Af[0] ^= sgn[0]; Af[1] ^= sgn[0]; Af[2] ^= sgn[1]; Af[3] ^= sgn[1];
+                if (WT && mode >= 2) {
+                    __half2* a = reinterpret_cast<__half2*>(Af);
+                    a[0] = __hmul2(a[0], wA); a[1] = __hmul2(a[1], wA); a[2] = __hmul2(a[2], wB); a[3] = __hmul2(a[3], wB);
                 }
 #pragma unroll
                 for (int jj = 0; jj < NJ; jj++) {                       // real parts

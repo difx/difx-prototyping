@@ -8,9 +8,9 @@
 //   naive   the obvious port of mpifxcorr's loop: a thread per (frequency, baseline, product,
 //           channel) over the windows, its sum held while the bin stays the same and added to that
 //           bin's output when it changes (or, scrunched, one sum of weight x product)
-//   stage   (scrunched) the staged XMAC weighted (xmacTensorStagedWeighted): the copy into its
-//           stage scales each (window, channel) by sqrt|w| of its bin, a negative weight's sign goes
-//           into the A operand; 16-window blocks whose weights are all 0 skipped.  One pass.
+//   stage   (scrunched) the staged XMAC weighted (xmacTensorStagedWeighted): the plain copy into its
+//           stage, with each (window, channel)'s weight in FP16 beside it; the A operand times the
+//           weight in registers; 16-window blocks whose weights are all 0 skipped.  One pass.
 //   passes  (separate bins) the same with a one-hot weight table per bin, one pass per bin
 //   sorted  (separate bins) each channel's windows sorted by bin into slots (a stable counting sort;
 //           within the XMAC's channel groups each bin padded to 16 x the most windows any of the
@@ -299,6 +299,148 @@ __global__ void wt_scrunch(int nfreq, int nbins, int nblp, const float* __restri
     for (int b = 0; b < nbins; b++)
         if (binw[b] > 0.f) sum += binw[b] * wt[((size_t)f * nbins + b) * nblp + blp];
     wtS[i] = sum;
+}
+
+// ---- the per-bin weights in two kernels (the six above, kept to compare) -------------------------
+// 1. bins_wt: the bins kernel with the weights' counting folded in.  A block takes WB windows at a
+//    time (grid-stride; WB up to 32, chosen to fill the GPU), all their (frequency, channel)s: each bin's
+//    count per frequency in shared memory (an add per run of equal bins in a warp: neighbouring
+//    channels share a bin, except at high DM), added to cnt at the end.  Whether some station's weight in a window
+//    is below 1 (a bit per window, read WB windows at a time); for such a window (rare) a second pass
+//    over its bins writes its histogram to H[f][k][.] (k its place in the flagged list): per bin, or
+//    scrunched one column, the histogram summed with the positive bin weights.  st = [nflag, cnt[f][b]],
+//    zeroed before (one memset of 4 (1 + nfreq nbins) bytes).
+// 2. wt_final: wt[f][b][q] = (cnt - sum over flagged k of H[k][b] (1 - w1 w2)) / nchan, the product in
+//    32 x 32 tiles of (bins, baseline-products).  Scrunched only the positive bin weights' sum is
+//    needed: (sum_b w_b cnt_b - sum_k H'[k] (1 - w1 w2)) / nchan, a matrix-vector product, the flagged
+//    windows split over a block's 8 warps' rows.
+// one add per run of equal keys across the warp's lanes (key < 0: none)
+__device__ inline void addRuns(int* h, int key) {
+    const int lane = threadIdx.x & 31;
+    const int prev = __shfl_up_sync(0xffffffffu, key, 1);
+    const bool start = lane == 0 || key != prev;
+    const unsigned later = __ballot_sync(0xffffffffu, start) & ~((2u << lane) - 1u);
+    if (start && key >= 0) atomicAdd(&h[key], (later ? __ffs(later) - 1 : 32) - lane);
+}
+__global__ void bins_wt(int WB, int nwin, int nfreq, int nchan, int nbins, const unsigned long long* __restrict__ ends64,
+                        const uint32_t* __restrict__ winPhase, const uint32_t* __restrict__ dmOff, uint8_t* bins,
+                        int nrows, const float* __restrict__ dw, const float* __restrict__ binw, int* st, int* list,
+                        float* H) {
+    __shared__ unsigned long long e[MAXBINS];
+    __shared__ unsigned flagMask[2];                  // alternate chunks: no sync needed before the reset
+    __shared__ int kSlot;
+    extern __shared__ int hs[];                        // [f][b] counts, then [f][b] a flagged window's
+    const int nfb = nfreq * nbins, nfc = nfreq * nchan;
+    const int hb = binw ? 1 : nbins;                   // H's columns
+    int* hw = hs + nfb;
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) e[i] = ends64[i];
+    for (int i = threadIdx.x; i < nfb; i += blockDim.x) hs[i] = 0;
+    for (int w0 = blockIdx.x * WB, it = 0; w0 < nwin; w0 += gridDim.x * WB, it ^= 1) {
+        if (threadIdx.x == 0) flagMask[it] = 0;
+        __syncthreads();
+        for (int t = threadIdx.x; t < nrows * WB; t += blockDim.x) {
+            const int w = w0 + t % WB;
+            if (w < nwin && dw[(size_t)(t / WB) * nwin + w] != 1.f) atomicOr(&flagMask[it], 1u << (t % WB));
+        }
+        const int n = min(WB, nwin - w0) * nfc;
+        // element i = (window w - w0, frequency f, channel c), stepped by the block's size without dividing
+        int wi = 0, f = 0, c = threadIdx.x;
+        while (c >= nchan) { c -= nchan; if (++f == nfreq) { f = 0; wi++; } }
+        for (int i0 = 0; i0 < n; i0 += blockDim.x) {   // whole warps each round, for the runs
+            const int i = i0 + threadIdx.x;
+            int key = -1;
+            if (i < n) {
+                const int b = binAt(winPhase[w0 + wi] + dmOff[f * nchan + c], e, nbins);
+                bins[(size_t)w0 * nfc + i] = (uint8_t)b;
+                key = f * nbins + b;
+            }
+            addRuns(hs, key);
+            c += blockDim.x;
+            while (c >= nchan) { c -= nchan; if (++f == nfreq) { f = 0; wi++; } }
+        }
+        __syncthreads();                               // flagMask complete; this block's bins visible to it
+        for (unsigned m = flagMask[it]; m; m &= m - 1) {
+            const int w = w0 + __ffs(m) - 1;
+            for (int i = threadIdx.x; i < nfb; i += blockDim.x) hw[i] = 0;
+            __syncthreads();
+            for (int i0 = 0; i0 < nfc; i0 += blockDim.x) {
+                const int j = i0 + threadIdx.x;
+                const int key = j < nfc ? (j / nchan) * nbins + bins[(size_t)w * nfc + j] : -1;
+                addRuns(hw, key);
+            }
+            if (threadIdx.x == 0) {
+                kSlot = atomicAdd(&st[0], 1);
+                if (kSlot < nwin) list[kSlot] = w;
+            }
+            __syncthreads();
+            const int k = kSlot;
+            if (k < nwin) {
+                if (binw) {
+                    for (int f = threadIdx.x; f < nfreq; f += blockDim.x) {
+                        float t = 0.f;
+                        for (int b = 0; b < nbins; b++) if (binw[b] > 0.f) t += binw[b] * hw[f * nbins + b];
+                        H[(size_t)f * nwin + k] = t;
+                    }
+                } else
+                    for (int i = threadIdx.x; i < nfb; i += blockDim.x)
+                        H[((size_t)(i / nbins) * nwin + k) * hb + i % nbins] = (float)hw[i];
+            }
+            __syncthreads();                           // hw, kSlot reused
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < nfb; i += blockDim.x)
+        if (hs[i]) atomicAdd(&st[1 + i], hs[i]);
+}
+__device__ inline float wtG(const XmacShape& s, const int2* bls, const float* dw, int f, int q, int w) {   // 1 - w1 w2
+    const int bl = q / 4, p = q % 4, pol1 = p == 1 || p == 3, pol2 = p == 1 || p == 2;
+    return 1.f - dw[((size_t)bls[bl].x * s.nband() + 2 * f + pol1) * s.nwin + w] *
+                 dw[((size_t)bls[bl].y * s.nband() + 2 * f + pol2) * s.nwin + w];
+}
+__global__ void wt_final(XmacShape s, int nbins, const int2* __restrict__ bls, const float* __restrict__ dw,
+                         const int* __restrict__ list, const int* __restrict__ st, const float* __restrict__ H, float* wt) {
+    __shared__ float hsm[32][33], gs[32][33];          // [window k][bin], [window k][(baseline, product)]
+    const int f = blockIdx.z, b0 = blockIdx.y * 32, q0 = blockIdx.x * 32;
+    const int nblp = s.nbaseline() * 4, nf = min(st[0], s.nwin);
+    const int tx = threadIdx.x, ty = threadIdx.y;      // 32 x 8: tx a (baseline, product), ty 4 bins
+    const int q = q0 + tx;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k0 = 0; k0 < nf; k0 += 32) {
+        for (int r = ty; r < 32; r += 8) {
+            const int k = k0 + r;
+            hsm[r][tx] = k < nf && b0 + tx < nbins ? H[((size_t)f * s.nwin + k) * nbins + b0 + tx] : 0.f;
+            gs[r][tx] = k < nf && q < nblp ? wtG(s, bls, dw, f, q, list[k]) : 0.f;
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int r = 0; r < 32; r++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) acc[j] += hsm[r][ty * 4 + j] * gs[r][tx];
+        __syncthreads();
+    }
+    if (q < nblp)
+        for (int j = 0; j < 4; j++) {
+            const int b = b0 + ty * 4 + j;
+            if (b < nbins) wt[((size_t)f * nbins + b) * nblp + q] = ((float)st[1 + f * nbins + b] - acc[j]) / s.nchan;
+        }
+}
+__global__ void wt_final_scrunched(XmacShape s, int nbins, const int2* __restrict__ bls, const float* __restrict__ dw,
+                                   const int* __restrict__ list, const int* __restrict__ st, const float* __restrict__ H,
+                                   const float* __restrict__ binw, float* wtS) {
+    __shared__ float red[8][33];
+    const int f = blockIdx.y, nblp = s.nbaseline() * 4, nf = min(st[0], s.nwin);
+    const int tx = threadIdx.x, ty = threadIdx.y, q = blockIdx.x * 32 + tx;
+    float acc = 0.f;
+    if (q < nblp)
+        for (int k = ty; k < nf; k += 8) acc += H[(size_t)f * s.nwin + k] * wtG(s, bls, dw, f, q, list[k]);
+    red[ty][tx] = acc;
+    __syncthreads();
+    if (ty == 0 && q < nblp) {
+        float c = 0.f, a = 0.f;
+        for (int b = 0; b < nbins; b++) if (binw[b] > 0.f) c += binw[b] * (float)st[1 + f * nbins + b];
+        for (int j = 0; j < 8; j++) a += red[j][tx];
+        wtS[(size_t)f * nblp + q] = (c - a) / s.nchan;
+    }
 }
 
 // ---- the naive port -----------------------------------------------------------------------------
@@ -618,6 +760,11 @@ int main(int argc, char** argv) {
     int* dHist = devAlloc<int>((size_t)u.nfreq * u.nwin * u.nbins);     // the flagged windows' histograms
     float* dWt = devAlloc<float>((size_t)u.nfreq * u.nbins * nblp);
     float* dWtS = devAlloc<float>((size_t)u.nfreq * nblp);
+    int* dWtSt = devAlloc<int>(1 + (size_t)u.nfreq * u.nbins);          // [nflag, the counts [f][b]]
+    float* dHistF = devAlloc<float>((size_t)u.nfreq * u.nwin * (u.scrunch ? 1 : u.nbins));
+    const size_t binsWtSmem = 2 * (size_t)u.nfreq * u.nbins * sizeof(int);
+    const int binsWB = std::max(1, std::min(32, u.nwin / (sms * 8)));    // windows a block in bins_wt: a block each
+    if (binsWtSmem > 48 * 1024) { fprintf(stderr, "ERROR: nfreq x nbins too large for bins_wt\n"); return 1; }
 
     // ---- inputs ----
     __half2* spec = devAlloc<__half2>(s.halfCount());
@@ -630,12 +777,27 @@ int main(int argc, char** argv) {
     cudaStream_t st;
     CHECK_CUDA(cudaStreamCreate(&st));
 
-    auto runBins = [&] {
+    auto runBinsOnly = [&] {                       // the bins alone (before the weights' work was folded in)
         bins_kernel<<<sms * 8, 256, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, dEnds, dWinPhase, dDmOff, dBins);
         CHECK_CUDA(cudaGetLastError());
     };
+    auto runBins = [&] {                           // the bins, each bin's count, the flagged windows' histograms
+        CHECK_CUDA(cudaMemsetAsync(dWtSt, 0, (1 + (size_t)u.nfreq * u.nbins) * sizeof(int), st));
+        bins_wt<<<(u.nwin + binsWB - 1) / binsWB, 256, binsWtSmem, st>>>(binsWB, u.nwin, u.nfreq, u.nchan, u.nbins, dEnds,
+            dWinPhase, dDmOff, dBins, u.nant * s.nband(), dDw, u.scrunch ? dWts : nullptr, dWtSt, dFlag, dHistF);
+        CHECK_CUDA(cudaGetLastError());
+    };
+    auto runWeights = [&] {                        // after runBins: the per-bin weights (and, scrunched, their weighted sum)
+        if (u.scrunch)
+            wt_final_scrunched<<<dim3((nblp + 31) / 32, u.nfreq), dim3(32, 8), 0, st>>>(s, u.nbins, dBls, dDw, dFlag, dWtSt,
+                                                                                    dHistF, dWts, dWtS);
+        else
+            wt_final<<<dim3((nblp + 31) / 32, (u.nbins + 31) / 32, u.nfreq), dim3(32, 8), 0, st>>>(s, u.nbins, dBls, dDw, dFlag,
+                                                                                               dWtSt, dHistF, dWt);
+        CHECK_CUDA(cudaGetLastError());
+    };
     auto runXmac = [&] { xmacTensorStagedMapped(s, map, spec, (cuFloatComplex*)vis, sms, st); };
-    auto runWeights = [&] {                        // the per-bin weights (and, scrunched, their weighted sum)
+    auto runWeightsOld = [&] {                     // the six kernels: the per-bin weights from the bins alone
         CHECK_CUDA(cudaMemsetAsync(dCntW, 0, (size_t)u.nfreq * u.nbins * sizeof(unsigned), st));
         CHECK_CUDA(cudaMemsetAsync(dNflag, 0, sizeof(int), st));
         wt_count<<<dim3((u.nwin + WCHUNK - 1) / WCHUNK, u.nfreq), 256, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, dBins, dCntW);
@@ -796,13 +958,11 @@ int main(int argc, char** argv) {
             const int bin = hBins[((size_t)w * u.nfreq + k.f) * u.nchan + cc];
             if (u.scrunch) {
                 ref[q] += u.weights[bin] * v;
-                // the weighted XMAC: each value times sqrt|w| rounded to FP16, the product rounded to FP16
-                // (exact in FP32 first), the sign on the product
-                const float sc = __half2float(__float2half_rn(std::sqrt(std::fabs((float)u.weights[bin]))));
+                // the weighted XMAC: the first station's value times w rounded to FP16, the product
+                // rounded to FP16 (exact in FP32 first)
+                const float sc = __half2float(__float2half_rn((float)u.weights[bin]));
                 const float2 as = __half22float2(__floats2half2_rn(a.x * sc, a.y * sc));
-                const float2 bs = __half22float2(__floats2half2_rn(b.x * sc, b.y * sc));
-                refStage[q] += (u.weights[bin] < 0 ? -1.0 : 1.0) *
-                               std::complex<double>(as.x, as.y) * std::conj(std::complex<double>(bs.x, bs.y));
+                refStage[q] += std::complex<double>(as.x, as.y) * std::conj(std::complex<double>(b.x, b.y));
             }
             else ref[q * nb + bin] += v;
             refAll[q] += v;
@@ -908,7 +1068,7 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpy(hWt.data(), dWt, hWt.size() * sizeof(float), cudaMemcpyDeviceToHost));
         if (u.scrunch) CHECK_CUDA(cudaMemcpy(hWtS.data(), dWtS, hWtS.size() * sizeof(float), cudaMemcpyDeviceToHost));
         int nflag = 0;
-        CHECK_CUDA(cudaMemcpy(&nflag, dNflag, sizeof(int), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&nflag, dWtSt, sizeof(int), cudaMemcpyDeviceToHost));
         double emax = 0, wmax = 0, smax = 0;
         std::vector<double> ref(u.nbins);
         for (size_t q = 0; q < picks.size(); q++) {
@@ -922,8 +1082,10 @@ int main(int argc, char** argv) {
             }
             double rs = 0;
             for (int b = 0; b < u.nbins; b++) {
-                const double g = hWt[((size_t)k.f * u.nbins + b) * nblp + k.bl * 4 + k.p];
-                emax = std::max(emax, std::fabs(g - ref[b]));
+                if (!u.scrunch) {                  // scrunched: only the sum is made
+                    const double g = hWt[((size_t)k.f * u.nbins + b) * nblp + k.bl * 4 + k.p];
+                    emax = std::max(emax, std::fabs(g - ref[b]));
+                }
                 wmax = std::max(wmax, ref[b]);
                 if (u.weights[b] > 0) rs += u.weights[b] * ref[b];
             }
@@ -947,18 +1109,20 @@ int main(int argc, char** argv) {
         const bool header = !t;
         if (t) fclose(t);
         fc = fopen(csv.c_str(), "a");
-        if (header) fprintf(fc, "gpu,nant,nfreq,nchan,nwin,period_ms,dm,bins,nbins,scrunch,avg,accumulate,what,ms,ms_per_ms\n");
+        if (header) fprintf(fc, "gpu,nant,nfreq,nchan,nwin,period_ms,dm,bins,nbins,scrunch,avg,accumulate,what,ms,ms_per_ms,dropout,partial\n");
     }
     auto line = [&](const std::string& key, const std::string& name, Timing t) {
         printf("  %-52s %8.3f [%8.3f]  %8.4f\n", name.c_str(), t.median, t.min, t.median / subMs);
-        if (fc) fprintf(fc, "\"%s\",%d,%d,%d,%d,%.6g,%g,%s,%d,%d,%d,%d,%s,%.5f,%.6f\n", prop.name, u.nant, u.nfreq, u.nchan,
+        if (fc) fprintf(fc, "\"%s\",%d,%d,%d,%d,%.6g,%g,%s,%d,%d,%d,%d,%s,%.5f,%.6f,%g,%g\n", prop.name, u.nant, u.nfreq, u.nchan,
                         u.nwin, u.period * 1e3, u.dm, bins.c_str(), u.nbins, (int)u.scrunch, avg, (int)accumulate, key.c_str(),
-                        t.median, t.median / subMs);
+                        t.median, t.median / subMs, dropout, partial);
     };
     const Timing tx = timeIt(runXmac, warmup, reps, st);
     line("xmac", "xmac (staged tensor, unbinned)", tx);
-    line("bins", "bins (per window, frequency, channel)", timeIt(runBins, warmup, reps, st));
-    line("weights", "per-bin weights (count, flagged windows, correction)", timeIt(runWeights, warmup, reps, st));
+    line("bins-only", "bins alone (per window, frequency, channel)", timeIt(runBinsOnly, warmup, reps, st));
+    line("weights-old", "per-bin weights from them (six kernels)", timeIt(runWeightsOld, warmup, reps, st));
+    line("bins", "bins, with the counts and flagged windows' histograms", timeIt(runBins, warmup, reps, st));
+    line("weights", "per-bin weights after them (one kernel)", timeIt(runWeights, warmup, reps, st));
     for (auto& v : variants) {
         const Timing t = timeIt(v.run, warmup, reps, st);
         line(v.key, "binned: " + v.name, t);

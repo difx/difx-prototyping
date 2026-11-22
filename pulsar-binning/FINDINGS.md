@@ -20,9 +20,11 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
 
 
 - **The gate and scrunched output: one pass of the staged XMAC, weighted in its stage**
-  (`xmacTensorStagedWeighted`): 0.33-0.70x the unbinned XMAC for the 1.5 ms gate (the blocks with no
-  on-pulse window skipped), 1.04-1.37x with nothing to skip (16 bins on - off, negative weights
-  included: the sign goes into the A operand).  ([docs/results.md](docs/results.md), steps 3, 6)
+  (`xmacTensorStagedWeighted`): 0.32-0.64x the unbinned XMAC for the 1.5 ms gate (the blocks with no
+  on-pulse window skipped), 0.99-1.16x with nothing to skip (16 bins on - off, negative weights
+  included).  The copy is the plain one; each (window, channel)'s weight goes beside the stage in
+  FP16 and multiplies the A operand in registers, sign included (the first version, scaling every
+  value by sqrt|w| in the copy, was 1.04-1.37x).  ([docs/results.md](docs/results.md), steps 3, 6)
 - **Separate bins: each channel's windows sorted by bin** (`xmacTensorStagedSorted`, a block per
   segment of a bin), from channel-major spectra ([station][band][channel][window]): 2.3-4.5x the
   unbinned XMAC for 16 bins and for the 500 ms pulsar (the XMAC gathering each slot's window), 6-7x
@@ -42,7 +44,9 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
 - **The bins kernel**: 3-9% of the unbinned XMAC at 10 stations (a binary search over the ends).
 - **The per-bin weights** (mpifxcorr's baseline weight per bin): a count of each bin's samples less a
   correction over the windows with a station weight below 1 (a matrix product): exact against
-  mpifxcorr's sum; 0.09-0.17 ms a subint with every weight 1, growing with the flagged windows.
+  mpifxcorr's sum.  The bins kernel counts as it goes (0.01-0.03 ms more) and one kernel finishes
+  (0.004 ms with every weight 1): bins + weights 3-22% of the XMAC, from 12-28% with six kernels;
+  with flagged windows 0.23-0.41 ms (from 0.42-1.05).
 - **High DM** (300 at 1.5 ms: the bin changes at every channel at 1024 channels; 1000 at 500 ms): the
   sorted approaches are unchanged (each channel sorted on its own); the gate loses its skipping
   (1.17-1.31x instead of 0.46-0.70x); gathering from window-major spectra, a pass per bin and the

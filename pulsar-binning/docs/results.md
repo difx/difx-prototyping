@@ -343,3 +343,70 @@ about the XMAC's time, as on the 2070) to the versions that start from them:
   of the XMAC (7-14% on the 2070): six small kernels, 0.06 ms at 128 channels and 0.11 at 1024.
   Folding the count into the bins kernel (in the backlog) matters more here.
 - **The bins kernel**: 0.018-0.054 ms, 5-17% of the XMAC (the most at 1.5 ms, DM 300, 128 bins).
+
+## The weights: the per-bin weights in two kernels, the weighted copy slimmed (2026-11-22, RTX 2070 SUPER)
+
+`run-bins.sh` (`results-local/ar313-adeller-bins-20261122-164224`, every run passing; the same
+sweep before the weighted copy changed: `ar313-adeller-bins-20261122-163639`).
+
+**The per-bin weights** were the bins kernel and then six small kernels (a count, the flagged
+windows' list, an initialisation, their histograms, the correction, the scrunched sum).  Now:
+- **the bins kernel counts as it goes** (`bins_wt`): a block takes up to 32 windows at a time,
+  enough of them to fill the GPU; each bin's count per frequency is added in shared memory, once per
+  run of equal bins across a warp's lanes (neighbouring channels mostly share a bin), and once into
+  the global count at the end.  It reads the stations' weights for its windows (a bit a window), and
+  for a window with some weight below 1 (rare) it makes a second pass over that window's bins, writing
+  its histogram for the correction.  An earlier try, a block per window with `__match_any_sync` and
+  divisions for the indices, cost 0.03-0.06 ms more than the bins alone; now 0.01-0.03 ms more.
+- **one kernel after it** (`wt_final`): (count - the correction) / nchan in 32 x 32 tiles, the
+  correction the same matrix product over the flagged windows.  Scrunched, only the sum over the
+  positive bin weights is needed, so the bins kernel sums each flagged window's histogram with those
+  weights and the correction is a matrix-vector product (`wt_final_scrunched`, the flagged windows
+  split over a block's warps): the 32-bin tiles wasted 30 of their 32 rows on a gate.
+- With no window flagged, bins + weights take 0.050-0.258 ms a subint (3-22% of the XMAC), against
+  0.172-0.335 ms (12-28%) before; the weights kernel 0.004 ms.  With flagged windows:
+
+| case | flagged windows | bins | weights | before (bins + weights) |
+|---|---|---|---|---|
+| 1.5 ms, 128 ch, 128 bins, dropout 0.02 | 1161 | 0.147 | 0.262 | 0.470 |
+| 1.5 ms, 1024 ch, 128 bins, dropout 0.1, partial 0.1 | 709 | 0.137 | 0.160 | 0.417 |
+| 500 ms, 128 ch, gate, dropout 0.05, partial 0.05 | 4193 | 0.108 | 0.123 | 0.770 |
+| 1.5 ms, 128 ch, 16 scrunched, dropout 0.3 | 6232 | 0.160 | 0.183 | 1.045 |
+
+  Exact against mpifxcorr's sum in every case.
+
+**The weighted copy slimmed** (the gate and scrunched output, `xmacTensorStagedWeighted`): the copy
+into the stage is now the plain one.  With each stage, 128 threads (CH x 16) each load one (window,
+channel)'s bin and put its weight, in FP16, into a [stage][channel][16] table in shared memory, in
+the order the A fragments take the windows; each lane loads one word (its two windows' weights) per
+16-window half and multiplies its A registers by them (four HMUL2, the sign included).  B is left
+as it is, so each product X1 X2* gets w once.  Blocks whose weights are all 1 skip the multiplies;
+all-0 blocks are skipped as before.  Gone: the bin loads, table lookups, conversions and FP16
+multiplies on every value in the copy, the sqrt|w| (now one FP16 rounding of the first station's
+value times w, instead of both stations' values times sqrt|w|), and the separate sign path.  The KS
+2 kernel's spills went from 44 to 16 bytes; the others spill nothing; the plain kernel is unchanged
+(registers, and its times in the sweep).
+
+| P | ch | bins | DM | before | now |
+|---|---|---|---|---|---|
+| 1.5 ms | 128 | gate | 30 | 0.47 | 0.40 |
+| | | 16 scrunched | 30 | 1.37 | 1.15 |
+| | | gate | 300 | 1.34 | 1.12 |
+| | 1024 | gate | 30 | 0.70 | 0.64 |
+| | | 16 scrunched | 30 | 1.27 | 1.11 |
+| | | gate | 300 | 1.15 | 1.09 |
+| 500 ms | 128 | gate | 30 | 1.14 | 1.09 |
+| | | 16 scrunched | 1000 | 1.34 | 1.13 |
+| | 1024 | gate | 30 | 1.09 | 1.03 |
+| | | 16 scrunched | 1000 | 1.26 | 1.09 |
+
+(ratios to the unbinned XMAC; with 8 channels averaged and accumulation within 0.04 of these.)
+With nothing to skip it is now 0.99-1.16x (1.04-1.37x before).  At 32 stations: the gate 0.32x, 16
+scrunched 1.14x; at 3 and 6 stations, where the XMAC is small, 16 scrunched 1.29-1.31x.
+
+What is left, from the 500 ms gate (every block on-pulse, weights all 1): 1.09x / 1.03x at 128 /
+1024 channels; with the classification off (every block plain, no multiplies; a timing hack, not
+kept) 1.07x / 1.02x, so the classification is 2-4%; with it off and every block multiplied
+(`--noskip`), 1.13x at 128 channels, so the multiplies are about 5%.  The rest, 2-7%, is the
+weighted kernel itself.  Moving the classification into the bins kernel would save at most the
+2-4%.
