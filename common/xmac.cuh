@@ -130,9 +130,29 @@ struct XmacWeights {
     int nbins = 0;
     bool skip = false;
     bool negative = false;              // some weight is negative
+    const int4* segs = nullptr;         // sorted (below)
+    int maxSeg = 0;
+    int cstride = 0;                    // sorted: __half2 from one channel to the next (channel-major)
+    const int* slotWin = nullptr;       // sorted, gathered: [frequency][channel][cap] each slot's window or -1
+    int cap = 0;
 };
 void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                               const XmacWeights& w, int multiprocessors, cudaStream_t st);
+// Sorted (pulsar binning, separate bins): the spectra's "windows" are slots (s.nwin of them), each
+// channel's windows sorted by bin, channel-major: receiver r's channel c, slot k at m.off[f][r] +
+// c cstride + k (the map's window strides unused); within a group of xmacTensorStagedChannels(s) channels (the
+// channels a block takes, from channel 0) each bin has the same slots, a multiple of 16, the
+// channels with fewer windows in it padded with zeros.  segs[(f * ngroups + g) * maxSeg + k] =
+// (bin, first slot block, last + 1, the bin's number of segments) for the group's k-th segment, bin
+// -1 past its last; a block runs one segment, adding its sums to that bin's visibilities (atomically
+// when the bin has several).  vis is [nbins][visCount], zeroed here.
+// With slotWin ([frequency][channel][s.nwin] the window of each slot, -1 padding), the spectra are not
+// permuted: channel-major in time order, a channel's windows at off + c cstride + window, and the copy
+// gathers each slot's window (4-byte loads).
+void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
+                            const int4* segs, int maxSeg, int nbins, int cstride, int multiprocessors, cudaStream_t st,
+                            const int* slotWin = nullptr);
+int xmacTensorStagedChannels(const XmacShape& s);
 int xmacTensorStagedTile(const XmacShape& s);
 int xmacTensorStagedStages(const XmacShape& s);
 void xmacTensorStagedSetTile(int ks);

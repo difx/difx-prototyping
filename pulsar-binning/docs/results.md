@@ -91,3 +91,50 @@ case passing (weights 0 and 1 exact; others against the host with the stage's FP
   at 1.5 ms (DM 30) a bin is in a large share of a block's 16-window blocks: 41x for 128 bins at
   128 channels, 70x at 1024 (a bin narrower than a window, in nearly every block).  The 500 ms
   pulsar's 118 empty bins still cost a pass each (the classification).  Not the way for many bins.
+
+## Step 4: bins sorted per channel (2026-11-22, RTX 2070 SUPER)
+
+Separate bins in one pass: each channel's windows sorted by bin into slots (a stable counting sort,
+a warp per (frequency, channel), the bins computed on the fly), each bin padded to a multiple of 16
+slots with the same slots across the XMAC's channel group (8 channels); the staged XMAC
+(`xmacTensorStagedSorted`) runs a block per segment of a bin (up to 32 slot blocks) and writes its
+sums to that bin once (atomically when the bin has several segments).  Every case checked against
+the host (and the sum of its bins against the unbinned sums).
+
+- **The XMAC over the slots is cheap; getting the data into slot order is not.**  From the usual
+  spectra ([station][window][band][channel]) a permuted copy cost 17-28 ms (1.5 ms, 128 channels):
+  a channel's windows are 4-byte gathers, a sector each, and dispersion (5.7 windows a channel)
+  keeps neighbouring channels from sharing them.  The XMAC over the permuted slots was 1.5-2.5 ms.
+- **Channel-major spectra** ([station][band][channel][window], a channel's windows contiguous; the
+  station kernel would write them in pulsar mode, here a transpose, 1.4-1.5 ms, not counted): the
+  permute 3.0-5.8 ms.  And `gather`: no permuted copy, the XMAC's copy gathers each slot's window
+  through the slot table (`xmacTensorStagedSorted` with slotWin).
+- **Weighted / sorted path / gather, ms per subint** (10 stations; the sort includes a
+  device-to-host sync, for the permute's size):
+
+| P | ch | bins | XMAC | passes | sorted: sort + permute + XMAC | gather: sort + XMAC | slots padding |
+|---|---|---|---|---|---|---|---|
+| 1.5 ms | 128 | 16 | 1.215 | 7.11 (6.0x) | 5.58 (4.6x): 0.35 + 3.02 + 2.19 | 3.93 (3.2x): 0.35 + 3.58 | 5% |
+| | 128 | 128 | 1.202 | 50.1 (41x) | 7.76 (6.5x): 0.91 + 3.64 + 3.22 | 14.4 (12x): 0.91 + 13.5 | 28% |
+| | 1024 | 16 | 1.470 | 13.8 (9.3x) | 6.69 (4.6x): 0.31 + 3.26 + 3.09 | 5.62 (3.8x): 0.30 + 5.33 | 22% |
+| | 1024 | 128 | 1.466 | 103 (70x) | 19.7 (13x): 1.78 + 5.78 + 12.0 | 26.8 (18x): 1.78 + 25.1 | 156% |
+| 500 ms | 128 | 16 | 1.204 | 4.00 (3.3x) | 5.49 (4.6x): 0.42 + 2.95 + 2.13 | 3.16 (2.6x): 0.42 + 2.75 | 3% |
+| | 128 | 128 | 1.209 | 19.9 (16x) | 5.79 (4.8x): 0.59 + 2.88 + 2.32 | 3.51 (2.9x): 0.59 + 2.92 | 2% |
+| | 1024 | 16 | 1.478 | 5.41 (3.7x) | 6.01 (4.1x): 0.31 + 3.04 + 2.63 | 3.72 (2.5x): 0.31 + 3.41 | 8% |
+| | 1024 | 128 | 1.493 | 30.3 (20x) | 8.16 (5.5x): 0.58 + 3.03 + 4.56 | 5.88 (3.9x): 0.58 + 5.30 | 8% |
+
+- **Gather wins when a bin's windows come in long runs** (16 bins; the 500 ms pulsar): 2.5-3.9x.
+  With short runs (1.5 ms, 128 bins: 1.5-3 windows) its 4-byte loads do not coalesce, and the
+  permuted copy wins (6.5x at 128 channels).
+- **The output is a large part of what remains**: separate bins zero and write nbins x the
+  visibilities every subint (128 bins x 1024 channels: 755 MB, twice), most of the 12 ms of the
+  XMAC over the slots there, and the 500 ms pulsar's 118 empty bins are zeroed too.  So channel
+  averaging in the XMAC and accumulating across subints (step 6) come next.
+- **The padding** (16-slot blocks per bin, the most windows any channel of a group has): 2-8% for
+  long runs, 28% at 1.5 ms / 128 bins / 128 channels, 156% at 1024 channels (6 windows a bin a
+  subint, padded to 16).  Sorting over several subints would cut the last.
+- **Writing a bin's sums at each bin change inside the window loop** (the first version of the
+  sorted XMAC, and what splitting 16-window blocks at bin boundaries, step 5 of the plan, needs)
+  put a second copy of the store code in the loop: 0.5-1.9 KB of spills at KS 2.  The segment
+  grid (one bin a block, one store at the end) has none; step 5 was not built further: for long
+  runs `gather` already does its job, and for short runs it is the passes' cost again.

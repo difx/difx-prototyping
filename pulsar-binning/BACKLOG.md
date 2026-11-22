@@ -11,6 +11,11 @@ to keep arbitrary breakpoints.
 - Step 3: weights in the staged XMAC's stage (`xmacTensorStagedWeighted`, the unweighted kernel
   unchanged): the gate and scrunched output in one pass at 0.46-1.35x the unbinned XMAC; separate
   bins by a pass each 3.3-70x (not the way for many bins).
+- Step 4: bins sorted per channel (`xmacTensorStagedSorted`, a block per segment of a bin), from
+  channel-major spectra: with a permuted copy 4.6-13x, gathering in the XMAC 2.5-18x (best for long
+  runs; the copy for short).  The output (nbins x the visibilities, zeroed and written each subint)
+  is a large part.  Step 5 (splitting 16-window blocks at bin changes) not built: its in-loop store
+  spilled, and gather covers long runs.
 
 ## The test cases
 

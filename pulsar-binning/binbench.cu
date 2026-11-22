@@ -12,6 +12,14 @@
 //           stage scales each (window, channel) by sqrt|w| of its bin, a negative weight's sign goes
 //           into the A operand; 16-window blocks whose weights are all 0 skipped.  One pass.
 //   passes  (separate bins) the same with a one-hot weight table per bin, one pass per bin
+//   sorted  (separate bins) each channel's windows sorted by bin into slots (a stable counting sort;
+//           within the XMAC's channel groups each bin padded to 16 x the most windows any of the
+//           group's channels has in it), the station spectra permuted into that order, and the
+//           staged XMAC over the slots, a block per segment of a bin (xmacTensorStagedSorted); all from
+//           channel-major spectra ([station][band][channel][window], as the station kernel would write
+//           in pulsar mode; here a transpose, timed apart)
+//   gather  (separate bins) the same without the permuted copy: the XMAC's copy gathers each slot's
+//           window from the channel-major spectra
 // timed against the unbinned staged XMAC (common/xmac.cu), and checked: the bins against mpifxcorr's
 // rule in double on the host, the binned visibilities against the host's sums in double, their sum
 // over the bins against the unbinned XMAC, and the simulated pulse's power in each bin against the
@@ -83,6 +91,116 @@ __global__ void bins_kernel(int nwin, int nfreq, int nchan, int nbins, const uns
             b = lo;
         }
         bins[i] = (uint8_t)b;
+    }
+}
+
+// ---- the sorted path ---------------------------------------------------------------------------
+__device__ inline int binAt(uint32_t ph, const unsigned long long* e, int nbins) {
+    if (ph < e[0] || ph >= e[nbins - 1]) return 0;
+    int lo = 1, hi = nbins - 1;
+    while (lo < hi) {
+        const int m = (lo + hi) >> 1;
+        if (ph < e[m]) hi = m; else lo = m + 1;
+    }
+    return lo;
+}
+constexpr int SW = 8;                       // warps a block in the sort's kernels: a warp a (frequency, channel)
+// count: cnt[(f * nchan + c) * nbins + b], the windows of channel c in bin b
+__global__ void sort_count(int nwin, int nfreq, int nchan, int nbins, const unsigned long long* __restrict__ ends64,
+                           const uint32_t* __restrict__ winPhase, const uint32_t* __restrict__ dmOff, int* cnt) {
+    __shared__ unsigned long long e[MAXBINS];
+    __shared__ int h[SW][MAXBINS];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, fc = blockIdx.x * SW + warp;
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) e[i] = ends64[i];
+    for (int i = lane; i < nbins; i += 32) h[warp][i] = 0;
+    __syncthreads();
+    if (fc >= nfreq * nchan) return;
+    const uint32_t d = dmOff[fc];
+    for (int w = lane; w < nwin; w += 32) atomicAdd(&h[warp][binAt(winPhase[w] + d, e, nbins)], 1);
+    __syncwarp();
+    for (int i = lane; i < nbins; i += 32) cnt[(size_t)fc * nbins + i] = h[warp][i];
+}
+// layout: a thread per (frequency, channel group of CH): each bin's first slot (segStart), padded to
+// 16 x the most windows any of the group's channels has in it; the segments (a bin's slot blocks,
+// at most L a segment); the most slots any group needs (atomicMax into *maxSlots)
+__global__ void sort_layout(int nfreq, int nchan, int CH, int nbins, int L, int maxSeg, const int* __restrict__ cnt,
+                            int* segStart, int4* segs, int* maxSlots) {
+    const int ncg = (nchan + CH - 1) / CH;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nfreq * ncg) return;
+    const int f = i / ncg, g = i % ncg;
+    int pos = 0, k = 0;
+    for (int b = 0; b < nbins; b++) {
+        int mx = 0;
+        for (int c = g * CH; c < min(nchan, g * CH + CH); c++) mx = max(mx, cnt[((size_t)f * nchan + c) * nbins + b]);
+        segStart[(size_t)i * nbins + b] = pos;
+        const int nsb = (mx + 15) / 16, nseg = (nsb + L - 1) / L;
+        for (int j = 0; j < nseg && k < maxSeg; j++, k++)
+            segs[(size_t)i * maxSeg + k] = make_int4(b, pos / 16 + j * L, pos / 16 + min(nsb, (j + 1) * L), nseg);
+        pos += 16 * nsb;
+    }
+    for (; k < maxSeg; k++) segs[(size_t)i * maxSeg + k] = make_int4(-1, 0, 0, 0);
+    atomicMax(maxSlots, pos);
+}
+// scatter: a warp per (frequency, channel): each window's slot, slotWin[(f * nchan + c) * cap + slot] =
+// window (the rest -1), in time order within a bin (stable)
+__global__ void sort_scatter(int nwin, int nfreq, int nchan, int nbins, int CH, const unsigned long long* __restrict__ ends64,
+                             const uint32_t* __restrict__ winPhase, const uint32_t* __restrict__ dmOff,
+                             const int* __restrict__ segStart, int cap, int* slotWin) {
+    __shared__ unsigned long long e[MAXBINS];
+    __shared__ int next[SW][MAXBINS];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, fc = blockIdx.x * SW + warp;
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) e[i] = ends64[i];
+    const int ncg = (nchan + CH - 1) / CH;
+    const bool ok = fc < nfreq * nchan;
+    const int f = ok ? fc / nchan : 0, c = ok ? fc % nchan : 0;
+    for (int i = lane; i < nbins; i += 32) next[warp][i] = ok ? segStart[((size_t)f * ncg + c / CH) * nbins + i] : 0;
+    __syncthreads();
+    if (!ok) return;
+    const uint32_t d = dmOff[fc];
+    for (int base = 0; base < nwin; base += 32) {
+        const int w = base + lane;
+        const bool valid = w < nwin;
+        const int b = valid ? binAt(winPhase[w] + d, e, nbins) : MAXBINS + lane;     // invalid lanes: alone
+        const unsigned mask = __match_any_sync(0xffffffffu, b);
+        const int rank = __popc(mask & ((1u << lane) - 1));
+        const int slot = valid ? next[warp][b] + rank : 0;
+        __syncwarp();
+        if (valid) {
+            slotWin[(size_t)fc * cap + slot] = w;
+            if (lane == __ffs(mask) - 1) next[warp][b] += __popc(mask);
+        }
+        __syncwarp();
+    }
+}
+// The channel-major layout: [station][band][channel][window] (a channel's windows contiguous), which
+// the station kernel would write in pulsar mode; here a transpose of the usual spectra (32 x 32 tiles)
+__global__ void to_channel_major(XmacShape s, const __half2* __restrict__ spec, __half2* specT) {
+    __shared__ __half2 tile[32][33];
+    const int ab = blockIdx.z;                                          // (station, band)
+    const int a = ab / s.nband(), band = ab % s.nband();
+    const int w0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    for (int r = threadIdx.y; r < 32; r += blockDim.y) {               // read: windows w0 + r, channels c0 + x
+        const int w = w0 + r, c = c0 + threadIdx.x;
+        if (w < s.nwin && c < s.nchan) tile[r][threadIdx.x] = spec[s.halfIndex(a, w, band, c)];
+    }
+    __syncthreads();
+    for (int r = threadIdx.y; r < 32; r += blockDim.y) {               // write: channel c0 + r, windows w0 + x
+        const int c = c0 + r, w = w0 + threadIdx.x;
+        if (w < s.nwin && c < s.nchan) specT[(((size_t)a * s.nband() + band) * s.nchan + c) * s.nwin + w] = tile[threadIdx.x][r];
+    }
+}
+// permute: the channel-major spectra into slot order, [station][band][channel][cap slots], zeros where
+// no window; a thread a slot (consecutive slots: within a bin, consecutive windows)
+__global__ void sort_permute(XmacShape s, int cap, int nslot, const int* __restrict__ slotWin,
+                             const __half2* __restrict__ specT, __half2* specS) {
+    const size_t n = (size_t)s.nant * s.nband() * s.nchan * nslot;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const int slot = (int)(i % nslot);
+        const size_t abc = i / nslot;                                   // (station, band, channel)
+        const int c = (int)(abc % s.nchan), band = (int)(abc / s.nchan % s.nband());
+        const int w = slotWin[((size_t)(band >> 1) * s.nchan + c) * cap + slot];
+        specS[abc * cap + slot] = w >= 0 ? specT[abc * s.nwin + w] : __floats2half2_rn(0.f, 0.f);
     }
 }
 
@@ -204,6 +322,7 @@ static void usage() {
 "  --only LIST     comma-separated versions to run: naive, stage (scrunched), passes (separate\n"
 "                  bins) (default all that apply)\n"
 "  --noskip        the weighted XMAC runs every 16-window block (no skipping of all-zero weights)\n"
+"  --seg-len L     sorted: a bin's slot blocks (16 slots) a segment (an XMAC block), at most; default 32\n"
 "  --reps N        timed repetitions, default 20; --warmup N, default 3\n"
 "  --check N       outputs checked against the host, default 128 (each with all its bins)\n"
 "  --csv FILE      append one row per timing\n"
@@ -246,7 +365,8 @@ int main(int argc, char** argv) {
     u.period = 1.5e-3; u.fdot = 0; u.dm = 30; u.phase0 = NAN; u.fwhm = 0.03;
     int nwinArg = 0, reps = 20, warmup = 3, ncheck = 128, device = 0;
     unsigned long long seed = 1;
-    std::string only = "naive,stage,passes", csv, bins = "128", phase = "start";
+    std::string only = "naive,stage,passes,sorted,gather", csv, bins = "128", phase = "start";
+    int segLen = 32;
     bool scrunchArg = false, noskip = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -270,6 +390,7 @@ int main(int argc, char** argv) {
         else if (a == "--bins") bins = next();
         else if (a == "--scrunch") scrunchArg = true;
         else if (a == "--noskip") noskip = true;
+        else if (a == "--seg-len") segLen = std::stoi(next());
         else if (a == "--fwhm") u.fwhm = std::stod(next());
         else if (a == "--noise") noise = std::stod(next());
         else if (a == "--only") only = next();
@@ -301,6 +422,9 @@ int main(int argc, char** argv) {
     const bool runNaive = only.find("naive") != std::string::npos;
     const bool runStage = only.find("stage") != std::string::npos && u.scrunch;
     const bool runPasses = only.find("passes") != std::string::npos && !u.scrunch;
+    const bool runSorted = only.find("sorted") != std::string::npos && !u.scrunch;
+    const bool runGather = only.find("gather") != std::string::npos && !u.scrunch;
+    const bool sortAny = runSorted || runGather;
 
     XmacShape s{};
     s.nant = u.nant; s.nfreq = u.nfreq; s.nchan = u.nchan; s.nwin = u.nwin; s.fftchannels = 2 * u.nchan;
@@ -401,7 +525,74 @@ int main(int argc, char** argv) {
             xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)(out + (size_t)b * s.visCount()), w, sms, st);
         } }});
 
+    // the sorted path: the slots' capacity (each channel's windows plus each bin's padding, generously),
+    // the shape and map of the permuted spectra, the sort's buffers
+    const int CHg = xmacTensorStagedChannels(s), ncg = (u.nchan + CHg - 1) / CHg;
+    const int cap = (2 * u.nwin + 16 * u.nbins + 15) / 16 * 16;
+    const int maxSeg = u.nbins + cap / 16 / std::max(1, segLen) + 1;
+    XmacShape ss = s;
+    ss.nwin = cap;
+    XmacMap mapS{};
+    __half2* specT = nullptr;
+    int* dCnt = nullptr, * dSegStart = nullptr, * dSlotWin = nullptr, * dMaxSlots = nullptr;
+    int4* dSegs = nullptr;
+    __half2* specS = nullptr;
+    int nslot = 0;
+    XmacMap mapT{};
+    if (sortAny) {
+        // (the channel-major spectra: here once, as the station kernel would write them in pulsar mode)
+        printf("sorted: channel groups of %d, slots up to %d (%.2f GiB of permuted spectra, %.2f channel-major), segments "
+               "of up to %d slot blocks\n", CHg, cap, ss.halfCount() * 4.0 * gib, s.halfCount() * 4.0 * gib, segLen);
+        XmacMapHost h = xmacRegularMap(ss);           // channel-major: (station, band)'s channel 0, slot 0
+        for (int f = 0; f < u.nfreq; f++)
+            for (int r = 0; r < h.rmax; r++) h.off[(size_t)f * h.rmax + r] = ((long long)(r >> 1) * ss.nband() + 2 * f + (r & 1)) * u.nchan * cap;
+        mapS = xmacUploadMap(h);
+        for (int f = 0; f < u.nfreq; f++)             // the unpermuted channel-major spectra
+            for (int r = 0; r < h.rmax; r++) h.off[(size_t)f * h.rmax + r] = ((long long)(r >> 1) * ss.nband() + 2 * f + (r & 1)) * u.nchan * u.nwin;
+        mapT = xmacUploadMap(h);
+        specT = devAlloc<__half2>(s.halfCount());
+        dCnt = devAlloc<int>((size_t)u.nfreq * u.nchan * u.nbins);
+        dSegStart = devAlloc<int>((size_t)u.nfreq * ncg * u.nbins);
+        dSegs = devAlloc<int4>((size_t)u.nfreq * ncg * maxSeg);
+        dSlotWin = devAlloc<int>((size_t)u.nfreq * u.nchan * cap);
+        dMaxSlots = devAlloc<int>(1);
+        if (runSorted) specS = devAlloc<__half2>(ss.halfCount());
+    }
+    const int nfc = u.nfreq * u.nchan;
+    auto runSort = [&] {
+        CHECK_CUDA(cudaMemsetAsync(dSlotWin, 0xff, (size_t)nfc * cap * sizeof(int), st));
+        CHECK_CUDA(cudaMemsetAsync(dMaxSlots, 0, sizeof(int), st));
+        sort_count<<<(nfc + SW - 1) / SW, SW * 32, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, dEnds, dWinPhase, dDmOff, dCnt);
+        sort_layout<<<(u.nfreq * ncg + 127) / 128, 128, 0, st>>>(u.nfreq, u.nchan, CHg, u.nbins, segLen, maxSeg, dCnt,
+                                                                   dSegStart, dSegs, dMaxSlots);
+        sort_scatter<<<(nfc + SW - 1) / SW, SW * 32, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, CHg, dEnds, dWinPhase,
+                                                              dDmOff, dSegStart, cap, dSlotWin);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaMemcpyAsync(&nslot, dMaxSlots, sizeof(int), cudaMemcpyDeviceToHost, st));
+        CHECK_CUDA(cudaStreamSynchronize(st));            // the slots in use, for the permute (a prototype's sync)
+        if (nslot > cap) { fprintf(stderr, "sorted: %d slots needed, more than the %d allowed\n", nslot, cap); exit(1); }
+    };
+    auto runTranspose = [&] {
+        to_channel_major<<<dim3((u.nwin + 31) / 32, (u.nchan + 31) / 32, u.nant * s.nband()), dim3(32, 8), 0, st>>>(s, spec, specT);
+        CHECK_CUDA(cudaGetLastError());
+    };
+    auto runPermute = [&] {
+        sort_permute<<<sms * 16, 256, 0, st>>>(s, cap, nslot, dSlotWin, specT, specS);
+        CHECK_CUDA(cudaGetLastError());
+    };
+    auto runSortedXmac = [&] {
+        xmacTensorStagedSorted(ss, mapS, specS, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, cap, sms, st);
+    };
+    if (runSorted) variants.push_back({"sorted", "sorted (sort, permute, the XMAC over the slots)", [&] {
+        runSort(); runPermute(); runSortedXmac(); }});
+    auto runGatherXmac = [&] {
+        xmacTensorStagedSorted(ss, mapT, specT, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, u.nwin, sms, st, dSlotWin);
+    };
+    if (runGather) variants.push_back({"gather", "gather (sort, the XMAC gathering the slots)", [&] {
+        runSort(); runGatherXmac(); }});
+
     bool pass = true;
+    if (sortAny) runTranspose();
     runBins();
     runXmac();
     CHECK_CUDA(cudaStreamSynchronize(st));
@@ -575,6 +766,18 @@ int main(int argc, char** argv) {
         const Timing t = timeIt(v.run, warmup, reps, st);
         line(v.key, "binned: " + v.name, t);
         printf("    %.2f x the unbinned XMAC\n", t.median / tx.median);
+        if (v.key == "gather") {
+            line("gather-sort", "  of which the sort", timeIt(runSort, warmup, reps, st));
+            line("gather-xmac", "  the XMAC gathering the slots", timeIt(runGatherXmac, warmup, reps, st));
+        }
+        if (v.key == "sorted") {
+            line("sorted-transpose", "  (not in it: to channel-major, as the station kernel would write)", timeIt(runTranspose, warmup, reps, st));
+            line("sorted-sort", "  of which the sort (count, layout, scatter; a sync)", timeIt(runSort, warmup, reps, st));
+            line("sorted-permute", "  the permute", timeIt(runPermute, warmup, reps, st));
+            line("sorted-xmac", "  the XMAC over the slots", timeIt(runSortedXmac, warmup, reps, st));
+            printf("    slots: %d for %d windows (+%.0f%% padding, the busiest channel group)\n", nslot, u.nwin,
+                   100.0 * (nslot - u.nwin) / u.nwin);
+        }
     }
     if (fc) fclose(fc);
     xmacFreeMap(map);

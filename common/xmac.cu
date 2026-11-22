@@ -198,10 +198,17 @@ __device__ __forceinline__ uint32_t scaleHalf2(uint32_t w, __half2 sc) {    // F
     const __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&w), sc);
     return *reinterpret_cast<const uint32_t*>(&h);
 }
-template<int KS, int CH, bool WT>
+// MODE 0 plain, 1 weighted (WT), 2 sorted (xmacTensorStagedSorted: the windows are slots sorted by bin
+// per channel, channel-major (a receiver's channel c at off + c W.cstride, its slots contiguous: the
+// copy loads 4 slots of a channel, no transpose); blockIdx.z is a segment of the block's channel
+// group, (bin, first and last + 1 slot block, the bin's segment count), instead of a chunk of the
+// windows; the sums go to that bin), 3 sorted and gathered (the same, the copy reading each slot's window
+// from channel-major spectra in time order through W.slotWin: no permuted copy)
+template<int KS, int CH, int MODE>
 __global__ void __launch_bounds__(MmaCfg<KS, CH>::NW * 32, MmaCfg<KS, CH>::MINB)
 xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, float2* vis,
                    const int2* __restrict__ superPairs, int nsp, int srows, int nbuf, int nchunk, XmacWeights W) {
+    constexpr bool WT = MODE == 1;
     using C = MmaCfg<KS, CH>;
     constexpr int NJ = C::NJ;
     extern __shared__ __align__(32) unsigned char smraw[];
@@ -219,8 +226,16 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     const bool diag = AB.x == AB.y;
     const int used = diag ? 16 * KS : 32 * KS;                          // stage rows in use
     const int ntb = (s.nwin + 15) / 16;
-    const int per = (ntb + nchunk - 1) / nchunk;
-    const int tb0 = blockIdx.z * per, tb1 = min(ntb, tb0 + per);
+    int tb0, tb1, segBin = 0;
+    bool atomicOut = nchunk > 1;
+    if constexpr (MODE >= 2) {
+        const int4 sg = W.segs[((size_t)f * ncg + blockIdx.x % ncg) * W.maxSeg + blockIdx.z];
+        if (sg.x < 0) return;                                           // past the group's segments
+        segBin = sg.x; tb0 = sg.y; tb1 = sg.z; atomicOut = sg.w > 1;
+    } else {
+        const int per = (ntb + nchunk - 1) / nchunk;
+        tb0 = blockIdx.z * per; tb1 = min(ntb, tb0 + per);
+    }
     auto recvOf = [&](int row) {                                        // stage row -> receiver, or -1
         const int r = row < 16 * KS ? AB.x * 16 * KS + row : AB.y * 16 * KS + row - 16 * KS;
         return r < R ? r : -1;
@@ -306,7 +321,7 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
         const int row = row0 + k * C::RSTEP;
         const int r = row < used ? recvOf(row) : -1;
         const bool any = r >= 0 && c0 + 4 * q < s.nchan;
-        src[k] = any ? (unsigned)moff[r] + c0 + 4 * q : NONE;
+        src[k] = any ? (unsigned)moff[r] + (MODE >= 2 ? (unsigned)(c0 + 4 * q) * (unsigned)W.cstride : c0 + 4 * q) : NONE;
         wstride[k] = any ? mws[r] : 0;
         dofs[k] = 4 * q * CSb + stagedChunk(row, wq);
     }
@@ -314,6 +329,34 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     uint4 v[C::MAXR][4];
     uint32_t bq[WT ? 4 : 1];                    // weighted: the 4 channels' bins of each of the 4 windows
     auto fetch = [&](int tb, int mode = 1) {
+        if constexpr (MODE == 2) {            // channel-major slots: v[k][cq] is channel cq's 4 slots
+#pragma unroll
+            for (int k = 0; k < C::MAXR; k++)
+#pragma unroll
+                for (int cq = 0; cq < 4; cq++)
+                    v[k][cq] = src[k] != NONE
+                             ? __ldg(reinterpret_cast<const uint4*>(spec + (src[k] + (unsigned)cq * (unsigned)W.cstride
+                                                                            + (unsigned)(tb * 16 + 4 * wq))))
+                             : make_uint4(0, 0, 0, 0);
+            return;
+        }
+        if constexpr (MODE == 3) {            // gathered: channel cq's 4 slots' windows (-1: padding)
+            const bool anyq = c0 + 4 * q < s.nchan;
+#pragma unroll
+            for (int cq = 0; cq < 4; cq++) {
+                const int4 wi = anyq ? __ldg(reinterpret_cast<const int4*>(W.slotWin + ((size_t)f * s.nchan + c0 + 4 * q + cq) * W.cap
+                                                                           + tb * 16 + 4 * wq))
+                                     : make_int4(-1, -1, -1, -1);
+#pragma unroll
+                for (int k = 0; k < C::MAXR; k++) {
+                    if (src[k] == NONE) { v[k][cq] = make_uint4(0, 0, 0, 0); continue; }
+                    const unsigned* b = reinterpret_cast<const unsigned*>(spec + src[k] + (unsigned)cq * (unsigned)W.cstride);
+                    v[k][cq] = make_uint4(wi.x >= 0 ? __ldg(b + wi.x) : 0u, wi.y >= 0 ? __ldg(b + wi.y) : 0u,
+                                          wi.z >= 0 ? __ldg(b + wi.z) : 0u, wi.w >= 0 ? __ldg(b + wi.w) : 0u);
+                }
+            }
+            return;
+        }
         if (WT && mode >= 2) {
 #pragma unroll
             for (int e = 0; e < 4; e++) {
@@ -354,6 +397,13 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
                         scaleHalf2((&v[k][0].x)[cq], sc[0]), scaleHalf2((&v[k][1].x)[cq], sc[1]),
                         scaleHalf2((&v[k][2].x)[cq], sc[2]), scaleHalf2((&v[k][3].x)[cq], sc[3]));
                 }
+            }
+        } else if constexpr (MODE >= 2) {
+#pragma unroll
+            for (int k = 0; k < C::MAXR; k++) {
+                if (src[k] == NONE) continue;
+#pragma unroll
+                for (int cq = 0; cq < 4; cq++) *reinterpret_cast<uint4*>(smraw + buf * BUFb + dofs[k] + cq * CSb) = v[k][cq];
             }
         } else {
 #pragma unroll
@@ -443,7 +493,30 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
         }
     };
 
-    if constexpr (!WT) {
+    // the sums out, from the accumulators, to dst ([freq][baseline][product][channel]): register e of n
+    // half h is row g + 8 (e >> 1), column 8 h + 2 t + (e & 1) of the 16 x 16 tile
+    auto store = [&](float2* dst) {
+    const int g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int i = 0; i < KS; i++)
+#pragma unroll
+        for (int jj = 0; jj < NJ; jj++) {
+            if (!on[i][jj]) continue;
+            const int I = AB.x * KS + i, J = AB.y * KS + (NJ == KS ? jj : sub);
+#pragma unroll
+            for (int h = 0; h < 2; h++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int r1 = I * 16 + g + 8 * (e >> 1), r2 = J * 16 + 8 * h + 2 * t + (e & 1);
+                    if (r1 >= R || r2 >= R || (r1 >> 1) >= (r2 >> 1)) continue;
+                    const int bl = baselineIndex(mst[r1 >> 1], mst[r2 >> 1], s.nant);
+                    addVis((cuFloatComplex*)dst, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), acc[i][jj][0][h][e],
+                           acc[i][jj][1][h][e], atomicOut);
+                }
+        }
+    };
+
+    if constexpr (MODE != 1) {                  // plain, and sorted (its segment's slots)
     if (tb0 < tb1) { fetch(tb0); put(0); }
     __syncthreads();
     if (nbuf == 2) {
@@ -494,26 +567,8 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     }
     }
 
-    // the sums out, from the accumulators: register e of n half h is row g + 8 (e >> 1), column
-    // 8 h + 2 t + (e & 1) of the 16 x 16 tile
-    const int g = lane >> 2, t = lane & 3;
-#pragma unroll
-    for (int i = 0; i < KS; i++)
-#pragma unroll
-        for (int jj = 0; jj < NJ; jj++) {
-            if (!on[i][jj]) continue;
-            const int I = AB.x * KS + i, J = AB.y * KS + (NJ == KS ? jj : sub);
-#pragma unroll
-            for (int h = 0; h < 2; h++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const int r1 = I * 16 + g + 8 * (e >> 1), r2 = J * 16 + 8 * h + 2 * t + (e & 1);
-                    if (r1 >= R || r2 >= R || (r1 >> 1) >= (r2 >> 1)) continue;
-                    const int bl = baselineIndex(mst[r1 >> 1], mst[r2 >> 1], s.nant);
-                    addVis((cuFloatComplex*)vis, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), acc[i][jj][0][h][e],
-                           acc[i][jj][1][h][e], nchunk > 1);
-                }
-        }
+    if constexpr (MODE >= 2) store(vis + (size_t)segBin * s.visCount());
+    else store(vis);
 }
 
 // The plan for a shape: KS, channels a block, the super-blocks, the stage's rows, the warps, and the
@@ -533,7 +588,7 @@ static int deviceAttr(cudaDeviceAttr a) {
 // blocks at KS 2 and cost a quarter at KS 1, and those were 1.1-1.3x slower than one; on the A100
 // (164 KB) the registers limit the blocks first.
 template<int KS, int CH> static int stagedBlocks(size_t smem) {
-    auto k = xmac_staged_kernel<KS, CH, false>;
+    auto k = xmac_staged_kernel<KS, CH, 0>;
     static bool set = false;
     if (!set) {
         CHECK_CUDA(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -581,12 +636,12 @@ bool xmacTensorStagedFits(const XmacShape& s) {
     return stagedPlan(s).smem <= (size_t)maxSmem;
 }
 
-template<int KS, int CH, bool WT = false>
+template<int KS, int CH, int MODE = 0>
 static void launchStaged(const XmacShape& s, const XmacMap& m, const StagedPlan& P, const __half2* spec,
                          cuFloatComplex* vis, int sms, cudaStream_t st, const XmacWeights& W = XmacWeights{}) {
     static size_t smemSet = 0;
-    auto kernel = xmac_staged_kernel<KS, CH, WT>;
-    const size_t smem = P.smem + (WT ? WEIGHTED_SMEM : 0);
+    auto kernel = xmac_staged_kernel<KS, CH, MODE>;
+    const size_t smem = P.smem + (MODE == 1 ? WEIGHTED_SMEM : 0);
     if (smem > smemSet) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
         smemSet = smem;
@@ -596,8 +651,10 @@ static void launchStaged(const XmacShape& s, const XmacMap& m, const StagedPlan&
     const int threads = P.nw * 32;
     const unsigned nx = (unsigned)((s.nchan + CH - 1) / CH * nsp);
     const int ntb = (s.nwin + 15) / 16;
-    const int nchunk = windowChunks((long long)nx * s.nfreq * threads, ntb, 4, sms);
-    if (nchunk > 1 || !m.complete)        // else every block stores its sums, and every visibility has one
+    const int nchunk = MODE >= 2 ? W.maxSeg : windowChunks((long long)nx * s.nfreq * threads, ntb, 4, sms);
+    if (MODE >= 2)                        // sorted: every bin's (a channel may lack some bins)
+        CHECK_CUDA(cudaMemsetAsync(vis, 0, (size_t)W.nbins * s.visCount() * sizeof(cuFloatComplex), st));
+    else if (nchunk > 1 || !m.complete)   // else every block stores its sums, and every visibility has one
         CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
     kernel<<<dim3(nx, s.nfreq, nchunk), threads, smem, st>>>(s, m, spec, (float2*)vis, superPairs, nsp, P.srows,
                                                               P.nbuf, nchunk, W);
@@ -644,7 +701,7 @@ void xmacFreeMap(XmacMap& m) {
     m = XmacMap{};
 }
 
-template<bool WT>
+template<int MODE>
 static void stagedDispatch(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis, int sms,
                            cudaStream_t st, const XmacWeights& W) {
     if (s.nchan % 4) { fprintf(stderr, "staged tensor XMAC: the channel count must be a multiple of 4\n"); exit(2); }
@@ -655,20 +712,20 @@ static void stagedDispatch(const XmacShape& s, const XmacMap& m, const __half2* 
     const StagedPlan P = stagedPlan(s, m.rmax);
     static int maxSmem = 0;
     if (!maxSmem) maxSmem = deviceAttr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
-    if (P.smem + (WT ? WEIGHTED_SMEM : 0) > (size_t)maxSmem) {
+    if (P.smem + (MODE == 1 ? WEIGHTED_SMEM : 0) > (size_t)maxSmem) {
         fprintf(stderr, "staged tensor XMAC: %zu bytes of shared memory a block (KS %d), more than a block may have\n",
-                P.smem + (WT ? WEIGHTED_SMEM : 0), P.ks);
+                P.smem + (MODE == 1 ? WEIGHTED_SMEM : 0), P.ks);
         exit(2);
     }
-    if (P.ks == 1 && P.ch == 16) launchStaged<1, 16, WT>(s, m, P, spec, vis, sms, st, W);
-    else if (P.ks == 1) launchStaged<1, 8, WT>(s, m, P, spec, vis, sms, st, W);
-    else if (P.ks == 2) launchStaged<2, 8, WT>(s, m, P, spec, vis, sms, st, W);
-    else if (P.ks == 4) launchStaged<4, 4, WT>(s, m, P, spec, vis, sms, st, W);
+    if (P.ks == 1 && P.ch == 16) launchStaged<1, 16, MODE>(s, m, P, spec, vis, sms, st, W);
+    else if (P.ks == 1) launchStaged<1, 8, MODE>(s, m, P, spec, vis, sms, st, W);
+    else if (P.ks == 2) launchStaged<2, 8, MODE>(s, m, P, spec, vis, sms, st, W);
+    else if (P.ks == 4) launchStaged<4, 4, MODE>(s, m, P, spec, vis, sms, st, W);
     else { fprintf(stderr, "staged tensor XMAC: KS must be 1, 2 or 4, not %d\n", P.ks); exit(2); }
 }
 void xmacTensorStagedMapped(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis, int sms,
                             cudaStream_t st) {
-    stagedDispatch<false>(s, m, spec, vis, sms, st, XmacWeights{});
+    stagedDispatch<0>(s, m, spec, vis, sms, st, XmacWeights{});
 }
 void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                               const XmacWeights& w, int sms, cudaStream_t st) {
@@ -676,8 +733,27 @@ void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half
         fprintf(stderr, "staged tensor XMAC, weighted: 1 to %d bins, with their bins and weights\n", MAXWBINS);
         exit(2);
     }
-    stagedDispatch<true>(s, m, spec, vis, sms, st, w);
+    stagedDispatch<1>(s, m, spec, vis, sms, st, w);
 }
+void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
+                            const int4* segs, int maxSeg, int nbins, int cstride, int sms, cudaStream_t st,
+                            const int* slotWin) {
+    if (nbins < 1 || !segs || maxSeg < 1 || (!slotWin && (cstride % 4 || cstride < s.nwin)) || s.nwin % 4 ||
+        m.maxOff + (long long)s.nchan * cstride > 0xfffffffeLL) {
+        fprintf(stderr, "staged tensor XMAC, sorted: bins and segments needed; the channel stride a multiple of 4, at "
+                        "least the slots, and the spectra within 2^32 __half2\n");
+        exit(2);
+    }
+    XmacWeights w;
+    w.cstride = cstride;
+    if (slotWin) { w.slotWin = slotWin; w.cap = s.nwin; }
+    w.segs = segs;
+    w.maxSeg = maxSeg;
+    w.nbins = nbins;
+    if (slotWin) stagedDispatch<3>(s, m, spec, vis, sms, st, w);
+    else stagedDispatch<2>(s, m, spec, vis, sms, st, w);
+}
+int xmacTensorStagedChannels(const XmacShape& s) { return stagedPlan(s).ch; }
 
 // The regular layout (halfIndex): its map, made and uploaded once per shape.
 void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* vis, int sms, cudaStream_t st) {
