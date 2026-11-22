@@ -52,3 +52,12 @@ different band layouts).  Hardware eras: [../README.md](../README.md#benchmark-h
   chunks (which still zero), and at its large ones the zeroing is a small share of a long XMAC.
   ([../phase-centres/docs/results.md](../phase-centres/docs/results.md), "The optimisation round")
 
+
+## Weighted (2026-11-22, for pulsar binning)
+
+- **`xmacTensorStagedWeighted`**: the staged XMAC with a weight per (window, frequency, channel)
+  from a bin table, applied in the copy into the stage (sqrt|w| in FP16; negative weights' signs
+  in the A operand).  A template flag: the unweighted kernel's registers and speed are unchanged
+  (xmacbench, 4-64 stations, the 2070); the weighted kernel's tables are in dynamic shared memory
+  that only it asks for (as static arrays they cost the unweighted kernel 4-11% at 4-10
+  stations).  Results and how it is used: ../pulsar-binning/docs/results.md, "Step 3".

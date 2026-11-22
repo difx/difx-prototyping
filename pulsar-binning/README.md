@@ -13,9 +13,10 @@ pulsar-binning/binbench --period-ms 500 --nchan 1024 --bins gate
 ```
 
 Simulates a dispersed pulsar in the station spectra, computes each (window, frequency, channel)'s
-bin as mpifxcorr does (integer phase, arbitrary ends), and bins the XMAC: so far the naive port
-(a thread per output), timed against the unbinned staged XMAC and checked against the host in
-double.  Bins: `gate` (2, scrunched with weights 0 / 1), `16` (unequal, the narrowest 1/1024; on - off
+bin as mpifxcorr does (integer phase, arbitrary ends), and bins the XMAC: the naive port (a thread
+per output), the staged XMAC weighted in its stage (`stage`: one pass, the gate and scrunched
+output; `passes`: one a bin), timed against the unbinned staged XMAC and checked against the host
+in double.  Bins: `gate` (2, scrunched with weights 0 / 1), `16` (unequal, the narrowest 1/1024; on - off
 when `--scrunch`ed), `128`, `even:N`.  `--help` lists the rest (stations, channels, subint, period,
 DM, the phase convention).  Results: [docs/results.md](docs/results.md).
 

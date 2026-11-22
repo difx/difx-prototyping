@@ -8,6 +8,9 @@ to keep arbitrary breakpoints.
 - binbench steps 1-2 (below): the bins (integer phase, arbitrary ends: exact against mpifxcorr's
   rule; 3-9% of the unbinned XMAC at 10 stations) and the naive port (3.8-6.2x the XMAC with one
   sum, 96-188x for 128 separate bins at 1.5 ms), checked on the 2070 ([docs/results.md](docs/results.md)).
+- Step 3: weights in the staged XMAC's stage (`xmacTensorStagedWeighted`, the unweighted kernel
+  unchanged): the gate and scrunched output in one pass at 0.46-1.35x the unbinned XMAC; separate
+  bins by a pass each 3.3-70x (not the way for many bins).
 
 ## The test cases
 

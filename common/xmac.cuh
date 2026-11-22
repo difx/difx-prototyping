@@ -11,6 +11,7 @@
 // a transpose into a tensor layout with a WMMA XMAC from it, the station kernel writing that layout
 // directly, and a WMMA version of the staged XMAC.)
 #pragma once
+#include <cstdint>
 #include <vector>
 #include <cuda_fp16.h>
 #include "common.cuh"
@@ -117,6 +118,21 @@ void xmacTensorStaged(const XmacShape& s, const __half2* spec, cuFloatComplex* v
 // The same with the spectra where a map says (the mma.sync version; spec is the base the offsets are from).
 void xmacTensorStagedMapped(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                             int multiprocessors, cudaStream_t st);
+// Weighted (pulsar binning, pulsar-binning/): each (window, frequency, channel) product times a weight,
+// weights[bins[(window * nfreq + f) * nchan + c]] (the subint's windows; bins < nbins <= 256).  The copy
+// into the stage scales each value by sqrt|w| (so the product gets |w|) and a negative weight's sign
+// goes into the A operand.  With skip, a block skips the 16-window blocks in which every one of its
+// channels has weight 0 (a gate's off-pulse; one bin a pass).  Weights of 1 and 0 are exact; others
+// scale in FP16 (each value times sqrt|w| rounded to FP16, the product rounded to FP16).
+struct XmacWeights {
+    const uint8_t* bins = nullptr;      // [window][frequency][channel]
+    const float* weights = nullptr;     // [nbins], any sign
+    int nbins = 0;
+    bool skip = false;
+    bool negative = false;              // some weight is negative
+};
+void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
+                              const XmacWeights& w, int multiprocessors, cudaStream_t st);
 int xmacTensorStagedTile(const XmacShape& s);
 int xmacTensorStagedStages(const XmacShape& s);
 void xmacTensorStagedSetTile(int ks);

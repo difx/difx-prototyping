@@ -8,6 +8,10 @@
 //   naive   the obvious port of mpifxcorr's loop: a thread per (frequency, baseline, product,
 //           channel) over the windows, its sum held while the bin stays the same and added to that
 //           bin's output when it changes (or, scrunched, one sum of weight x product)
+//   stage   (scrunched) the staged XMAC weighted (xmacTensorStagedWeighted): the copy into its
+//           stage scales each (window, channel) by sqrt|w| of its bin, a negative weight's sign goes
+//           into the A operand; 16-window blocks whose weights are all 0 skipped.  One pass.
+//   passes  (separate bins) the same with a one-hot weight table per bin, one pass per bin
 // timed against the unbinned staged XMAC (common/xmac.cu), and checked: the bins against mpifxcorr's
 // rule in double on the host, the binned visibilities against the host's sums in double, their sum
 // over the bins against the unbinned XMAC, and the simulated pulse's power in each bin against the
@@ -197,7 +201,9 @@ static void usage() {
 "  --scrunch       write the weighted sum of the bins instead of each bin (gate: always)\n"
 "  --fwhm X        the simulated pulse's width, turns (FWHM of its power), default 0.03\n"
 "  --noise X       each station's own noise, relative to the pulse's peak amplitude, default 1\n"
-"  --only LIST     comma-separated versions to run: naive (default all)\n"
+"  --only LIST     comma-separated versions to run: naive, stage (scrunched), passes (separate\n"
+"                  bins) (default all that apply)\n"
+"  --noskip        the weighted XMAC runs every 16-window block (no skipping of all-zero weights)\n"
 "  --reps N        timed repetitions, default 20; --warmup N, default 3\n"
 "  --check N       outputs checked against the host, default 128 (each with all its bins)\n"
 "  --csv FILE      append one row per timing\n"
@@ -240,8 +246,8 @@ int main(int argc, char** argv) {
     u.period = 1.5e-3; u.fdot = 0; u.dm = 30; u.phase0 = NAN; u.fwhm = 0.03;
     int nwinArg = 0, reps = 20, warmup = 3, ncheck = 128, device = 0;
     unsigned long long seed = 1;
-    std::string only = "naive", csv, bins = "128", phase = "start";
-    bool scrunchArg = false;
+    std::string only = "naive,stage,passes", csv, bins = "128", phase = "start";
+    bool scrunchArg = false, noskip = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -263,6 +269,7 @@ int main(int argc, char** argv) {
         else if (a == "--phase") phase = next();
         else if (a == "--bins") bins = next();
         else if (a == "--scrunch") scrunchArg = true;
+        else if (a == "--noskip") noskip = true;
         else if (a == "--fwhm") u.fwhm = std::stod(next());
         else if (a == "--noise") noise = std::stod(next());
         else if (a == "--only") only = next();
@@ -292,6 +299,8 @@ int main(int argc, char** argv) {
     for (int k = 1; k < u.nbins; k++)
         if (!(u.ends[k] > u.ends[k - 1])) { fprintf(stderr, "bin ends must ascend\n"); return 2; }
     const bool runNaive = only.find("naive") != std::string::npos;
+    const bool runStage = only.find("stage") != std::string::npos && u.scrunch;
+    const bool runPasses = only.find("passes") != std::string::npos && !u.scrunch;
 
     XmacShape s{};
     s.nant = u.nant; s.nfreq = u.nfreq; s.nchan = u.nchan; s.nwin = u.nwin; s.fftchannels = 2 * u.nchan;
@@ -349,6 +358,11 @@ int main(int argc, char** argv) {
     float* dWts = devCopy(wts);
     int2* dBls = devCopy(bls);
     uint8_t* dBins = devAlloc<uint8_t>(nBin);
+    std::vector<float> oneHot((size_t)u.nbins * u.nbins, 0.f);       // per bin, a table with 1 for that bin
+    for (int b = 0; b < u.nbins; b++) oneHot[(size_t)b * u.nbins + b] = 1.f;
+    float* dOneHot = devCopy(oneHot);
+    bool anyNeg = false;
+    for (double w : u.weights) anyNeg |= w < 0;
 
     // ---- inputs ----
     __half2* spec = devAlloc<__half2>(s.halfCount());
@@ -375,6 +389,17 @@ int main(int argc, char** argv) {
             bin_naive<false><<<sms * 16, 256, 0, st>>>(s, dBls, spec, dBins, dWts, out);
         }
         CHECK_CUDA(cudaGetLastError()); }});
+    if (runStage) variants.push_back({"stage", "stage (the staged XMAC, weighted in its stage)", [&] {
+        XmacWeights w;
+        w.bins = dBins; w.weights = dWts; w.nbins = u.nbins; w.skip = !noskip; w.negative = anyNeg;
+        xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)out, w, sms, st); }});
+    if (runPasses) variants.push_back({"passes", "passes (the weighted staged XMAC, a pass a bin)", [&] {
+        XmacWeights w;
+        w.bins = dBins; w.nbins = u.nbins; w.skip = !noskip;
+        for (int b = 0; b < u.nbins; b++) {
+            w.weights = dOneHot + (size_t)b * u.nbins;
+            xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)(out + (size_t)b * s.visCount()), w, sms, st);
+        } }});
 
     bool pass = true;
     runBins();
@@ -416,7 +441,7 @@ int main(int argc, char** argv) {
     auto rnd = [&](int n) { return std::min(n - 1, (int)(rng.uniform() * n)); };
     for (int i = 0; i < ncheck; i++) picks.push_back({rnd(u.nfreq), rnd(u.nbl), rnd(4), rnd(u.nchan)});
     const int nb = u.scrunch ? 1 : u.nbins;
-    std::vector<std::complex<double>> ref(picks.size() * nb), refAll(picks.size());
+    std::vector<std::complex<double>> ref(picks.size() * nb), refAll(picks.size()), refStage(picks.size());
     for (size_t q = 0; q < picks.size(); q++) {
         const Pick& k = picks[q];
         const int pol1 = k.p == 1 || k.p == 3, pol2 = k.p == 1 || k.p == 2;
@@ -425,7 +450,16 @@ int main(int argc, char** argv) {
             const float2 b = __half22float2(hSpec[s.halfIndex(bls[k.bl].y, w, 2 * k.f + pol2, k.c)]);
             const std::complex<double> v = std::complex<double>(a.x, a.y) * std::conj(std::complex<double>(b.x, b.y));
             const int bin = hBins[((size_t)w * u.nfreq + k.f) * u.nchan + k.c];
-            if (u.scrunch) ref[q] += u.weights[bin] * v;
+            if (u.scrunch) {
+                ref[q] += u.weights[bin] * v;
+                // the weighted XMAC: each value times sqrt|w| rounded to FP16, the product rounded to FP16
+                // (exact in FP32 first), the sign on the product
+                const float sc = __half2float(__float2half_rn(std::sqrt(std::fabs((float)u.weights[bin]))));
+                const float2 as = __half22float2(__floats2half2_rn(a.x * sc, a.y * sc));
+                const float2 bs = __half22float2(__floats2half2_rn(b.x * sc, b.y * sc));
+                refStage[q] += (u.weights[bin] < 0 ? -1.0 : 1.0) *
+                               std::complex<double>(as.x, as.y) * std::conj(std::complex<double>(bs.x, bs.y));
+            }
             else ref[q * nb + bin] += v;
             refAll[q] += v;
         }
@@ -447,17 +481,20 @@ int main(int argc, char** argv) {
         v.run();
         CHECK_CUDA(cudaStreamSynchronize(st));
         CHECK_CUDA(cudaMemcpy(hOut.data(), out, nOut * sizeof(float2), cudaMemcpyDeviceToHost));
-        double e2 = 0, r2 = 0, emax = 0, s2 = 0, a2 = 0;
+        double e2 = 0, r2 = 0, emax = 0, s2 = 0, a2 = 0, x2 = 0;
+        const bool emu = v.key == "stage";          // against the stage's own rounding of the weighted values
         for (size_t q = 0; q < picks.size(); q++) {
             const Pick& k = picks[q];
             std::complex<double> sum = 0;
             for (int b = 0; b < nb; b++) {
                 const float2 g = hOut[(size_t)b * s.visCount() + s.visIndex(k.f, k.bl, k.p, k.c)];
                 const std::complex<double> gv(g.x, g.y);
-                const double e = std::norm(gv - ref[q * nb + b]);
+                const std::complex<double> rf = emu ? refStage[q] : ref[q * nb + b];
+                if (emu) x2 += std::norm(gv - ref[q]);
+                const double e = std::norm(gv - rf);
                 e2 += e;
                 emax = std::max(emax, e);
-                r2 += std::norm(ref[q * nb + b]);
+                r2 += std::norm(rf);
                 sum += gv;
             }
             s2 += std::norm(sum - refAll[q]);
@@ -470,6 +507,7 @@ int main(int argc, char** argv) {
         if (r2 == 0) printf("check: %s: the reference is zero (no weighted bin in this subint)\n", v.key.c_str());
         printf("check: %s vs the host: rms %.2e, max %.2e (relative to rms)", v.key.c_str(), rel, std::sqrt(emax) / rms);
         if (!u.scrunch) printf("; summed over the bins vs the unbinned sums %.2e", relSum);
+        if (emu && r2 > 0) printf("; vs exact weights %.2e", std::sqrt(x2 / r2));
         printf("  %s\n", ok ? "OK" : "FAIL");
         pass &= ok;
     }
