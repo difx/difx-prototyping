@@ -509,3 +509,18 @@ Tried and not kept (the 2070): two copies of the compute step, with and without 
 chosen per block (instructions 89.8M to 76.2M, but 84 bytes of spills on sm_80 and 20% slower);
 one copy multiplying every block, by 1 where the weights are all 1 (no predication question; the
 all-ones gate 3-4% slower).
+
+## The binning against the whole chain (2026-11-22, RTX 2070 SUPER)
+
+`run-station.sh` (new): fusebench at binbench's shape (10 stations, 8 x 32 MHz bands, 2-bit packed
+VDIF, 25.6 ms subint) with the staged XMAC after the end-to-end station kernel
+(`results-local/ar313-adeller-station-20261122-181444`, every check passing).  ms per subint:
+
+| channels | station (end-to-end, FP16 spectra) | staged XMAC | chain | S/X |
+|---|---|---|---|---|
+| 128 | 3.30 | 1.21 | 4.49 | 2.74 |
+| 1024 | 3.71 | 1.49 | 5.18 | 2.49 |
+
+The XMAC matches binbench's unbinned one (1.19-1.21 and 1.46-1.50 ms).  For the chain to stay within
+2x of the unbinned one, the binned XMAC (with the bins and weights) may cost up to S/X + 2 times the
+unbinned XMAC: 4.5-4.7x on the 2070.  The A100 to measure (its XMAC relatively cheaper, so S/X larger).

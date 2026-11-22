@@ -23,7 +23,8 @@ when `--scrunch`ed), `128`, `even:N`.  `--avg A` sums A channels into each outpu
 give stations invalid or half-valid windows (for the per-bin weights, checked against mpifxcorr's
 sum).  `gatherwm` is the sorted XMAC gathering straight from the usual window-major spectra.  `--help` lists the rest
 (stations, channels, subint, period, DM, the phase convention).  `run-bins.sh` runs the whole test
-matrix (results-local/<host>-bins-<stamp>/).  Results: [docs/results.md](docs/results.md); in short,
+matrix (results-local/<host>-bins-<stamp>/); `run-station.sh` the station stage at the same shape
+(fusebench, with the staged XMAC after it), for the binning's cost against the whole chain.  Results: [docs/results.md](docs/results.md); in short,
 [FINDINGS.md](FINDINGS.md); the approaches side by side, with a diagram: [docs/approaches.md](docs/approaches.md).
 
 ## The problem
