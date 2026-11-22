@@ -14,6 +14,9 @@
 
 ## binbench (2026-11-22, RTX 2070 SUPER at 150 W / 1500 MHz)
 
+The approaches side by side, with a diagram: [docs/approaches.md](docs/approaches.md).
+
+
 - **The gate and scrunched output: one pass of the staged XMAC, weighted in its stage**
   (`xmacTensorStagedWeighted`): 0.33-0.70x the unbinned XMAC for the 1.5 ms gate (the blocks with no
   on-pulse window skipped), 1.04-1.37x with nothing to skip (16 bins on - off, negative weights
@@ -33,5 +36,16 @@
   channels in the XMAC and accumulating over the integration (no zeroing each subint) help where it
   dominates (the 500 ms pulsar's empty bins: 4.2x to 3.1x).
 - **The bins kernel**: 3-9% of the unbinned XMAC at 10 stations (a binary search over the ends).
+
+## The A100 (2026-11-22, OzSTAR job 21374617)
+
+- **The same picture, with gather winning every separate-bin case**: 3.0-4.8x the unbinned XMAC
+  (6.6x for 128 bins of the 1.5 ms pulsar at 128 channels, where the permuted copy is 7.1x; on the
+  2070 the copy won there).  One sorted approach, gathered, would do on both.
+- **The weighted stage costs relatively more**: the gate 0.77-0.97x (1.5 ms), 1.26-1.33x with
+  nothing to skip; scrunched 1.26-1.80x.  The A100 is issue-bound on the copy's extra instructions,
+  as the phase-centre shift is.
+- In real time every case but bins narrower than a window (0.27) is at most 0.08 ms per ms of data.
+  ([docs/results.md](docs/results.md), "The A100")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

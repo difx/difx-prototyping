@@ -27,7 +27,8 @@ its `FINDINGS.md`.
 - Done: weights in the XMAC's stage: the gate and scrunched output in one pass, 0.46-1.35x the unbinned XMAC; a pass per bin 3-70x.
 - Done: bins sorted per channel (channel-major spectra): 2.5-6.5x the unbinned XMAC (18x at 1024 channels x 128 bins, the output).
 - Done: channel averaging and accumulation in the binned XMAC; run-bins.sh, the whole matrix on the 2070 (FINDINGS.md).
-- Next: the A100; per-bin weights; phase centres per bin; sorting over several subints.
+- Done: the A100 (gather wins every separate-bin case; the weighted stage relatively dearer); docs/approaches.md, the approaches with a diagram.
+- Next: one sorted approach (gather); per-bin weights; phase centres per bin; sorting over several subints.
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 

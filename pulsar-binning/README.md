@@ -22,7 +22,7 @@ when `--scrunch`ed), `128`, `even:N`.  `--avg A` sums A channels into each outpu
 `--accumulate` adds into the output instead of zeroing it each subint.  `--help` lists the rest
 (stations, channels, subint, period, DM, the phase convention).  `run-bins.sh` runs the whole test
 matrix (results-local/<host>-bins-<stamp>/).  Results: [docs/results.md](docs/results.md); in short,
-[FINDINGS.md](FINDINGS.md).
+[FINDINGS.md](FINDINGS.md); the approaches side by side, with a diagram: [docs/approaches.md](docs/approaches.md).
 
 ## The problem
 

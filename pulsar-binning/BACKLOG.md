@@ -16,6 +16,8 @@ to keep arbitrary breakpoints.
   runs; the copy for short).  The output (nbins x the visibilities, zeroed and written each subint)
   is a large part.  Step 5 (splitting 16-window blocks at bin changes) not built: its in-loop store
   spilled, and gather covers long runs.
+- The A100 (job 21374617): the same picture; gather wins every separate-bin case; the stage costs
+  relatively more (docs/results.md, "The A100").
 - Step 6 (part): channel averaging in the binned XMAC (a shared-memory sum over a block's channels)
   and accumulating over an integration; `run-bins.sh`, the whole matrix on the 2070: the gate
   0.45-1.13x, scrunched 1.04-1.37x, 16 separate 2.6-4.5x, 128 separate 2.7-6.5x (14x for bins
@@ -23,7 +25,11 @@ to keep arbitrary breakpoints.
 
 ## Next
 
-- **The A100** (`run-bins.sh` on OzSTAR).
+- **One sorted approach**: gather wins every separate-bin case on the A100 (job 21374617), the
+  permuted copy only the shortest runs on the 2070 (6.5x against 12x): drop the copy, or keep it
+  for the 2070 only.
+- **The weighted stage on the A100** (1.26-1.80x when nothing is skipped, against 1.04-1.37x on the
+  2070): fewer instructions in the copy (the classification pass, the scaling).
 - **The rest of the output side**: the per-bin weights (mpifxcorr's baseline weight per bin: a
   histogram of the bins, with the windows' validity); phase centres per bin (the shift x nbins).
 - **The bins kernel**: a lookup table on the phase's top bits instead of the binary search.

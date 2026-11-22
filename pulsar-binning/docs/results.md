@@ -189,3 +189,48 @@ transpose, nothing if the station kernel writes them):
   there, so the binning's fixed costs weigh less.
 - In real time (10 stations): the binned XMAC at 0.02-0.3 ms per ms of data in every case but the
   worst (0.8).
+
+## The A100 (OzSTAR gina8, job 21374617, 2026-11-22)
+
+`run-bins.sh` at commit fafcd29 (`results-local/gina8-bins-20261122-142203`), every run passing.
+ms per subint; best / XMAC as above (the XMAC's own time varies by ~9% between runs of the same
+shape here, 0.321-0.352 ms):
+
+| P | ch | bins | avg / acc | XMAC | bins kernel | naive | stage | passes | sorted | gather | best / XMAC |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.5 ms | 128 | gate | 1 / no | 0.352 | 0.021 | 2.81 | 0.27 | | | | 0.77 |
+| | | 16 scrunched | 1 / no | 0.352 | 0.031 | 2.81 | 0.63 | | | | 1.78 |
+| | | 16 | 1 / no | 0.352 | 0.030 | 4.03 | | 3.83 | 1.45 | 1.14 | 3.23 (gather) |
+| | | 128 | 1 / no | 0.321 | 0.037 | 16.8 | | 26.4 | 2.28 | 2.11 | 6.57 (gather) |
+| | 1024 | gate | 1 / no | 0.375 | 0.018 | 1.86 | 0.36 | | | | 0.96 |
+| | | 16 scrunched | 1 / no | 0.376 | 0.023 | 1.86 | 0.62 | | | | 1.65 |
+| | | 16 | 1 / no | 0.403 | 0.026 | 3.91 | | 5.35 | 2.02 | 1.61 | 4.00 (gather) |
+| | | 128 | 1 / no | 0.375 | 0.036 | 20.8 | | 39.4 | 7.55 | 6.58 | 17.5 (gather) |
+| 500 ms | 128 | gate | 1 / no | 0.321 | 0.019 | 2.65 | 0.42 | | | | 1.31 |
+| | | 16 scrunched | 1 / no | 0.321 | 0.029 | 2.66 | 0.42 | | | | 1.31 |
+| | | 16 | 1 / no | 0.352 | 0.032 | 3.78 | | 2.91 | 1.48 | 1.14 | 3.23 (gather) |
+| | | 128 | 1 / no | 0.321 | 0.036 | 3.57 | | 18.7 | 1.59 | 1.24 | 3.88 (gather) |
+| | 1024 | gate | 1 / no | 0.376 | 0.019 | 1.86 | 0.47 | | | | 1.26 |
+| | | 16 scrunched | 1 / no | 0.375 | 0.029 | 1.86 | 0.47 | | | | 1.26 |
+| | | 16 | 1 / no | 0.404 | 0.032 | 2.85 | | 3.45 | 1.64 | 1.19 | 2.95 (gather) |
+| | | 128 | 1 / no | 0.376 | 0.036 | 2.95 | | 21.9 | 2.09 | 1.78 | 4.75 (gather) |
+| | | 128 | 8 / yes | 0.375 | 0.036 | 2.93 | | 22.2 | 1.73 | 1.42 | 3.79 (gather) |
+
+(The other avg 8 rows: within a few % of the avg 1 ones.)
+
+- **The unbinned XMAC is 3.4-3.9x faster than on the 2070**; the binned versions mostly keep their
+  ratios to it, with three changes.
+- **Gather wins every separate-bin case on the A100**, the short runs too (1.5 ms, 128 channels,
+  128 bins: 6.6x against the permuted copy's 7.1x; on the 2070 12.1x against 6.5x).  Its 4-byte
+  loads cost less there (40 MB of L2 against 4 MB).  So the permuted copy, and its buffer, could go.
+- **Weighting in the stage costs relatively more**: the gate 0.77-0.97x at 1.5 ms (0.46-0.70x on
+  the 2070), 1.26-1.33x with nothing to skip (1.10-1.13x), 16 scrunched 1.65-1.80x (1.24-1.37x).
+  As with the phase-centre shift, the A100's tensor cores are 16x its FP32 rate (the 2070's about
+  4x), so the copy's extra instructions (classification, scaling, signs) weigh more.
+- **A pass per bin is relatively worse** (57-108x for 128 bins: many small launches and a
+  classification each), and **the naive port relatively better** (23-55x for 128 bins at 1.5 ms,
+  8-11x at 500 ms: the A100's L2 takes its scattered adds better).
+- **The worst case** (1.5 ms, 1024 channels, 128 bins: bins narrower than a window): 17.5-18x.
+- **In real time** every binned case but that one is at most 0.08 ms per ms of data (2.1 ms a
+  25.6 ms subint); that one 0.27.
+- **The bins kernel**: 0.018-0.037 ms, 5-12% of the XMAC.
