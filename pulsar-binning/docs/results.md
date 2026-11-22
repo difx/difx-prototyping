@@ -461,3 +461,51 @@ gate 1.085x against 1.093x), and the flags kernel costs 0.014-0.015 ms (1.0-1.2%
 -0.4% to +1.6%: as expected where the classification was 2-4%.  The A100, where 15-25% is left with
 no multiplies, is the test; with Nsight Compute (`ncu-ozstar.sbatch`, the pb-* cases) the weighted
 kernel on the all-ones 500 ms gate, with the flags and classifying itself, against the plain one.
+
+### The A100: the classification, and where the weighted kernel's time goes (OzSTAR gina5, jobs 21376972 and 21376973, commit afa9a9c)
+
+**The sweep** (`results-local/gina5-bins-20261122-174351`, every run passing): with the flags the
+weighted XMAC is 1.5-2.8% of the XMAC faster than classifying itself (the 1.5 ms gate at 128
+channels 0.654x against 0.673x; the 500 ms gate 1.202x against 1.224x), but the flags kernel costs
+0.011-0.012 ms, 3% of the A100's 0.32-0.40 ms XMAC, so the net is 0.3-1.9% worse.  Worth it only
+folded into a kernel that runs anyway.
+
+**Nsight Compute** (`results-local/ncu-gina5-20261122-174412`, the pb-* cases: 10 stations, 128
+channels, one launch each; ncu holds the clock at 1.27 GHz):
+
+| | plain | 500 ms gate, flags | 500 ms gate, classifying itself | 16 scrunched, 1.5 ms |
+|---|---|---|---|---|
+| duration (us) | 352 | 430 | 438 | 461 |
+| instructions executed | 93.0M | 119.2M | | 127.2M |
+| issued IPC | 1.97 | 2.06 | 2.05 | 2.05 |
+| occupancy (achieved / theoretical) | 24% / 25% | 25% / 25% | 25% / 25% | 25% / 25% |
+
+The time follows the instructions (the A100 issues as fast in each, about 2 an SM a cycle, half its
+issue slots, with 4 warps a scheduler: the register limit's 2 blocks an SM).  The 26M more:
+
+| SASS (millions) | plain | gate, flags | 16 scrunched |
+|---|---|---|---|
+| HMMA | 6.55 | 6.55 | 6.55 |
+| HMUL2 | 0 | 3.28 | 3.28 |
+| S2R (thread index) | 0.07 | 2.06 | 2.47 |
+| LOP3 + IMAD + ISETP + SHF | 51.6 | 64.0 | 69.1 |
+| BSSY, BSYNC, BRA, PLOP3 | 7.2 | 10.8 | 10.9 |
+
+- **The multiplies are predicated**: the compiler made `if (mode >= 2)` around the four HMUL2 a
+  predicate, so blocks whose weights are all 1 issue them anyway (3.3M, never enabled on the 500 ms
+  gate).
+- **The ldmatrix addresses are recomputed**: in the weighted kernel each A and B fragment's
+  shared-memory address is rebuilt from `threadIdx.x` (S2R, shifts, LOP3s, IMADs: about 30
+  instructions a 16-window block a warp); the plain kernel keeps them in registers.  Both are at
+  128 registers (`__launch_bounds__` for 2 blocks an SM); the weighted kernel holds a few more values
+  across the loop (the next block's bin, the list's entries, the mode), and the compiler re-derives
+  the addresses rather than spill.  Confirmed on the 2070: with the weighted kernel's register cap
+  lifted (162 registers) the S2Rs go and its instructions fall from 89.9M to 79.7M (plain 66.5M), but
+  at 1 block an SM it is slower.
+- **The rest** (~13M at 162 registers) is the list loop's bookkeeping: each entry's decode, the
+  variable window block in the fetch, the branches around the weights' load and store.
+
+Tried and not kept (the 2070): two copies of the compute step, with and without the multiplies,
+chosen per block (instructions 89.8M to 76.2M, but 84 bytes of spills on sm_80 and 20% slower);
+one copy multiplying every block, by 1 where the weights are all 1 (no predication question; the
+all-ones gate 3-4% slower).

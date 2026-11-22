@@ -32,7 +32,8 @@ its `FINDINGS.md`.
 - Done: the A100 again: window-major spectra (gatherwm) beat a transpose in 19 of 24 runs, so the station kernel stays as it is.
 - Done: the weights: the per-bin weights in two kernels (3-22% of the XMAC, from 12-28%); the weighted copy slimmed (0.99-1.16x with nothing to skip, from 1.04-1.37x; 2070).
 - Done: the A100 with the new weights: 1.15-1.34x with nothing to skip (from 1.26-1.81x); bins + weights 8-22% of the XMAC (24-40%).
-- Next: the weighted kernel's remaining 15-25% on the A100 (classification in the bins kernel, Nsight Compute); one sorted approach (gather from window-major).
+- Done: the classification with the bins (net 0.3-1.9% worse on the A100 as its own kernel); Nsight Compute: the weighted kernel's 15-25% is 28% more instructions, register pressure (ldmatrix addresses re-derived at 128 registers) and the list loop.
+- Next: fewer live values in the weighted kernel (cp.async of precomputed FP16 weights on sm_80); one sorted approach (gather from window-major).
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 
