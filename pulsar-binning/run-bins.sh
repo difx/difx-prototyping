@@ -3,7 +3,7 @@
 # run-bins.sh - pulsar binning in the XMAC (binbench, README.md): the test matrix, every version
 # that applies, each checked against the host.  10 stations, 4 dual-pol 32 MHz bands, a 25.6 ms
 # subint; P = 1.5 and 500 ms; 128 and 1024 channels; the gate, 16 bins scrunched, 16 and 128 bins
-# separate.  DM 30, the output at full resolution (zeroed each subint) and with 8 channels averaged,
+# separate (and 32 even bins separate, at full resolution).  DM 30, the output at full resolution (zeroed each subint) and with 8 channels averaged,
 # accumulated (no zeroing each subint); and a high DM (300 for 1.5 ms, 1000 for 500 ms: at 1024
 # channels the 1.5 ms pulsar's bin changes at every channel), full resolution.  Build first (make in the repository root, see ../README.md).
 #
@@ -44,6 +44,7 @@ for p in 1.5 500; do
             run "p$p-n$n-gate-$o"      --period-ms $p --nchan $n --bins gate "${out[@]}"
             run "p$p-n$n-16s-$o"       --period-ms $p --nchan $n --bins 16 --scrunch "${out[@]}"
             run "p$p-n$n-16-$o"        --period-ms $p --nchan $n --bins 16 "${out[@]}"
+            [ $o = avg8 ] || run "p$p-n$n-32-$o" --period-ms $p --nchan $n --bins even:32 "${out[@]}"
             run "p$p-n$n-128-$o"       --period-ms $p --nchan $n --bins 128 "${out[@]}"
         done
     done

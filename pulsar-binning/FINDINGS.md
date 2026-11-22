@@ -78,5 +78,9 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   Nsight Compute shows 28% more instructions at the same issue rate, from register pressure (the
   ldmatrix addresses re-derived from the thread index at the 128-register cap) and the list loop's
   bookkeeping.  ([docs/results.md](docs/results.md), "The weights" and "The A100: the classification ...")
+- **Against the whole chain** (station + XMAC, job 21377096: the station stage is 3.2x the XMAC at 10
+  stations on the A100): the gate and scrunched bins cost the chain 0.91-1.11x; 16 separate bins of a
+  millisecond pulsar 1.7-1.8x (2.09x at 128 channels, DM 300); 128 separate bins 3.4-5.1x.
+  ([docs/results.md](docs/results.md), "The binning against the whole chain")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

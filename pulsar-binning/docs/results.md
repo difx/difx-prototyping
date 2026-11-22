@@ -523,4 +523,31 @@ VDIF, 25.6 ms subint) with the staged XMAC after the end-to-end station kernel
 
 The XMAC matches binbench's unbinned one (1.19-1.21 and 1.46-1.50 ms).  For the chain to stay within
 2x of the unbinned one, the binned XMAC (with the bins and weights) may cost up to S/X + 2 times the
-unbinned XMAC: 4.5-4.7x on the 2070.  The A100 to measure (its XMAC relatively cheaper, so S/X larger).
+unbinned XMAC: 4.5-4.7x on the 2070.
+
+**The A100** (OzSTAR gina5, job 21377096, commit 1d5b978,
+`results-local/gina5-station-20261122-182253`):
+
+| channels | station (end-to-end, FP16 spectra) | staged XMAC | chain | S/X | binned XMAC may cost |
+|---|---|---|---|---|---|
+| 128 | 1.022 | 0.321 | 1.345 | 3.19 | 5.2x |
+| 1024 | 1.219 | 0.376 | 1.596 | 3.24 | 5.2x |
+
+(The fastest station stage of any kind, writing FP32 spectra, is 1.000 ms at 128 channels; the
+first version of `run-station.sh` counted a component line in that column, fixed.)  With the last A100
+sweep (job 21376972; the best binned version with window-major spectra, plus the bins and weights),
+the whole chain against the unbinned one, 10 stations:
+
+| P, DM | channels | gate | 16 scrunched | 16 separate | 128 separate |
+|---|---|---|---|---|---|
+| 1.5 ms, 30 | 128 | 0.95x | 1.11x | 1.77x | 3.39x |
+| 1.5 ms, 300 | 128 | 1.10x | 1.11x | 2.09x | 3.48x |
+| 1.5 ms, 30 | 1024 | 0.97x | 1.08x | 1.71x | 4.71x |
+| 1.5 ms, 300 | 1024 | 0.99x | 1.08x | 1.84x | 5.13x |
+| 500 ms, 30 / 1000 | 128 | 1.08x / 0.94x | 1.09x / 1.10x | 1.63x / 1.61x | 1.88x / 2.88x |
+| 500 ms, 30 / 1000 | 1024 | 1.06x / 0.91x | 1.06x / 1.08x | 1.53x / 1.33x | 1.90x / 2.00x |
+
+So the gate and scrunched bins cost the chain at most 11%, and 16 separate bins of a millisecond
+pulsar 1.7-1.8x, 2.09x at 128 channels and DM 300; 128 separate bins 3.4-5.1x.  32 even bins added
+to `run-bins.sh` (the 2070: 4.25x the XMAC gathered from channel-major spectra, 10.4x from
+window-major at 128 channels, DM 300).

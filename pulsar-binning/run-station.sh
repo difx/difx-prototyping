@@ -40,7 +40,8 @@ import csv, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1])) if r['kind'] == 'time']
 print("10 stations, 8 x 32 MHz bands (4 dual-pol), 2-bit, 25.6 ms subint; ms per subint (median)")
 print("station: the end-to-end kernel writing FP16 spectra (what the staged XMAC reads); fastest: the")
-print("fastest station variant of any kind; X: the staged tensor XMAC alone; chain: the two measured together.")
+print("fastest whole station stage of any kind (FP32 or FP16 spectra); X: the staged tensor XMAC alone; chain:")
+print("the two measured together.")
 print("Within a factor F of the unbinned chain, the binned XMAC (with the bins) may cost up to")
 print("F (S/X + 1) - S/X times the unbinned XMAC: for F = 2, S/X + 2")
 print("%6s %9s %9s %9s %9s %7s %12s" % ("nchan", "station", "fastest", "X", "chain", "S/X", "binned max"))
@@ -48,7 +49,7 @@ for n in sorted({r['nchan'] for r in rows}, key=int):
     d = [r for r in rows if r['nchan'] == n]
     get = lambda pre: min(float(r['median_ms']) for r in d if r['name'].startswith(pre))
     s = get('end-to-end -> FP16 spectra')
-    fastest = min(float(r['median_ms']) for r in d if r['name'].startswith(('fused', '2 kernels', 'end-to-end')))
+    fastest = min(float(r['median_ms']) for r in d if r['name'].startswith(('fused,', '2 kernels', 'end-to-end')))
     x = get('XMAC: staged tensor')
     chain = get('station + XMAC: end-to-end -> FP16 spectra + staged tensor')
     print("%6s %9.3f %9.3f %9.3f %9.3f %7.2f %11.2fx" % (n, s, fastest, x, chain, s / x, s / x + 2))

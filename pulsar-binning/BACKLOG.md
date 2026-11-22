@@ -41,6 +41,12 @@ to keep arbitrary breakpoints.
   counting the transpose the others need, in 19 of 24 separate-bin runs, and at most 1.6x the
   fastest in the rest (128 channels, short runs or high DM); the permuted copy never wins there.  Kept (2026-11-22): drop the
   permuted copy and the channel-major path in DiFX; the 128-channel millisecond pulsar below.
+- **The target** (2026-11-22): a gate, or up to 16-32 bins, for a millisecond pulsar at DM ~hundreds,
+  10 stations, within 2x of the unbinned chain (station + XMAC); worse with many stations or bins
+  is acceptable.  The A100 (station stage 3.2x the XMAC): the gate and scrunched bins 0.91-1.11x, so
+  no more tuning of the weighted kernel (the ideas below add complexity for a few % of the chain);
+  16 separate bins 1.7-2.1x; 32 bins to measure (in `run-bins.sh`).  If 32 bins miss: the
+  4-channel (16-byte) gathers where a quad shares a window, or the station kernel writing slot order.
 - **The weighted kernel's rest** (the A100: 1.13-1.32x the XMAC with nothing to skip; Nsight
   Compute, docs/results.md, "The A100: the classification, and where ..."): 28% more instructions
   than the plain kernel at the same issue rate.  Register pressure (the ldmatrix addresses re-derived
