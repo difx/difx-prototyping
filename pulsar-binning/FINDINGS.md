@@ -94,7 +94,9 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
 - **The station kernel writing bin order** (tried, removed): the scattered store costs it +1.5 ms at
   128 channels and +3.7 at 1024 on the A100 (+3.0 and +25 on the 2070), so 32 bins at DM 300 cost the
   chain 2.50x at 128 channels and 4.14x at 1024, against 2.94x gathering from window-major.  Not
-  worth coupling the station kernel to the binning: the window-major gather is the one way.
+  worth coupling the station kernel to the binning: the window-major gather is the one way, and
+  binbench keeps only it for separate bins (the permuted copy and the channel-major gather removed,
+  their results in docs/results.md).
   ([docs/results.md](docs/results.md), "The station kernel writing bin order")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

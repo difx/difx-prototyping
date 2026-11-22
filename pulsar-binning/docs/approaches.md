@@ -89,7 +89,7 @@ blocks without it.
 - *Measured:* 44x / 82x (1.5 ms, 128 channels, 128 bins), 72x / 105x (1024 channels), 23x / 58x
   (500 ms, 1024 channels, 128 bins), 6.1x / 11x (1.5 ms, 16 bins).  Only for a handful of bins.
 
-## 4. Sorted per channel, permuted copy (separate bins, short runs)
+## 4. Sorted per channel, permuted copy (separate bins, short runs; removed)
 
 Sort each channel's windows by bin into **slots**: a stable counting sort (a warp per frequency and
 channel, the bins computed on the fly), then a layout that gives each bin the same slots across a
@@ -112,7 +112,7 @@ multiplies is one bin, for every channel, and writes that bin once at the end.
   1024 channels (bins narrower than a window), 5.6x / 5.6x (500 ms, 1024 channels, 128 bins),
   4.6x / 4.1x (1.5 ms, 16 bins).
 
-## 5. Sorted per channel, gathered (separate bins, long runs)
+## 5. Sorted per channel, gathered (separate bins, long runs; 5b, from window-major, kept)
 
 The same sort and slots without the permuted copy: the XMAC's copy into its stage reads each
 slot's window through the slot table (a 16-byte index load per channel and 4 slots, then 4-byte
@@ -171,6 +171,10 @@ So one sorted approach, gathered from the station kernel's usual window-major ou
 separate bins on the A100: the best, counting the transpose the others need, in 19 of 24 runs, and
 at most 1.6x the best in the rest (128 channels with short runs or high DM).  The station kernel
 stays as it is.  On the 2070 the transpose and the permuted copy win more often (its L2 is 4 MB).
+5b is the one binbench keeps (2026-11-23): the permuted copy (4) and the gather from channel-major
+spectra (5) are removed with their transpose, their results here and in [results.md](results.md),
+as are the station kernel writing slot order and segments in time order, tried for 32 bins at high
+DM (results.md, "32 bins on the A100" and after).
 
 32
 stations (where the XMAC is 4x larger) give the same picture or better: the gate 0.33x, 16 scrunched
@@ -183,8 +187,8 @@ Slowest index first; the last is contiguous.
 | layout | where | index order | element |
 |---|---|---|---|
 | FP16 spectra, window-major | DRAM: the station kernel's output now; read by the stage and passes | `[station][window][band][channel]` | `__half2` (re, im) |
-| FP16 spectra, channel-major | DRAM: sorted and gather's input (here a transpose; gatherwm does without) | `[station][band][channel][window]` | `__half2` |
-| slots | DRAM: the permuted copy (approach 4) | `[station][band][channel][slot]`, a channel's windows in bin order, each bin padded to 16 slots, the same slots across a channel group | `__half2` |
+| FP16 spectra, channel-major | DRAM: sorted and gather's input (a transpose; removed with them) | `[station][band][channel][window]` | `__half2` |
+| slots | DRAM: the permuted copy (approach 4, removed) | `[station][band][channel][slot]`, a channel's windows in bin order, each bin padded to 16 slots, the same slots across a channel group | `__half2` |
 | bins | DRAM | `[window][frequency][channel]` | `uint8` |
 | slot table | DRAM | `[frequency][channel][slot]`: the window, or -1 for padding | `int` |
 | segments | DRAM | `[frequency][channel group][k]`: (bin, first and last + 1 slot block, the bin's segments) | `int4` |

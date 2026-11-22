@@ -64,7 +64,8 @@ different band layouts).  Hardware eras: [../README.md](../README.md#benchmark-h
   that only it asks for (as static arrays they cost the unweighted kernel 4-11% at 4-10
   stations).  Results and how it is used: ../pulsar-binning/docs/results.md, "Step 3".
 - **`xmacTensorStagedSorted`** (pulsar binning, separate bins): the staged kernel over slots sorted
-  by bin per channel, from channel-major spectra (a permuted copy, or gathering each slot's window
-  through a slot table), a block per segment of a bin; and, for every binned mode, channel averaging
-  (the block's warps summed in shared memory when the averaging covers its channels) and
-  accumulation.  Template modes 2 and 3; the plain kernel unchanged.
+  by bin per channel, gathering each slot's window through a slot table from the spectra as the map
+  lays them out (the usual window-major ones), a block per segment of a bin; and, for every binned
+  mode, channel averaging (the block's warps summed in shared memory when the averaging covers its
+  channels) and accumulation.  Template mode 2; the plain kernel unchanged.  (A mode over permuted,
+  channel-major slots, and the gather from channel-major spectra, removed: pulsar-binning/docs/results.md.)

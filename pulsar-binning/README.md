@@ -15,13 +15,14 @@ pulsar-binning/binbench --period-ms 500 --nchan 1024 --bins gate
 Simulates a dispersed pulsar in the station spectra, computes each (window, frequency, channel)'s
 bin as mpifxcorr does (integer phase, arbitrary ends), and bins the XMAC: the naive port (a thread
 per output), the staged XMAC weighted in its stage (`stage`: one pass, the gate and scrunched
-output; `passes`: one a bin), bins sorted per channel (`sorted`: a permuted copy of channel-major
-spectra; `gather`: the XMAC gathering them), timed against the unbinned staged XMAC and checked
+output; `passes`: one a bin), and bins sorted per channel with the XMAC gathering each slot's window
+from the usual window-major spectra (`gatherwm`), timed against the unbinned staged XMAC and checked
 against the host in double.  Bins: `gate` (2, scrunched with weights 0 / 1), `16` (unequal, the narrowest 1/1024; on - off
 when `--scrunch`ed), `128`, `even:N`.  `--avg A` sums A channels into each output channel,
 `--accumulate` adds into the output instead of zeroing it each subint, `--dropout P` / `--partial P`
 give stations invalid or half-valid windows (for the per-bin weights, checked against mpifxcorr's
-sum).  `gatherwm` is the sorted XMAC gathering straight from the usual window-major spectra.  `--help` lists the rest
+sum).  (The permuted copy and the gather from channel-major spectra, which needed a transpose, are
+removed; their results stay in the docs.)  `--help` lists the rest
 (stations, channels, subint, period, DM, the phase convention).  `run-bins.sh` runs the whole test
 matrix (results-local/<host>-bins-<stamp>/); `run-station.sh` the station stage at the same shape
 (fusebench, with the staged XMAC after it), for the binning's cost against the whole chain.  Results: [docs/results.md](docs/results.md); in short,

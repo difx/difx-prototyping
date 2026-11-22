@@ -67,9 +67,9 @@ for r in rows:
         flagged.setdefault(k + (r['dropout'], r['partial']), {})[r['what']] = float(r['ms'])
     else:
         runs.setdefault(k, {})[r['what']] = float(r['ms'])
-vers = ['naive', 'stage', 'passes', 'sorted', 'gather', 'gatherwm']
-print("ms per subint (25.6 ms); best / xmac: the fastest binned version against the unbinned staged XMAC (gatherwm: gather")
-print("from the window-major spectra; sorted and gather start from channel-major ones, not counted)")
+vers = ['naive', 'stage', 'passes', 'gatherwm']
+print("ms per subint (25.6 ms); best / xmac: the fastest binned version against the unbinned staged XMAC (gatherwm: sorted")
+print("per channel, the XMAC gathering from the window-major spectra; with the sort, not the bins and weights)")
 print("bins: the bins kernel with each bin's count and the flagged windows' histograms; weights: the per-bin weights after it;")
 print("old b+w: the bins alone and the six weights kernels before")
 print("%-6s %5s %5s %-10s %4s %4s  %8s %7s %7s %7s  " % ("P ms", "DM", "nchan", "bins", "avg", "acc", "xmac", "bins", "weights", "old b+w") +

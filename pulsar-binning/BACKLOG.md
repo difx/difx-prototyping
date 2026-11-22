@@ -34,13 +34,13 @@ to keep arbitrary breakpoints.
   and accumulating over an integration; `run-bins.sh`, the whole matrix on the 2070: the gate
   0.45-1.13x, scrunched 1.04-1.37x, 16 separate 2.6-4.5x, 128 separate 2.7-6.5x (14x for bins
   narrower than a window).  [FINDINGS.md](FINDINGS.md).
+- One sorted approach (2026-11-23): the gather from window-major spectra (gatherwm; on the A100
+  the fastest, counting the transpose the others need, in 19 of 24 separate-bin runs).  The permuted
+  copy and the channel-major gather removed from binbench and the XMAC; their results in
+  docs/results.md.
 
 ## Next
 
-- **One sorted approach: gather from window-major spectra** (gatherwm): on the A100 the fastest,
-  counting the transpose the others need, in 19 of 24 separate-bin runs, and at most 1.6x the
-  fastest in the rest (128 channels, short runs or high DM); the permuted copy never wins there.  Kept (2026-11-22): drop the
-  permuted copy and the channel-major path in DiFX; the 128-channel millisecond pulsar below.
 - **The target** (2026-11-22): a gate, or up to 16-32 bins, for a millisecond pulsar at DM ~hundreds,
   10 stations, within 2x of the unbinned chain (station + XMAC); worse with many stations or bins
   is acceptable.  The A100 (station stage 3.2x the XMAC): the gate and scrunched bins 0.91-1.11x, so

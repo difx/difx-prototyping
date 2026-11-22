@@ -37,7 +37,8 @@ its `FINDINGS.md`.
 - Done: 32 separate bins on the A100: 2.0-2.07x the chain at DM 30, 2.95x at DM 300 (millisecond pulsar).
 - Done: why 32 bins at high DM cost more (Nsight Compute: DRAM re-reads, a sector's channels in different bins); segments in time order tried, slower, reverted.
 - Done: the station kernel writing bin order (A100: 32 bins at DM 300 2.50x the chain at 128 channels, 4.14x at 1024, against 2.94x; removed).
-- Next: wrap up: the weighted kernel left as it is (within the 2x target); one sorted approach (gather from window-major).
+- Done: one sorted approach (the gather from window-major spectra); the permuted copy and the channel-major gather removed (results kept in the docs).
+- Next: wrap up (the weighted kernel left as it is, within the 2x target).
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 

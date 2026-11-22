@@ -215,14 +215,11 @@ B500=(--period-ms 500 --nchan 128 --bins gate --only stage)
 profileb pb-plain-c128         0 'xmac_staged_kernel<.int.2, .int.8, .int.0>' "${B500[@]}"
 profileb pb-gate500-c128       0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' "${B500[@]}"
 profileb pb-16s-1.5ms-c128     0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' --period-ms 1.5 --nchan 128 --bins 16 --scrunch --only stage
-# 32 separate bins of the 1.5 ms pulsar, the gathering XMAC (MODE 3): from window-major spectra at
-# DM 30 and DM 300 (9.2x the XMAC: each channel its own slot list), from channel-major at DM 300, and
-# from channel-major at 1024 channels (6.8x whatever the DM)
+# 32 separate bins of the 1.5 ms pulsar, the sorted XMAC gathering from window-major spectra (MODE 2)
+# at DM 30 and DM 300 (9.2x the XMAC: a sector's channels in different bins, read from DRAM for each)
 B32=(--period-ms 1.5 --bins even:32)
-profileb pb-32-dm30-wm-c128    0 'xmac_staged_kernel<.int.2, .int.8, .int.3>' "${B32[@]}" --nchan 128 --dm 30 --only gatherwm
-profileb pb-32-dm300-wm-c128   0 'xmac_staged_kernel<.int.2, .int.8, .int.3>' "${B32[@]}" --nchan 128 --dm 300 --only gatherwm
-profileb pb-32-dm300-cm-c128   0 'xmac_staged_kernel<.int.2, .int.8, .int.3>' "${B32[@]}" --nchan 128 --dm 300 --only gather
-profileb pb-32-dm300-cm-c1024  0 'xmac_staged_kernel<.int.2, .int.8, .int.3>' "${B32[@]}" --nchan 1024 --dm 300 --only gather
+profileb pb-32-dm30-wm-c128    0 'xmac_staged_kernel<.int.2, .int.8, .int.2>' "${B32[@]}" --nchan 128 --dm 30 --only gatherwm
+profileb pb-32-dm300-wm-c128   0 'xmac_staged_kernel<.int.2, .int.8, .int.2>' "${B32[@]}" --nchan 128 --dm 300 --only gatherwm
 
 packs=()
 for o in "${outs[@]}"; do

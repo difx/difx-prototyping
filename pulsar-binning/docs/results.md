@@ -656,3 +656,15 @@ the binning (the sort before it, the output's layout and size by mode) and costs
 1.5-3% unless a compile-time variant.  Removed (the store, fusebench `--bin-order`, the
 `run-station.sh` column; in git history at a5a6d4e): the window-major gather is the one way, working
 everywhere.
+
+## The simplification (2026-11-23)
+
+One way for separate bins: sorted per channel, the XMAC gathering from the usual window-major
+spectra (`gatherwm`).  Removed from binbench: the permuted copy (`sorted`) and the gather from
+channel-major spectra (`gather`), with their transpose and permute kernels; from the XMAC, the mode
+over permuted slots, and the channel and window strides (the gather takes the map's window stride).
+Their results stay above.  With the permute gone the sort no longer waits for the host (the slot
+count is checked once): on the 2070 the gatherwm runs are the same or slightly faster (32 bins, 128
+channels, DM 300: 10.14x the XMAC against 10.31x; 16 bins at 1024 channels 3.37x against 3.83x;
+every check passing).
+

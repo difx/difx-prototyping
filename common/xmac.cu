@@ -197,11 +197,9 @@ struct MmaCfg {
 constexpr int MAXWBINS = 256, MAXTL = 1024;
 constexpr size_t WEIGHTED_SMEM = MAXWBINS * 4 + MAXTL * 2 + MAXTL + 2 * 16 * 16 * 2 + 16;
 // MODE 0 plain, 1 weighted (WT), 2 sorted (xmacTensorStagedSorted: the windows are slots sorted by bin
-// per channel, channel-major (a receiver's channel c at off + c W.cstride, its slots contiguous: the
-// copy loads 4 slots of a channel, no transpose); blockIdx.z is a segment of the block's channel
-// group, (bin, first and last + 1 slot block, the bin's segment count), instead of a chunk of the
-// windows; the sums go to that bin), 3 sorted and gathered (the same, the copy reading each slot's window
-// from channel-major spectra in time order through W.slotWin: no permuted copy)
+// per channel; blockIdx.z is a segment of the block's channel group, (bin, first and last + 1 slot
+// block, the bin's segment count), instead of a chunk of the windows; the sums go to that bin; the
+// copy gathers each slot's window from the spectra, in the map's layout, through W.slotWin)
 template<int KS, int CH, int MODE>
 __global__ void __launch_bounds__(MmaCfg<KS, CH>::NW * 32, MmaCfg<KS, CH>::MINB)
 xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, float2* vis,
@@ -317,7 +315,7 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
         const int row = row0 + k * C::RSTEP;
         const int r = row < used ? recvOf(row) : -1;
         const bool any = r >= 0 && c0 + 4 * q < s.nchan;
-        src[k] = any ? (unsigned)moff[r] + (MODE >= 2 ? (unsigned)(c0 + 4 * q) * (unsigned)W.cstride : c0 + 4 * q) : NONE;
+        src[k] = any ? (unsigned)moff[r] + c0 + 4 * q : NONE;
         wstride[k] = any ? mws[r] : 0;
         dofs[k] = 4 * q * CSb + stagedChunk(row, wq);
     }
@@ -331,18 +329,7 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     const int wPos = (wWin & 8) + 2 * (wWin & 3) + ((wWin >> 2) & 1);
     int wBin = -1;
     auto fetch = [&](int tb, int mode = 1) {
-        if constexpr (MODE == 2) {            // channel-major slots: v[k][cq] is channel cq's 4 slots
-#pragma unroll
-            for (int k = 0; k < C::MAXR; k++)
-#pragma unroll
-                for (int cq = 0; cq < 4; cq++)
-                    v[k][cq] = src[k] != NONE
-                             ? __ldg(reinterpret_cast<const uint4*>(spec + (src[k] + (unsigned)cq * (unsigned)W.cstride
-                                                                            + (unsigned)(tb * 16 + 4 * wq))))
-                             : make_uint4(0, 0, 0, 0);
-            return;
-        }
-        if constexpr (MODE == 3) {            // gathered: channel cq's 4 slots' windows (-1: padding)
+        if constexpr (MODE == 2) {            // v[k][cq]: channel cq's 4 slots, each its window (-1: padding)
             const bool anyq = c0 + 4 * q < s.nchan;
 #pragma unroll
             for (int cq = 0; cq < 4; cq++) {
@@ -352,8 +339,8 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
 #pragma unroll
                 for (int k = 0; k < C::MAXR; k++) {
                     if (src[k] == NONE) { v[k][cq] = make_uint4(0, 0, 0, 0); continue; }
-                    const unsigned* b = reinterpret_cast<const unsigned*>(spec + src[k] + (unsigned)cq * (unsigned)W.cstride);
-                    const unsigned ws = (unsigned)W.wstride;
+                    const unsigned* b = reinterpret_cast<const unsigned*>(spec + src[k] + cq);
+                    const unsigned ws = (unsigned)wstride[k];
                     v[k][cq] = make_uint4(wi.x >= 0 ? __ldg(b + (unsigned)wi.x * ws) : 0u, wi.y >= 0 ? __ldg(b + (unsigned)wi.y * ws) : 0u,
                                           wi.z >= 0 ? __ldg(b + (unsigned)wi.z * ws) : 0u, wi.w >= 0 ? __ldg(b + (unsigned)wi.w * ws) : 0u);
                 }
@@ -761,26 +748,23 @@ void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half
     stagedDispatch<1>(s, m, spec, vis, sms, st, w);
 }
 void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
-                            const int4* segs, int maxSeg, int nbins, int cstride, int sms, cudaStream_t st,
-                            const int* slotWin, int avg, bool accumulate, int wstride) {
+                            const int4* segs, int maxSeg, int nbins, const int* slotWin, int sms, cudaStream_t st,
+                            int avg, bool accumulate) {
     checkAvg(s, avg);
-    if (nbins < 1 || !segs || maxSeg < 1 || (!slotWin && (cstride % 4 || cstride < s.nwin)) || s.nwin % 4 ||
-        m.maxOff + (long long)s.nchan * cstride > 0xfffffffeLL) {
-        fprintf(stderr, "staged tensor XMAC, sorted: bins and segments needed; the channel stride a multiple of 4, at "
-                        "least the slots, and the spectra within 2^32 __half2\n");
+    if (nbins < 1 || !segs || maxSeg < 1 || !slotWin || s.nwin % 16) {
+        fprintf(stderr, "staged tensor XMAC, sorted: bins, segments and the slots' windows needed; slots a multiple "
+                        "of 16\n");
         exit(2);
     }
     XmacWeights w;
-    w.cstride = cstride;
-    w.wstride = wstride;
     w.avg = avg;
     w.accumulate = accumulate;
-    if (slotWin) { w.slotWin = slotWin; w.cap = s.nwin; }
+    w.slotWin = slotWin;
+    w.cap = s.nwin;
     w.segs = segs;
     w.maxSeg = maxSeg;
     w.nbins = nbins;
-    if (slotWin) stagedDispatch<3>(s, m, spec, vis, sms, st, w);
-    else stagedDispatch<2>(s, m, spec, vis, sms, st, w);
+    stagedDispatch<2>(s, m, spec, vis, sms, st, w);
 }
 int xmacTensorStagedChannels(const XmacShape& s) { return stagedPlan(s).ch; }
 
