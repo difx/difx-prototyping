@@ -49,10 +49,15 @@ struct Unfused {
 // order, [ant][win][band][nchan] __half2 (XmacShape::halfIndex), for the staged tensor XMAC
 // (xmacTensorStaged); invalid windows as zeros.  The values are multiplied by scale (a power of two,
 // about 1 / sqrt(FFT length), to keep FP16 well inside its range), so the visibilities by scale^2.
+// With dest (pulsar binning, bin order): each (window, frequency, channel)'s slot, [win][freq][nchan],
+// and the spectra go channel-major in slot order, [ant][band][nchan][cap] (the binned XMAC's sorted
+// layout, pulsar-binning); the padding slots are not written.
 struct HalfOut {
     __half2* h;
     XmacShape s;
     float scale;
+    const int* dest = nullptr;
+    int cap = 0;
 };
 
 struct FusedVariant {

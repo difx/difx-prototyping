@@ -597,10 +597,49 @@ and it is fetched from DRAM for each.  At 1024 channels from channel-major the s
 the windows (a bin is 1.5 windows a period, so a channel's slots are runs of 1-2 windows, a sector
 holding 8), with 3.4x the instructions (5x the blocks, each with fewer slots) and 0.47 GB of output.
 
-**Segments in time order** (`sort_layout`, `--seg-len`, `run-seglen.sh`): each bin's slots split into
-segments of L slot blocks, ordered time first, then bin, so that the blocks running together read
-the same windows and L2 keeps the sectors between bins.  Correct (every run passing); with the default
-L = 32 a bin is one segment, as before.  On the 2070 (4 MB of L2, too small for a time chunk) shorter
-segments only add blocks and output atomics (`results-local/ar313-adeller-seglen-20261122-222423`: 32
-bins, 128 channels, DM 300, window-major 10.4x at L 32, 10.9x at 8, 12.4x at 2); the A100 (40 MB) is
-the test.
+**Segments in time order** (tried, reverted): each bin's slots split into segments of L slot blocks
+(`--seg-len`), ordered time first, then bin, so that the blocks running together read the same windows
+and L2 keeps the sectors between bins.  Correct, but slower on both GPUs: shorter segments add blocks
+and output atomics, and a time chunk short enough for L2 is too short a segment.  The gathering XMAC
+(with the sort) against the unbinned XMAC, 1.5 ms pulsar (`run-seglen.sh`, removed since; the 2070
+`results-local/ar313-adeller-seglen-20261122-222423`, the A100 gina2
+`results-local/gina2-seglen-20261122-222812`, every run passing):
+
+| bins, channels, DM | | 2070, L 32 / 8 / 4 / 2 | A100, L 32 / 8 / 4 / 2 |
+|---|---|---|---|
+| 32, 128, 300 | window-major | 10.40 / 10.85 / 11.02 / 12.39 | 9.11 / 9.37 / 9.98 / 10.34 |
+| 32, 128, 300 | channel-major | 4.27 / 4.74 / 5.53 / 7.00 | 3.97 / 4.40 / 5.30 / 6.72 |
+| 32, 1024, 300 | window-major | 17.67 / 17.55 / 17.80 / 17.80 | 9.25 / 9.29 / 9.37 / 9.59 |
+| 16, 128, 300 | window-major | 8.46 / 8.51 / 8.91 / 10.20 | 5.83 / 5.83 / 6.96 / 9.70 |
+
+So 32 separate bins at high DM stay at about 3x the chain.  What would bring them down is a layout
+in which a sector's values go to one bin: the station kernel writing the spectra channel-major
+(1.73x the chain at 128 channels; at 1024 channels the bins of 1.5 windows still split the sectors)
+or in slot order.
+
+### The station kernel writing bin order (2026-11-22, RTX 2070 SUPER)
+
+The end-to-end station kernel's FP16 store through a table (`HalfOut::dest`, common/pipelines.cuh:
+each (window, frequency, channel)'s slot), into the layout the binned XMAC's sorted mode reads,
+[station][band][channel][slot]; fusebench `--bin-order P,DM,NBINS` builds the table as binbench's
+sort does and checks every value against the usual order (exact).  `run-station.sh` runs it for 32
+bins of the 1.5 ms pulsar at DM 300 (`results-local/ar313-adeller-station-20261122-224055`).  The
+never-taken branch costs the usual store 3% (3.41 against 3.30 ms at 128 channels; 3.80-3.82 against
+3.71 at 1024): to be made compile-time, or removed, after the A100.
+
+| 2070, 32 bins, 1.5 ms, DM 300 | station | binning | chain | against unbinned |
+|---|---|---|---|---|
+| 128 ch, window-major gather | 3.30 | 12.50 + bins, weights 0.11 | 15.9 | 3.5x |
+| 128 ch, bin order | 6.36 | sort 0.43, bins 0.10, XMAC over slots 2.23 | 9.1 | 2.0x |
+| 1024 ch, window-major gather | 3.70 | 25.9 + 0.08 | 29.7 | 5.7x |
+| 1024 ch, bin order | 28.5 | 0.90, 0.08, 3.79 | 33.3 | 6.4x |
+
+(Zeroing the bin-order buffer, an upper bound for its padding, 0.67-0.80 ms, not included.)  The
+scattered store costs 3.0 ms at 128 channels and 25 ms at 1024: a window's consecutive channels go to
+addresses a channel's slots apart, a 4-byte store to a sector each; at 128 channels a bin's
+consecutive windows fill a sector's other slots soon after, at 1024 (a bin 1.5 windows a period)
+they do not.  On the A100 (40 MB of L2) the stores may merge better: the test.  The A100's XMAC over
+the slots is 0.467 ms at 128 channels (1.45x the XMAC) and 1.488 at 1024 (4.0x, its 28% padding and
+the output), with the sort 0.33 / 0.18 ms (job of gina17); the chain is within 2x at 128 channels if
+the bin-order store costs the station kernel under about 0.8 ms more, and at 1024 channels under
+about 0.25 ms.

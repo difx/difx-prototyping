@@ -56,8 +56,12 @@ struct OutHalf {
     HalfOut o;
     __device__ __forceinline__ void put(const Geometry&, int ant, int win, int band, unsigned k, cuFloatComplex v,
                                         bool valid) const {
-        o.h[o.s.halfIndex(ant, win, band, k)] = valid ? __floats2half2_rn(v.x * o.scale, v.y * o.scale)
-                                                      : __float2half2_rn(0.f);
+        const __half2 h = valid ? __floats2half2_rn(v.x * o.scale, v.y * o.scale) : __float2half2_rn(0.f);
+        if (o.dest)
+            o.h[((size_t)(ant * o.s.nband() + band) * o.s.nchan + k) * o.cap +
+                __ldg(o.dest + ((size_t)win * o.s.nfreq + band / 2) * o.s.nchan + k)] = h;
+        else
+            o.h[o.s.halfIndex(ant, win, band, k)] = h;
     }
 };
 

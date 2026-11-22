@@ -86,5 +86,11 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   300 (window-major spectra: each channel its own slot list, a 4-byte load a slot); the 500 ms
   pulsar 1.41-1.68x (2.48x at 128 channels, DM 1000).  Channel-major spectra would give 1.73x at 128
   channels (before a transpose) but 2.38x at 1024.  ([docs/results.md](docs/results.md), "32 bins on the A100")
+- **Why 32 bins at high DM cost more** (Nsight Compute): DRAM traffic, not instructions.  A 32-byte
+  sector holds a window's 8 channels, which at high DM fall in different bins; each XMAC block covers
+  one bin, so each sector is read from DRAM once for each bin it feeds (window-major at DM 300: 3.9 GB
+  for 0.39 GB of spectra).  Running the blocks in time order to share the sectors in L2 was slower on
+  both GPUs.  Only a layout where a sector feeds one bin (the station kernel writing channel-major or
+  slot order) would fix it; not pursued.
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

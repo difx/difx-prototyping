@@ -35,7 +35,8 @@ its `FINDINGS.md`.
 - Done: the classification with the bins (net 0.3-1.9% worse on the A100 as its own kernel); Nsight Compute: the weighted kernel's 15-25% is 28% more instructions, register pressure (ldmatrix addresses re-derived at 128 registers) and the list loop.
 - Done: the binning against the whole chain (A100 station stage 3.2x the XMAC): gate and scrunched 0.91-1.11x the chain, 16 separate MSP bins 1.7-2.1x.
 - Done: 32 separate bins on the A100: 2.0-2.07x the chain at DM 30, 2.95x at DM 300 (millisecond pulsar).
-- Next: where 32 bins' time goes at high DM (Nsight Compute); the weighted kernel left as it is (within the 2x target); one sorted approach (gather from window-major).
+- Done: why 32 bins at high DM cost more (Nsight Compute: DRAM re-reads, a sector's channels in different bins); segments in time order tried, slower, reverted.
+- Next: wrap up: the weighted kernel left as it is (within the 2x target); one sorted approach (gather from window-major).
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 
