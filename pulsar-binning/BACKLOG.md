@@ -1,27 +1,86 @@
 # pulsar-binning: backlog
 
-## Next
+mpifxcorr's implementation is read: [docs/mpifxcorr.md](docs/mpifxcorr.md), with the decision
+to keep arbitrary breakpoints.
 
-- **Check mpifxcorr's and gpudifx's binning first**: how the bins and their per-channel offsets
-  (dispersion) are computed and applied, and the output layout.
+## The test cases
 
-## Approaches to compare (prototype and measure each)
+Every parameter variable; these are the defaults and the sweep.
 
-- **A pass per bin**: the XMAC run once per bin, with the windows not in the bin set to zero (or
-  skipped by the copy into the stage).  Simple, and it costs nbins x the XMAC.  Gating is then one
-  pass.
-- **Weights in the stage**: the copy into shared memory multiplies each (window, channel) value
-  by its bin's on/off weight, so the tensor cores never see the other bins.  This is still a pass
-  per bin, but the passes share the loads if one block holds several bins' accumulators.
-- **Bin-major accumulators**: one accumulator set per bin, held in registers or shared memory, with
-  each 16-window block split at the bin boundaries.  Tensor-core efficiency falls as the bins get
-  shorter.
-- **Bin boundaries at the station stage**: the station kernel tags or reorders windows by bin
-  (per channel: hard).
+| case | bins | output |
+|---|---|---|
+| gate | 2 (on-pulse 10%) | scrunched, weights 1 (on), 0 (off) |
+| 16 | 16 of unequal widths, the narrowest 1/1024, finest round the pulse | separate; and scrunched (weighted) |
+| 128 | 128 even | separate |
 
-## What to measure
+- **Pulsars**: P = 1.5 ms and P = 500 ms, DM 30 (variable), a polyco-like phase model (phase,
+  frequency, its derivative per subint).
+- **Channelisation**: 128 and 1024 channels a band for each pulsar (4 µs and 32 µs windows;
+  6400 and 800 a 25.6 ms subint), 4 dual-pol 32 MHz bands, 10 stations (also 32).  The frequency
+  resolution is the user's choice; the smearing it implies is reported, not changed.
+- **Checks**: a simulated pulsar (a pulsed signal common to the stations, with its profile and
+  dispersion, plus noise), every version against a double-precision host reference on sampled
+  outputs, and the bins' signal against the profile; the per-bin weights against mpifxcorr's
+  rule.
 
-- The cost against nbins (1 = gating, 8, 32, 128), pulse period and DM, with the visibilities
-  checked against gpudifx's (or mpifxcorr's) binned output.
-- Memory: nbins x the visibilities.
-- Whether incoherent dedispersion (the per-channel bin offset) changes the answer.
+## The plan: `binbench` (pulsar-binning/binbench.cu)
+
+1. **The bins**: a kernel computing the bin index per (window, channel, frequency) per subint
+   (uint8 / uint16), in integer phase (a 32-bit fraction of a turn: the subint's phase, the
+   window's step and the channel's dispersion offset added as integers, the wrap free), arbitrary
+   breakpoints by a 1024-cell table on the top bits plus one comparison.  mpifxcorr's convention
+   by default (the window's start; its channel frequencies), an option for the window's middle.
+   Its cost against the XMAC's (expected: negligible).
+2. **The reference**: a naive port of mpifxcorr (a thread per (baseline, product, channel),
+   looping over windows into its bins), checked against the host in double.
+3. **Weights in the stage** (the staged XMAC, `common/xmac.cu`, behind a template flag so the
+   default path is unchanged): the copy into shared memory multiplies each (window, channel) by
+   a weight from its bin.  The tile serves both sides of the product (X1 X2^*), so a weight s
+   there enters as s²: the stage carries √|w|, and a negative weight's sign goes into the A
+   operand's registers (an XOR of the sign bits per window, next to the sign flip the kernel
+   already makes there for the imaginary part).  So one pass for any weights.
+   - Scrunched output (and the gate) in one pass, at the XMAC's cost (+ the weights' loads).
+   - Separate bins as one 0/1 pass per bin, skipping the 16-window chunks with none of the bin
+     in the block's channels.  Expected fine for few bins, poor for 128 at 1.5 ms: a bin is in
+     ~30% of an 8-channel block's chunks at 128 channels, nearly all at 1024.
+4. **Bin-sorted windows** (separate bins, many bins): per channel, the windows sorted by bin
+   (a counting sort; offsets per (channel, bin), padded to 16).  The XMAC gathers each channel's
+   16 windows of one bin and writes its accumulators to that bin at the bin's end.  One pass;
+   the cost is the gather (4-byte loads per channel instead of rows of channels) and the padding
+   (1.5 ms, 128 bins: ~50 windows per (channel, bin) a subint at 128 channels, +15-28%; ~6 at 1024,
+   +150%: there a longer subint, or bins sorted over several subints, would help).  Measure; if
+   the gather is too slow, a separate pass writing the spectra bin-sorted per channel (a
+   permutation of the station spectra), and later the station kernel writing that order directly.
+5. **Splitting the 16-window chunks at bin boundaries** (the alternative to 4 when runs are long:
+   the 500 ms pulsar): masked MMAs per bin present in a chunk, accumulators written at each bin
+   change.  ~1x for long runs, ~nbins-per-chunk x for short.
+6. **The output side**: per-bin weights; channel averaging per bin; for the 500 ms pulsar the
+   sparse bins (only those touched in a subint written or copied; the device-to-host copy of
+   all 128 bins x 1024 channels would be ~30 GB/s); phase centres per bin (the shift's cost x
+   nbins).
+7. **Sweep** on the 2070, then the A100 (OzSTAR), each version against the unbinned XMAC:
+   cases x periods x stations, and DM 0 (no channel dependence) against DM 30.
+
+## What to decide from it
+
+- Which approach per regime (few bins / many; short runs / long), and whether one covers all.
+- Whether the station kernel should write a bin-friendly order in pulsar mode.
+- Window start or middle (mpifxcorr compatibility against accuracy).
+
+## To investigate in mpifxcorr
+
+- **The phase at the window's start** (`getBins`: offset i x the window length), not its middle:
+  a bias of half a window (1/750 of a 1.5 ms period at 4 µs windows, 1/94 at 32 µs).  A bug?
+- **Lower sideband**: `Configuration` gives the polyco the band edge minus (nchan - 1) channels,
+  so the dispersion offsets ascend with the channel index; if an LSB band's channel 0 is its
+  edge (highest frequency), they are reversed across the band.
+- **Normalisation of binned and gated output**: the weights count samples, so neither a bin's or
+  gate's amplitude nor a weighted scrunch's noise comes out right (a weighted sum Σ w_b V_b has
+  noise ∝ √(Σ w_b² n_b); its weight is Σ over w_b > 0 of w_b n_b).  Work out the normalisation
+  that makes the noise correct, for mpifxcorr and the GPU alike.
+
+## Later
+
+- **Coherent dedispersion** before the channelisation (per station, in the station kernel or
+  before it): removes the within-channel smearing that limits the bins' precision for
+  millisecond pulsars (~1/80 of a 1.5 ms period at DM 30, 1.4 GHz, at best, incoherently).

@@ -22,9 +22,10 @@ its `FINDINGS.md`.
 
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)
 
-- Check mpifxcorr's and gpudifx's binning (bins, per-channel dispersion offsets, output layout).
-- Prototype and compare: a pass per bin, weights in the stage, bin-major accumulators, bins at the station stage.
-- Measure cost against bins (1-128), pulse period and DM, against gpudifx's or mpifxcorr's binned output.
+- Done: mpifxcorr's binning read (docs/mpifxcorr.md); arbitrary breakpoints kept, phase in integer math.
+- Next: binbench: the bins per (window, channel); a naive reference; weights in the XMAC's stage (gate, scrunch, a pass per bin); bins sorted per channel; the output side.
+- Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
+- Later: coherent dedispersion.
 
 ## [two-stage](two-stage/BACKLOG.md)
 
@@ -60,6 +61,9 @@ Things the prototypes point to that belong in difx itself, not here:
   computes them; see `two-stage/docs/analysis.md`.
 - **Select one or two stages** by the channel count per subband and the delay rate
   ([two-stage/FINDINGS.md](two-stage/FINDINGS.md)).
+- **Report the pulsar binning's smearing at startup**: the window length and the within-channel
+  dispersion smearing against the narrowest bin (pulsar-binning/docs/mpifxcorr.md).  The user
+  sets the resolution; DiFX says what it costs.
 - **Decide how the tunable parameters are set** (to decide before the mpifxcorr implementation,
   not now).  Several kernel choices are compile-time today and their best values depend on the
   GPU and the job: fft-fusion's fused kernel is compiled per FFT length (cuFFTDx needs the size at

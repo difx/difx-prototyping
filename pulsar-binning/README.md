@@ -1,6 +1,8 @@
 # pulsar-binning
 
-GPU pulsar gating and binning for gpudifx.  **Not started**: the approaches are in [BACKLOG.md](BACKLOG.md).
+GPU pulsar gating and binning for gpudifx.  mpifxcorr's implementation is read
+([docs/mpifxcorr.md](docs/mpifxcorr.md): arbitrary breakpoints kept); the plan and test cases are
+in [BACKLOG.md](BACKLOG.md).
 
 ## The problem
 
