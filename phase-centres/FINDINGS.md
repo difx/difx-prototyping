@@ -41,6 +41,15 @@ Detail: [docs/mpifxcorr.md](docs/mpifxcorr.md) (how mpifxcorr does it),
   - The staged XMAC no longer zeroes its output when every visibility is stored anyway (5-20%).
   - Ruled out: the shift in the XMAC's epilogue (its atomics alone cost 2-260x the whole shift);
     the XMAC's pieces in one launch (0-1%).  ([results.md](docs/results.md), "The optimisation round")
+- **The A100 after the optimisation round: the tensor shift 1.1-2.1x faster** (1.55x at the
+  default, 1.8x at 1000 centres), less than on the 2070.
+  - 2.4-3.7 Tcmac/s with 100+ centres, 6-9% of the tensor-core rate.  Shift / XMAC ≈ 0.3-0.45 x
+    centres / windows per piece.  100 centres: +45% over the XMAC (was +65%); 1000: 4.1x (was 5.8x).
+  - The gain is mostly storing each output once; the matrix product barely moved (1.08x at 10
+    pieces).  The same 80 registers fit only 3 blocks an SM: 37.5% of the A100's warps (75% on
+    the 2070).  Four blocks (64 registers) is 3-12% slower on the 2070, untested on the A100.
+  - XMAC 4-9% faster, within its 9% run-to-run spread.  ([results.md](docs/results.md), "A100 ...
+    after the optimisation round")
 - **Lower sideband** works through a base frequency per band, as mpifxcorr's rotator.
 - **mpifxcorr's lag-window term, 1 - |Δτ| / (nchan / bw), is right** to 5e-4 in a time-domain
   simulation (`lagwindow.py`).  ([results.md](docs/results.md))

@@ -183,6 +183,62 @@ Each sweep below changes one parameter from that.  The table is in ms per ms of 
 - **32 stations: shift / XMAC 1.5 at work 1.**  The XMAC is more efficient with more stations
   (569 Gcmac/s); the shift is not.
 
+## A100-SXM4-80GB (OzSTAR gina2), after the optimisation round
+
+SLURM job 21370182, commit 7bcfe24, every run passing (`results-local/gina2-centres-20261122-115100`).
+Columns as above, ms per ms of data:
+
+| sweep | value | windows a piece | xmac | delays | naive | simt | tensor | sh/xmac | work | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| centres | 1 | 100 | 0.0228 | 0.0004 | 0.0025 | 0.0084 | 0.0029 | 0.13 | 0.01 | 0.0261 |
+| centres | 10 | 100 | 0.0228 | 0.0005 | 0.0187 | 0.0085 | 0.0031 | 0.13 | 0.10 | 0.0264 |
+| centres | **100** | 100 | 0.0224 | 0.0005 | 0.1858 | 0.0295 | 0.0096 | 0.43 | 1.00 | **0.0325** |
+| centres | 1000 | 100 | 0.0209 | 0.0005 | 1.7302 | 0.2083 | 0.0643 | 3.08 | 10.00 | 0.0857 |
+| pieces | 2 | 50 | 0.0291 | 0.0005 | - | 0.0508 | 0.0161 | 0.55 | 2.00 | 0.0457 |
+| pieces | 4 | 25 | 0.0461 | 0.0007 | - | 0.0996 | 0.0301 | 0.65 | 4.00 | 0.0769 |
+| pieces | 10 | 10 | 0.1018 | 0.0011 | - | 0.2460 | 0.0723 | 0.71 | 10.00 | 0.1753 |
+| avg | 8 | 100 | 0.0209 | 0.0004 | - | 0.0561 | 0.0372 | 1.78 | 1.00 | 0.0585 |
+| avg | 16 | 100 | 0.0208 | 0.0004 | - | 0.0395 | 0.0205 | 0.99 | 1.00 | 0.0418 |
+| avg | 32 | 100 | 0.0209 | 0.0004 | - | 0.0309 | 0.0120 | 0.58 | 1.00 | 0.0333 |
+| avg | 128 | 100 | 0.0209 | 0.0004 | - | 0.0250 | 0.0076 | 0.36 | 1.00 | 0.0289 |
+| avg | 256 | 100 | 0.0208 | 0.0004 | - | 0.0251 | 0.0071 | 0.34 | 1.00 | 0.0284 |
+| nchan | 1024 (avg 8, 800 windows) | 800 | 0.0146 | 0.0004 | - | 0.0073 | 0.0049 | 0.34 | 0.12 | 0.0199 |
+| nchan | 65536 (avg 512, 13 windows) | 13 | 0.0764 | 0.0004 | - | 0.1947 | 0.0485 | 0.63 | 7.69 | 0.1254 |
+| nant | 32 | 100 | 0.1674 | 0.0006 | - | 0.3250 | 0.0943 | 0.56 | 1.00 | 0.2622 |
+
+**Against the A100's first version (below): the tensor shift 1.1-2.1x faster, less than the
+2070's 1.4-3.0x.**
+- Tensor shift: 1.55x at the default shape (0.0149 -> 0.0096 ms per ms), 1.8x at 1000 centres,
+  1.5x at 32 stations, 1.8-2.1x at averages of 8-32 and at 1024 channels, 1.3x at averages of
+  128-256.  1.1-1.2x at 1-10 centres.
+- The gain shrinks as the matrix product's share grows: 1.54x / 1.30x / 1.17x / 1.08x at 1 / 2 /
+  4 / 10 pieces, 1.08x at 65536 channels (13 windows, 512 averaged).  So on the A100 the gain is
+  mostly the per-output work (each output stored once); the matrix product itself barely moved.
+  On the 2070 it gained 1.7-2.0x with 2-10 pieces.
+- It runs at 2.4-3.7 Tcmac/s with 100 or more centres (was 1.5-3.4): 6-9% of the A100's FP16
+  tensor rate (about 39 Tcmac/s), against 23-34% on the 2070.
+- Whole chain at 100 centres: 0.0325 ms per ms, +45% over the XMAC alone (was +65%).  10 centres:
+  +16%.  1000 centres: 4.1x the XMAC (was 5.8x).
+- **Shift / XMAC ≈ 0.3-0.45 x centres / windows per piece** at 10 stations, averages of 64 or more
+  (0.56 at 32 stations); was 0.5-0.65.
+- Against the 2070 after the same round: the tensor shift 2.3-3.1x faster, the XMAC 2.3-4.0x.
+- XMAC: 4-9% faster than the first A100 run in most rows (13% at 256 averaged, 16% at 65536
+  channels), 4% slower at 32 stations.  Its time for the same shape varies by 9% between runs
+  (0.0208-0.0228 here), so only the trend is clear: smaller than the 2070's 5-20%.  (`xmac/run-staged.sh` in the same job is
+  unchanged from the 18 November runs within noise: its small shapes split the windows over
+  chunks, which still zero, and at its large ones the zeroing is a small share of a long XMAC.)
+
+**Why the A100 gains less: occupancy, by registers.**  Built for sm_80 the kernel is the same 80
+registers and 21 KB, so 3 blocks of 256 threads an SM: 24 warps of the A100's 64 (37.5%),
+against 24 of the 2070's 32 (75%).  Shared memory would allow 7 blocks; registers allow 3.
+- Four blocks (`__launch_bounds__(256, 4)`) compiles to 64 registers with a 32-byte spill (sm_75
+  and sm_80).  On the 2070 that is 3-12% slower (default 899 -> 842 Gcmac/s, 1000 centres
+  1159 -> 1125, 8 averaged 218 -> 192), as three blocks there already fill 75%.  On the A100 it
+  would be 50%: untested.  Five blocks spills 164 bytes.
+- The A100 also has 16x the tensor rate of its FP32 cores (the 2070 about 4x), so the kernel's
+  FP32 work (phasors, conversion to FP16, the outer phasor: about a quarter of the instructions
+  on the 2070) weighs more there.  Not profiled on the A100.
+
 ## A100-SXM4-80GB (OzSTAR gina3), the first version
 
 SLURM job 21341101, commit 7fc7d05 (the same kernels as the 2070 run), every run passing

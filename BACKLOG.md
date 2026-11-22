@@ -14,7 +14,8 @@ its `FINDINGS.md`.
 - Done: the A100 sweep (shift / XMAC ≈ 0.5-0.65 x centres / windows per piece).
 - Done: the optimisation round on the 2070 (shift 2-3x at 100+ centres, XMAC zeroing skipped); lower sideband; lag-window term checked.
 - Dropped: the XMAC's pieces in one launch (0-1%); the shift in the XMAC's epilogue (atomics 2-260x the shift).
-- Next: the A100 after the optimisation round.
+- Done: the A100 after the optimisation round (shift 1.1-2.1x; +45% over the XMAC at 100 centres).
+- Next (optional): the A100's occupancy (3 blocks an SM by registers: 24 of 64 warps).
 - Later: pieces in multiples of 16 windows (only for very short pieces); a NUFFT shift for centres ≫ channels averaged.
 
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)
@@ -57,3 +58,19 @@ Things the prototypes point to that belong in difx itself, not here:
   computes them; see `two-stage/docs/analysis.md`.
 - **Select one or two stages** by the channel count per subband and the delay rate
   ([two-stage/FINDINGS.md](two-stage/FINDINGS.md)).
+- **Decide how the tunable parameters are set** (to decide before the mpifxcorr implementation,
+  not now).  Several kernel choices are compile-time today and their best values depend on the
+  GPU and the job: fft-fusion's fused kernel is compiled per FFT length (cuFFTDx needs the size at
+  compile time, and the build is slow); the XMAC's tile and super-block sizes; the phase-centre
+  shift's centres per block and blocks per SM (2070 and A100 may differ); one stage or two.  The
+  options:
+  - *At run time*: compile the kernels when the job starts (NVRTC, with cuFFTDx's headers),
+    cached per GPU and shape.  Fully flexible; a JIT toolchain at every site, and a first-run delay.
+  - *At install time*: the user (or a benchmark suite run at install-difx time) picks the values
+    for the site's GPU, written to a tuning file.  Simple at run time; re-tune when the GPU changes.
+  - *Several builds, chosen per job*: compile a set of variants (FFT lengths, tile sizes, per GPU
+    architecture) and select one from the job's inputs (channels, stations, centres, averaging) by
+    heuristics.  No JIT; bigger binaries and builds, and the heuristics need measurements behind
+    them (as the sweeps here provide).
+  Mixing them is possible (e.g. variants built, with an install-time benchmark tuning the
+  heuristics' thresholds).

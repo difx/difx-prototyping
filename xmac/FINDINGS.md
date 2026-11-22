@@ -46,6 +46,9 @@ different band layouts).  Hardware eras: [../README.md](../README.md#benchmark-h
 
 - **The staged XMAC no longer zeroes its output when it need not**: unsplit (one chunk of windows a
   block) each block stores its sums, and with a complete map every visibility is written.
-  5-20% off the XMAC in phasecentrebench (more with short pieces, 32 stations, 13 windows a subint).
+  5-20% off the XMAC in phasecentrebench (more with short pieces, 32 stations, 13 windows a subint)
+  on the 2070; on the A100 4-9% (16% at 13 windows), within its 9% run-to-run spread.
+  `run-staged.sh`'s times are unchanged within noise: its small shapes split the windows over
+  chunks (which still zero), and at its large ones the zeroing is a small share of a long XMAC.
   ([../phase-centres/docs/results.md](../phase-centres/docs/results.md), "The optimisation round")
 
