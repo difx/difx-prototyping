@@ -55,9 +55,9 @@ to keep arbitrary breakpoints.
   bin: on sm_80 a cp.async of precomputed FP16 weights straight into shared memory, laid out
   [frequency][16-window block][channel][16] by the bins kernel, no register and no lookup; the list
   as a plain run of window blocks where a block has nothing to skip); the addresses as explicit
-  per-lane offsets (2 for A, 2 for B) that the compiler keeps.  The flags (`block_flags`): net 0.3-1.9%
-  worse on the A100 as a kernel of their own (0.011 ms); fold them into the bins kernel's per-bin
-  counting pass or drop them.
+  per-lane offsets (2 for A, 2 for B) that the compiler keeps.  (The flags as a kernel of their own,
+  `block_flags`, were net 0.3-1.9% worse on the A100 and are removed.)  Against the whole chain the
+  weighted kernel's rest is a few percent (FINDINGS.md): not worth much more code.
 - **The per-bin weights' correction** on the tensor cores, if heavily flagged data matter (0.26 ms at
   1161 flagged windows, 128 bins, 10 stations; it grows with flagged windows x bins x baselines).
 - **The millisecond pulsar at fewer channels, from window-major spectra** (kept: window-major; 128

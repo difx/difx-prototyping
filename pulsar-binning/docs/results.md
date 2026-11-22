@@ -468,7 +468,8 @@ kernel on the all-ones 500 ms gate, with the flags and classifying itself, again
 weighted XMAC is 1.5-2.8% of the XMAC faster than classifying itself (the 1.5 ms gate at 128
 channels 0.654x against 0.673x; the 500 ms gate 1.202x against 1.224x), but the flags kernel costs
 0.011-0.012 ms, 3% of the A100's 0.32-0.40 ms XMAC, so the net is 0.3-1.9% worse.  Worth it only
-folded into a kernel that runs anyway.
+folded into a kernel that runs anyway.  Removed since (the flags kernel, `XmacWeights::blockFlags`,
+the `stage-self` variant): the XMAC classifies its windows itself, as before.
 
 **Nsight Compute** (`results-local/ncu-gina5-20261122-174412`, the pb-* cases: 10 stations, 128
 channels, one launch each; ncu holds the clock at 1.27 GHz):

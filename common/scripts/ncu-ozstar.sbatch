@@ -210,14 +210,11 @@ profilep pc-default-auto       shift_tile --only tensor
 
 # binbench's weighted staged XMAC (pulsar gating / scrunched binning, 10 stations: KS 2, 8 channels a
 # block) against the plain one, 128 channels: the 500 ms gate (every block on-pulse, weights all 1:
-# no multiplies), with the block flags made with the bins and with each block classifying its own
-# windows (binbench runs the plain XMAC, then stage, then stage-self: the second weighted launch);
-# and 16 bins scrunched at 1.5 ms (weights other than 0 and 1: the multiplies)
+# no multiplies); and 16 bins scrunched at 1.5 ms (weights other than 0 and 1: the multiplies)
 B500=(--period-ms 500 --nchan 128 --bins gate --only stage)
 profileb pb-plain-c128         0 'xmac_staged_kernel<.int.2, .int.8, .int.0>' "${B500[@]}"
-profileb pb-gate500-flags-c128 0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' "${B500[@]}"
-profileb pb-gate500-self-c128  1 'xmac_staged_kernel<.int.2, .int.8, .int.1>' "${B500[@]}"
-profileb pb-16s-1.5ms-flags-c128 0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' --period-ms 1.5 --nchan 128 --bins 16 --scrunch --only stage
+profileb pb-gate500-c128       0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' "${B500[@]}"
+profileb pb-16s-1.5ms-c128     0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' --period-ms 1.5 --nchan 128 --bins 16 --scrunch --only stage
 
 packs=()
 for o in "${outs[@]}"; do

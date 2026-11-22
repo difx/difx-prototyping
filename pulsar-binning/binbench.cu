@@ -392,31 +392,6 @@ __global__ void bins_wt(int WB, int nwin, int nfreq, int nchan, int nbins, const
     for (int i = threadIdx.x; i < nfb; i += blockDim.x)
         if (hs[i]) atomicAdd(&st[1 + i], hs[i]);
 }
-// each 16-window block's flags per (frequency, 4-channel quad), for the weighted XMAC (W.blockFlags):
-// bit 0 some weight non-zero, bit 1 some weight not 1.  A thread a (frequency, block, quad), quads
-// fastest: 16 4-byte loads of the bins
-__global__ void block_flags(int nwin, int nfreq, int nchan, int nbins, const uint8_t* __restrict__ bins,
-                            const float* __restrict__ binw, uint8_t* flags) {
-    __shared__ float w[MAXBINS];
-    for (int i = threadIdx.x; i < nbins; i += blockDim.x) w[i] = binw[i];
-    __syncthreads();
-    const int nq = nchan / 4, ntb = (nwin + 15) / 16;
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nfreq * ntb * nq) return;
-    const int q = i % nq, tb = (i / nq) % ntb, f = i / (nq * ntb);
-    unsigned fl = 0;
-    for (int e = 0; e < 16; e++) {
-        const int win = tb * 16 + e;
-        if (win >= nwin) break;
-        const unsigned b4 = __ldg(reinterpret_cast<const unsigned*>(bins + ((size_t)win * nfreq + f) * nchan + 4 * q));
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            const float v = w[(b4 >> (8 * k)) & 255];
-            fl |= (v != 0.f ? 1u : 0u) | (v != 1.f ? 2u : 0u);
-        }
-    }
-    flags[i] = (uint8_t)fl;
-}
 __device__ inline float wtG(const XmacShape& s, const int2* bls, const float* dw, int f, int q, int w) {   // 1 - w1 w2
     const int bl = q / 4, p = q % 4, pol1 = p == 1 || p == 3, pol2 = p == 1 || p == 2;
     return 1.f - dw[((size_t)bls[bl].x * s.nband() + 2 * f + pol1) * s.nwin + w] *
@@ -806,17 +781,10 @@ int main(int argc, char** argv) {
         bins_kernel<<<sms * 8, 256, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, dEnds, dWinPhase, dDmOff, dBins);
         CHECK_CUDA(cudaGetLastError());
     };
-    const int nBlockFlags = u.nfreq * ((u.nwin + 15) / 16) * (u.nchan / 4);
-    uint8_t* dBlockFlags = devAlloc<uint8_t>(nBlockFlags);
-    auto runFlags = [&] {
-        block_flags<<<(nBlockFlags + 255) / 256, 256, 0, st>>>(u.nwin, u.nfreq, u.nchan, u.nbins, dBins, dWts, dBlockFlags);
-    };
     auto runBins = [&] {                           // the bins, each bin's count, the flagged windows' histograms
-                                                   // (and, scrunched, the weighted XMAC's block flags)
         CHECK_CUDA(cudaMemsetAsync(dWtSt, 0, (1 + (size_t)u.nfreq * u.nbins) * sizeof(int), st));
         bins_wt<<<(u.nwin + binsWB - 1) / binsWB, 256, binsWtSmem, st>>>(binsWB, u.nwin, u.nfreq, u.nchan, u.nbins, dEnds,
             dWinPhase, dDmOff, dBins, u.nant * s.nband(), dDw, u.scrunch ? dWts : nullptr, dWtSt, dFlag, dHistF);
-        if (u.scrunch) runFlags();               // the weighted XMAC's block flags
         CHECK_CUDA(cudaGetLastError());
     };
     auto runWeights = [&] {                        // after runBins: the per-bin weights (and, scrunched, their weighted sum)
@@ -849,11 +817,6 @@ int main(int argc, char** argv) {
         else bin_naive<false><<<sms * 16, 256, 0, st>>>(s, dBls, spec, dBins, dWts, out, avg);
         CHECK_CUDA(cudaGetLastError()); }});
     if (runStage) variants.push_back({"stage", "stage (the staged XMAC, weighted in its stage)", [&] {
-        XmacWeights w;
-        w.bins = dBins; w.weights = dWts; w.nbins = u.nbins; w.skip = !noskip; w.negative = anyNeg;
-        w.avg = avg; w.accumulate = accumulate; w.blockFlags = dBlockFlags;
-        xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)out, w, sms, st); }});
-    if (runStage) variants.push_back({"stage-self", "stage, each XMAC block classifying its windows itself", [&] {
         XmacWeights w;
         w.bins = dBins; w.weights = dWts; w.nbins = u.nbins; w.skip = !noskip; w.negative = anyNeg;
         w.avg = avg; w.accumulate = accumulate;
@@ -1160,7 +1123,6 @@ int main(int argc, char** argv) {
     line("weights-old", "per-bin weights from them (six kernels)", timeIt(runWeightsOld, warmup, reps, st));
     line("bins", "bins, with the counts and flagged windows' histograms", timeIt(runBins, warmup, reps, st));
     line("weights", "per-bin weights after them (one kernel)", timeIt(runWeights, warmup, reps, st));
-    if (u.scrunch) line("flags", "  of the bins: the weighted XMAC's block flags", timeIt(runFlags, warmup, reps, st));
     for (auto& v : variants) {
         const Timing t = timeIt(v.run, warmup, reps, st);
         line(v.key, "binned: " + v.name, t);
