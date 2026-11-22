@@ -552,3 +552,27 @@ So the gate and scrunched bins cost the chain at most 11%, and 16 separate bins 
 pulsar 1.7-1.8x, 2.09x at 128 channels and DM 300; 128 separate bins 3.4-5.1x.  32 even bins added
 to `run-bins.sh` (the 2070: 4.25x the XMAC gathered from channel-major spectra, 10.4x from
 window-major at 128 channels, DM 300).
+
+### 32 bins on the A100 (OzSTAR gina17, commit 0a66110)
+
+`run-bins.sh` (`results-local/gina17-bins-20261122-215341`, every run passing; still with the
+`stage-self` column, removed since: within 0.01 ms of `stage`, as before).  The other cases repeat
+job 21376972 to within a few %.  The binned XMAC with the bins and weights (r, against the unbinned
+XMAC) and the whole chain against the unbinned chain, (S/X + r) / (S/X + 1) with S/X 3.19 / 3.24:
+
+| P, DM | channels | 16 separate, r / chain | 32 separate, window-major | 32, channel-major gather (no transpose) |
+|---|---|---|---|---|
+| 1.5 ms, 30 | 128 | 4.16 / 1.75x | 5.21 / 2.00x | 4.02 / 1.72x |
+| 1.5 ms, 300 | 128 | 5.60 / 2.10x | 9.21 / 2.96x | 4.05 / 1.73x |
+| 1.5 ms, 30 | 1024 | 4.03 / 1.72x | 5.54 / 2.07x | 6.83 / 2.38x |
+| 1.5 ms, 300 | 1024 | 4.63 / 1.86x | 9.26 / 2.95x | 6.84 / 2.38x |
+| 500 ms, 30 / 1000 | 128 | 3.63 / 3.75: 1.63x / 1.66x | 3.83 / 7.19: 1.68x / 2.48x | 3.41 / 3.67: 1.57x / 1.64x |
+| 500 ms, 30 / 1000 | 1024 | 3.25 / 2.47: 1.53x / 1.35x | 2.72 / 3.16: 1.41x / 1.51x | 2.71 / 2.76: 1.40x / 1.41x |
+
+So 32 separate bins of the millisecond pulsar are at the 2x target at DM 30 (2.00-2.07x) and miss
+it at DM 300 (2.95x): gathering from window-major spectra, where at high DM each channel of a block's
+8 has its own slot list, so each slot is a 4-byte load of its own (the 4-channel gathers would not
+help: at DM 300 a quad's channels mostly do not share a window).  From channel-major spectra the
+gather is 4.0x at 128 channels (1.73x the chain, before a transpose of about the XMAC's time) but
+6.8x at 1024 channels (2.38x) whatever the DM: 1024 channels' 32 bins (47 us each, 1.5 windows) cost
+more than the layout explains.

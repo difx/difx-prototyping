@@ -82,5 +82,9 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   stations on the A100): the gate and scrunched bins cost the chain 0.91-1.11x; 16 separate bins of a
   millisecond pulsar 1.7-1.8x (2.09x at 128 channels, DM 300); 128 separate bins 3.4-5.1x.
   ([docs/results.md](docs/results.md), "The binning against the whole chain")
+- **32 separate bins** (gina17): the millisecond pulsar 2.00-2.07x the chain at DM 30, 2.95x at DM
+  300 (window-major spectra: each channel its own slot list, a 4-byte load a slot); the 500 ms
+  pulsar 1.41-1.68x (2.48x at 128 channels, DM 1000).  Channel-major spectra would give 1.73x at 128
+  channels (before a transpose) but 2.38x at 1024.  ([docs/results.md](docs/results.md), "32 bins on the A100")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).
