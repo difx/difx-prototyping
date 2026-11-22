@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G                 # the build: up to ~4 GB per ptxas (N=8192 and up), eight at once
 #SBATCH --tmp=8G                  # job-local disk ($JOBFS) for nvcc's intermediate files
-#SBATCH --time=1:30:00            # estimate: build ~25 min on a gina node (5 min on a desktop), the default scripts ~20 min
+#SBATCH --time=1:30:00            # estimate: build ~6 min on a gina node (370 s, job 21387208), the default scripts ~20 min
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<partition>
 #
@@ -40,7 +40,7 @@
 #     sbatch --export=ALL,MATHDX=<MathDx dir> ...           # a MathDx you already have
 #     sbatch --export=ALL,EXTRA="--reps 50" ...             # extra options for every script
 #     sbatch --export=ALL,TARGETS="xmacbench" ...           # build only these (default: all; fusebench
-#                                                           # is the ~25 min part)
+#                                                           # is most of it)
 #     sbatch --export=ALL,SCRIPTS="xmac/run-xmac.sh xmac/run-staged.sh" ...   # only some scripts
 #     SCRIPTS=fft-fusion/run-wide.sh      the wider shapes (bits, bands)
 #     SCRIPTS=fft-fusion/run-matrix.sh    the big matrix (bits x subbands x channels x stations, 108

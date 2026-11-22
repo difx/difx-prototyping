@@ -36,6 +36,7 @@ its `FINDINGS.md`.
 - Done: the binning against the whole chain (A100 station stage 3.2x the XMAC): gate and scrunched 0.91-1.11x the chain, 16 separate MSP bins 1.7-2.1x.
 - Done: 32 separate bins on the A100: 2.0-2.07x the chain at DM 30, 2.95x at DM 300 (millisecond pulsar).
 - Done: why 32 bins at high DM cost more (Nsight Compute: DRAM re-reads, a sector's channels in different bins); segments in time order tried, slower, reverted.
+- Done: the station kernel writing bin order (A100: 32 bins at DM 300 2.50x the chain at 128 channels, 4.14x at 1024, against 2.94x; removed).
 - Next: wrap up: the weighted kernel left as it is (within the 2x target); one sorted approach (gather from window-major).
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.

@@ -260,51 +260,6 @@ struct CsvOut {
 };
 static CsvOut csv;
 
-// --bin-order: each (window, frequency, channel)'s slot for a pulsar of period P (s) and DM in
-// nbins even bins, as pulsar-binning's binbench sorts them (sort_layout: per channel by bin, the
-// windows in order; channel groups of 8, each bin padded to 16 x the most windows any of the group's
-// channels has in it).  Bands from 1400 MHz up (USB), the pulse mid-subint.  Returns the slots a
-// channel (cap); dest is [win][freq][nchan].
-static int binOrderTable(const XmacShape& s, double bwMHz, double P, double dm, int nbins, std::vector<int>& dest) {
-    const double flo = 1400.0, fref = flo + s.nfreq * bwMHz / 2, twin = s.nchan / (bwMHz * 1e6), K = 1.0 / 0.000241;
-    const double phase0 = 0.5 - s.nwin * twin / (2 * P);
-    const int CH = 8;
-    dest.assign((size_t)s.nwin * s.nfreq * s.nchan, 0);
-    std::vector<int> bin((size_t)CH * s.nwin), cnt((size_t)CH * nbins), next(nbins);
-    int cap = 0;
-    for (int f = 0; f < s.nfreq; f++)
-        for (int g = 0; g < s.nchan; g += CH) {
-            const int nc = std::min(CH, s.nchan - g);
-            std::fill(cnt.begin(), cnt.end(), 0);
-            for (int c = 0; c < nc; c++) {
-                const double nu = flo + f * bwMHz + (g + c) * bwMHz / s.nchan;
-                const double d = (-dm * K / (nu * nu) + dm * K / (fref * fref)) / P;
-                for (int w = 0; w < s.nwin; w++) {
-                    double ph = phase0 + w * twin / P + d;
-                    ph -= std::floor(ph);
-                    const int b = std::min(nbins - 1, (int)(ph * nbins));
-                    bin[(size_t)c * s.nwin + w] = b;
-                    cnt[(size_t)c * nbins + b]++;
-                }
-            }
-            int pos = 0;
-            std::vector<int> start(nbins);
-            for (int b = 0; b < nbins; b++) {
-                int mx = 0;
-                for (int c = 0; c < nc; c++) mx = std::max(mx, cnt[(size_t)c * nbins + b]);
-                start[b] = pos;
-                pos += 16 * ((mx + 15) / 16);
-            }
-            cap = std::max(cap, pos);
-            for (int c = 0; c < nc; c++) {
-                next = start;
-                for (int w = 0; w < s.nwin; w++)
-                    dest[((size_t)w * s.nfreq + f) * s.nchan + g + c] = next[bin[(size_t)c * s.nwin + w]]++;
-            }
-        }
-    return cap;
-}
-
 // --xmac's check: the FP16 spectra as FP32, for gpudifx's XMAC
 __global__ void half_to_float(const __half2* h, float2* f, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
@@ -367,9 +322,6 @@ static void usage() {
 "                  after the station processing: gpudifx's XMAC from the FP32 spectra, and the staged\n"
 "                  tensor-core one from the end-to-end kernel's FP16 spectra; checked against each\n"
 "                  other, timed alone and each with the station processing\n"
-"  --bin-order P,DM,NBINS  with --xmac: also the end-to-end kernel writing its FP16 spectra in\n"
-"                  pulsar-binning's bin order (each value to its slot through a table: a pulsar of\n"
-"                  period P ms and dispersion measure DM in NBINS even bins), checked and timed\n"
 "  --chunk W       packed input: also run the end-to-end kernel and the 2-kernel pipelines W\n"
 "                  windows at a time, each antenna on its own stream (the antennas run together),\n"
 "                  each antenna's part of the 2-kernel buffer reused for every chunk, so that\n"
@@ -397,8 +349,6 @@ int main(int argc, char** argv) {
     Rotator rotator = Rotator::FIXED;
     int fpb = 0, ept = 0, regcap = 0, chunk = 0, reps = 20, warmup = 3, ncheck = 16, device = 0;
     bool sweepEpt = false, sweepRegcap = false, xmac = false;
-    double binP = 0, binDM = 0;
-    int binN = 0;
     unsigned long long seed = 1;
     std::string csvPath;
     for (int i = 1; i < argc; i++) {
@@ -445,14 +395,6 @@ int main(int argc, char** argv) {
         else if (a == "--batched") batched = true;
         else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--xmac") xmac = true;
-        else if (a == "--bin-order") {
-            const std::string m = next();
-            if (sscanf(m.c_str(), "%lf,%lf,%d", &binP, &binDM, &binN) != 3 || binP <= 0 || binN < 2) {
-                fprintf(stderr, "--bin-order P,DM,NBINS\n");
-                return 2;
-            }
-            binP *= 1e-3;
-        }
         else if (a == "--csv") csvPath = next();
         else if (a == "--invalid") invalidFrac = std::stod(next());
         else if (a == "--reps") reps = std::stoi(next());
@@ -831,7 +773,7 @@ int main(int argc, char** argv) {
     // outFused holds the end-to-end kernel's FP32 spectra here (the 2-kernel checks below reuse it).
     const XmacShape xs{g.nant, g.nband / 2, g.nchan, g.nwin, g.fftchannels};
     __half2* hHalf = nullptr;
-    HalfOut hout{}, houtBin{};
+    HalfOut hout{};
     cuFloatComplex *visA = nullptr, *visB = nullptr;
     XmacGpudifx gx;
     const FusedVariant* halfCheck = nullptr;
@@ -900,39 +842,6 @@ int main(int argc, char** argv) {
         // against gpudifx's XMAC from the FP32 spectra: FP16 rounding of the spectra
         gx.run(visB, st);
         visDiff("XMAC staged tensor (FP16, scaled) vs gpudifx's XMAC (FP32)", 1.0 / ((double)hout.scale * hout.scale), 1e-3);
-
-        // --bin-order: the same kernel writing through the slot table; every value where the table says
-        if (binN > 0) {
-            std::vector<int> dest;
-            const int cap = binOrderTable(xs, bw, binP, binDM, binN, dest);
-            const size_t nBin = (size_t)xs.nant * xs.nband() * xs.nchan * cap;
-            printf("bin order: %g ms, DM %g, %d bins: %d slots a channel for %d windows (+%.0f%% padding), %.2f GiB\n",
-                   binP * 1e3, binDM, binN, cap, xs.nwin, 100.0 * (cap - xs.nwin) / xs.nwin, nBin * 4.0 * gib);
-            houtBin = hout;
-            houtBin.h = devAlloc<__half2>(nBin);
-            houtBin.dest = devCopy(dest);
-            houtBin.cap = cap;
-            std::swap(hout, houtBin);
-            runHalfStation(*halfCheck);
-            std::swap(hout, houtBin);
-            CHECK_CUDA(cudaStreamSynchronize(st));
-            std::vector<uint32_t> a(xs.halfCount()), b(nBin);
-            CHECK_CUDA(cudaMemcpy(a.data(), hHalf, a.size() * 4, cudaMemcpyDeviceToHost));
-            CHECK_CUDA(cudaMemcpy(b.data(), houtBin.h, b.size() * 4, cudaMemcpyDeviceToHost));
-            size_t bad = 0;
-            for (int ant = 0; ant < xs.nant; ant++)
-                for (int w = 0; w < xs.nwin; w++)
-                    for (int band = 0; band < xs.nband(); band++)
-                        for (int c = 0; c < xs.nchan; c++) {
-                            const size_t j = ((size_t)(ant * xs.nband() + band) * xs.nchan + c) * cap +
-                                             dest[((size_t)w * xs.nfreq + band / 2) * xs.nchan + c];
-                            bad += a[xs.halfIndex(ant, w, band, c)] != b[j];
-                        }
-            const bool ok = bad == 0;
-            pass &= ok;
-            printf("check: bin order vs the usual order: %zu of %zu values differ  %s\n", bad, a.size(), ok ? "OK" : "FAIL");
-            csv.check("FP16 spectra in bin order vs the usual order", (double)bad, (double)bad, 0.5, ok);
-        }
     }
 
     // ---- packed input: the two-kernel pipeline (decode + fringe -> buffer -> fused FFT) ----
@@ -1168,15 +1077,6 @@ int main(int argc, char** argv) {
         printf("  (the combined lines below: FP32 spectra from %u FFT/block, %u/thr%s; FP16 spectra from %u FFT/block, "
                "%u/thr)\n", bestFused->fpb, bestFused->ept, bestFused->regcap ? " (capped)" : "", bestHalf->fpb,
                bestHalf->ept);
-        if (binN > 0) {
-            std::swap(hout, houtBin);
-            line("end-to-end -> FP16 spectra in bin order", timeIt([&] { runHalfStation(*bestHalf); }, warmup, reps, st),
-                 tU.median);
-            line("  the bin-order buffer zeroed (an upper bound for its padding)", timeIt([&] {
-                CHECK_CUDA(cudaMemsetAsync(hout.h, 0, (size_t)xs.nant * xs.nband() * xs.nchan * hout.cap * 4, st)); },
-                warmup, reps, st), 0);
-            std::swap(hout, houtBin);
-        }
         line("XMAC: gpudifx (FP32 spectra)", timeIt([&] { gx.run(visA, st); }, warmup, reps, st), 0);
         line("XMAC: staged tensor (FP16 spectra)", timeIt([&] { xmacTensorStaged(xs, hHalf, visA, sms, st); }, warmup,
                                                           reps, st), 0);

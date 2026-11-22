@@ -90,7 +90,11 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   sector holds a window's 8 channels, which at high DM fall in different bins; each XMAC block covers
   one bin, so each sector is read from DRAM once for each bin it feeds (window-major at DM 300: 3.9 GB
   for 0.39 GB of spectra).  Running the blocks in time order to share the sectors in L2 was slower on
-  both GPUs.  Only a layout where a sector feeds one bin (the station kernel writing channel-major or
-  slot order) would fix it; not pursued.
+  both GPUs.
+- **The station kernel writing bin order** (tried, removed): the scattered store costs it +1.5 ms at
+  128 channels and +3.7 at 1024 on the A100 (+3.0 and +25 on the 2070), so 32 bins at DM 300 cost the
+  chain 2.50x at 128 channels and 4.14x at 1024, against 2.94x gathering from window-major.  Not
+  worth coupling the station kernel to the binning: the window-major gather is the one way.
+  ([docs/results.md](docs/results.md), "The station kernel writing bin order")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

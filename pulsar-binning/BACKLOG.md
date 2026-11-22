@@ -47,8 +47,9 @@ to keep arbitrary breakpoints.
   no more tuning of the weighted kernel (the ideas below add complexity for a few % of the chain);
   16 separate bins 1.7-2.1x; 32 separate bins 2.0-2.07x at DM 30, 2.95x at DM 300 (window-major).
   At high DM the cost is DRAM re-reads (a sector's channels in different bins, a block a bin;
-  Nsight Compute, docs/results.md); segments in time order did not help.  If 32+ separate bins at
-  high DM matter: the station kernel writing channel-major (1.73x at 128 channels) or slot order.
+  Nsight Compute, docs/results.md); segments in time order did not help, nor the station kernel
+  writing bin order (2.50x at 128 channels, 4.14x at 1024; removed).  Accepted: 32 separate bins at
+  high DM about 3x the chain.
 - **The weighted kernel's rest** (the A100: 1.13-1.32x the XMAC with nothing to skip; Nsight
   Compute, docs/results.md, "The A100: the classification, and where ..."): 28% more instructions
   than the plain kernel at the same issue rate.  Register pressure (the ldmatrix addresses re-derived

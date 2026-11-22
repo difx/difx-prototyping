@@ -638,8 +638,21 @@ never-taken branch costs the usual store 3% (3.41 against 3.30 ms at 128 channel
 scattered store costs 3.0 ms at 128 channels and 25 ms at 1024: a window's consecutive channels go to
 addresses a channel's slots apart, a 4-byte store to a sector each; at 128 channels a bin's
 consecutive windows fill a sector's other slots soon after, at 1024 (a bin 1.5 windows a period)
-they do not.  On the A100 (40 MB of L2) the stores may merge better: the test.  The A100's XMAC over
-the slots is 0.467 ms at 128 channels (1.45x the XMAC) and 1.488 at 1024 (4.0x, its 28% padding and
-the output), with the sort 0.33 / 0.18 ms (job of gina17); the chain is within 2x at 128 channels if
-the bin-order store costs the station kernel under about 0.8 ms more, and at 1024 channels under
-about 0.25 ms.
+they do not.
+
+**The A100** (OzSTAR gina13, job 21387208, commit a5a6d4e,
+`results-local/gina13-station-20261123-085245`, every check passing): the station kernel 1.038 ms
+at 128 channels and 1.228 at 1024 (the never-taken branch about 1.5%), in bin order 2.549 and 4.927
+(+1.51 and +3.70 ms; within 2x of the chain needed under about +0.8 and +0.25).  With the XMAC over
+the slots (0.467 / 1.488 ms), the sort (0.33 / 0.18) and the bins and weights (gina17):
+
+| A100, 32 bins, 1.5 ms, DM 300 | window-major gather | bin order |
+|---|---|---|
+| 128 channels | 2.94x the unbinned chain | 2.50x (2.61x with the whole buffer zeroed) |
+| 1024 channels | 2.94x | 4.14x |
+
+Bin order is ahead only at 128 channels and misses 2x there too; it couples the station kernel to
+the binning (the sort before it, the output's layout and size by mode) and costs the usual store
+1.5-3% unless a compile-time variant.  Removed (the store, fusebench `--bin-order`, the
+`run-station.sh` column; in git history at a5a6d4e): the window-major gather is the one way, working
+everywhere.
