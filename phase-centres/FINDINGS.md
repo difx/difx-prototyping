@@ -47,8 +47,15 @@ Detail: [docs/mpifxcorr.md](docs/mpifxcorr.md) (how mpifxcorr does it),
     centres / windows per piece.  100 centres: +45% over the XMAC (was +65%); 1000: 4.1x (was 5.8x).
   - The gain is mostly storing each output once; the matrix product barely moved (1.08x at 10
     pieces).  The same 80 registers fit only 3 blocks an SM: 37.5% of the A100's warps (75% on
-    the 2070).  Four blocks (64 registers) is 3-12% slower on the 2070, where shared memory still
-    allows only 3; untested on the A100.
+    the 2070).
+  - Nsight Compute on the A100 (job 21370872): the tensor pipe is busy 9-10% of the time, the
+    FMA and ALU pipes 45-55%: the shift is bound by its non-tensor instructions (outer phasor
+    20%, the fine visibilities' loads 18%, per-piece setup 16%, inner phasors 13%, final store
+    13%, WMMA 11%).  Four blocks an SM (`--blocks 4`, 64 registers) is 6-8% faster there (3-12%
+    slower on the 2070, where shared memory allows only 3).  ([results.md](docs/results.md),
+    "A100 Nsight Compute")
+  - Shifts instead of a run-time division in the loads' index, and a stepped index in the final
+    store: 2.7-7% on the 2070; the A100 not yet measured.
   - XMAC 4-9% faster, within its 9% run-to-run spread.  ([results.md](docs/results.md), "A100 ...
     after the optimisation round")
 - **Lower sideband** works through a base frequency per band, as mpifxcorr's rotator.

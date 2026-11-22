@@ -228,19 +228,63 @@ Columns as above, ms per ms of data:
   unchanged from the 18 November runs within noise: its small shapes split the windows over
   chunks, which still zero, and at its large ones the zeroing is a small share of a long XMAC.)
 
-**Why the A100 gains less: occupancy, by registers.**  Built for sm_80 the kernel is the same 80
-registers and 21 KB, so 3 blocks of 256 threads an SM: 24 warps of the A100's 64 (37.5%),
-against 24 of the 2070's 32 (75%).  Shared memory would allow 7 blocks; registers allow 3.
-- Four blocks (`--blocks 4`: `__launch_bounds__(256, 4)`) compiles to 64 registers with a 32-byte
-  spill (sm_75 and sm_80).  On the 2070 that is 3-12% slower (default 899 -> 842 Gcmac/s, 1000
-  centres 1159 -> 1125, 8 averaged 218 -> 192): shared memory (64 KB an SM on Turing) still
-  allows only 3 blocks there (ncu: occupancy limit 3 by shared memory, 4 by registers; 73%
-  achieved either way), so it is the registers' cost without the occupancy.  On the A100 it would
-  be 32 of 64 warps: to be measured (`common/scripts/ncu-ozstar.sbatch`, the pc-* cases).  Five
-  blocks spills 164 bytes.
-- The A100 also has 16x the tensor rate of its FP32 cores (the 2070 about 4x), so the kernel's
-  FP32 work (phasors, conversion to FP16, the outer phasor: about a quarter of the instructions
-  on the 2070) weighs more there.  Not profiled on the A100.
+**Why the A100 gains less: instruction issue, not the tensor cores.**  Built for sm_80 the kernel
+is the same 80 registers and 21 KB, so 3 blocks of 256 threads an SM: 24 warps of the A100's 64
+(37.5%), against 24 of the 2070's 32 (75%).  Nsight Compute on the A100 (below) shows the tensor
+pipe busy only 9-10% of the time while the FP32/integer pipes are at 45-55%: the kernel is bound by
+its non-tensor instructions, and the A100 has 16x the tensor rate of its FP32 cores (the 2070
+about 4x).
+
+## A100 Nsight Compute: 3 and 4 blocks an SM (2026-11-22)
+
+SLURM job 21370872 (gina5), commit e5acd5b, `common/scripts/ncu-ozstar.sbatch` with `CASES='^pc'`:
+the tensor shift at 3 blocks an SM (80 registers) and 4 (`--blocks 4`: 64 registers, a 32-byte
+spill), at four shapes, each profiled (`--set full`, ncu's base clock) and timed without the
+profiler on the same node (`results-local/ncu-gina5-20261122-122043`, every timing run passing).
+
+| shape | 3 blocks, ms | 4 blocks, ms | gain | achieved occupancy (3 -> 4) |
+|---|---|---|---|---|
+| default (100 centres, 64 averaged) | 0.251 | 0.231 | 8% | 36% -> 48% |
+| 1000 centres | 1.640 | 1.547 | 6% | 37% -> 49% |
+| 10 pieces | 2.017 | 1.875 | 7% | 37% -> 49% |
+| 8 averaged | 0.949 | 0.892 | 6% | 36% -> 48% |
+
+- **Four blocks: 6-8% faster on the A100** (3-12% slower on the 2070, where shared memory, 64 KB
+  an SM, allows only 3 blocks anyway: ncu there gives limit 3 by shared memory, 4 by registers,
+  73% achieved either way).  On the A100 shared memory limits it to 4 blocks too (the carveout ncu
+  reports), so 5 would need less shared memory as well as 48 registers (164 bytes of spill).
+- **The pipes** (default, 3 / 4 blocks): issue slots 60% busy at 3 blocks, 2.4 instructions a
+  cycle; FMA pipe 46 / 50%, ALU 42 / 46%, XU (sincos) 24 / 26%, LSU 20%, tensor 9 / 9.5% (10% at
+  1000 centres, 2% at 8 averaged).  DRAM 14-32% of peak, L2 hit rate 78%.  Stalls (sampled): long scoreboard
+  (the fine visibilities' loads), wait, math-pipe throttle, barrier.
+- **Where the instructions go** (source counters, default at 4 blocks; 1000 centres the same to
+  within 2%):
+
+  | part of the kernel | instructions | stall samples |
+  |---|---|---|
+  | outer phasor (sincos per output per piece, the product from shared memory) | 20% | 11% |
+  | V: the fine visibilities' loads, to FP16 | 18% | 34% |
+  | per piece: the delays to shared memory, the row offsets, setup | 16% | 12% |
+  | U: the inner phasors | 13% | 9% |
+  | the final store (its index) | 13% | 7% |
+  | the WMMA loads and mma | 11% | 16% |
+  | FP16 conversions, cmul | 7% | 4% |
+
+  At 10 pieces the per-piece setup and the final store fall to 10% and 2%; at 8 averaged the
+  outer phasor (33%), setup (23%) and final store (21%) dominate.
+- One line was 9% of the instructions: the V loop's index, `i / (KC / 2)` and `i % (KC / 2)`,
+  divisions by a value known only at run time.  KC is a power of two (A is), so shifts and a
+  mask do it; and the final store now steps its index (+16 G a centre's step) instead of
+  computing it per output.  On the 2070: 2.7-7% faster (default 0.657 -> 0.639 ms, 1000 centres
+  5.04 -> 4.88, 8 averaged 2.72 -> 2.53, 65536 channels 3.79 -> 3.61), every check passing
+  (also at 37 centres, 7 stations, mixed sidebands).  On the A100, issue-bound, probably more:
+  not yet measured.
+- **phasecentrebench now chooses the blocks an SM itself**: 4 where 4 fit
+  (`cudaOccupancyMaxActiveBlocksPerMultiprocessor` for the 4-block kernel: registers and shared
+  memory), else 3.  It picks 3 on the 2070; `--blocks 3|4` overrides.
+- What is left is mostly inherent to this layout: a sincos per output per piece, and fixed costs
+  per block (a block is 64 rows x 32 centres x A channels: at the default 2 chunks of 32 channels)
+  that more work per block would amortise, at the price of a larger restructuring.
 
 ## A100-SXM4-80GB (OzSTAR gina3), the first version
 

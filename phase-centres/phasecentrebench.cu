@@ -153,8 +153,9 @@ __global__ void shift_naive(Geo g, const float2* __restrict__ vis, const double*
 // tensor: V in FP16 (scaled by 1 / the piece's windows), the complex product as a real one,
 //   [Vre Vim interleaved] x [[cos sin], [-sin cos] per (k, s)] -> [re im interleaved], 16x16x16 WMMA,
 //   8 warps each 16 rows x TN real columns; TN = 32, at most 80 registers for 3 blocks an SM (64
-//   with --tile-centres 64: one block an SM, slower; docs/results.md).  --blocks 4: 64 registers
-//   for 4 (a small spill; slower on the 2070, for the A100's occupancy).
+//   with --tile-centres 64: one block an SM, slower; docs/results.md), or 64 registers for 4 (a
+//   small spill).  4 where 4 fit (shared memory too: the A100, 6-8% faster), else 3 (the 2070,
+//   where shared memory allows only 3); --blocks overrides.
 // simt: FP32, TN = 32, a thread 2 rows x 4 centres.
 // The outer phase in FP32 without losing the bits a double would keep: Δτ fLO_f mod 1 per (frequency,
 // centre), and y = Δτ A df mod 1 as yh + yl (two floats), g y mod 1 = frac(g yh) + (the fma's
@@ -213,8 +214,9 @@ __global__ void __launch_bounds__(NT, BLOCKS) shift_tile(Geo g, const float2* __
         else for (int j = 0; j < 8; j++) a8[j] = make_float2(0.f, 0.f);
         __syncthreads();
         for (int c0 = 0; c0 < g.A; c0 += KC) {
+            const int hk = KC / 2, hks = __ffs(hk) - 1;      // KC a power of two (A is): shifts, not divisions
             for (int i = tid; i < TM * KC / 2; i += NT) {    // V: 64 rows x KC, two channels a load
-                const int r = i / (KC / 2), kk = 2 * (i % (KC / 2));
+                const int r = i >> hks, kk = 2 * (i & (hk - 1));
                 const long long o = rowOff[r];
                 const float4 v = o >= 0 ? *reinterpret_cast<const float4*>(vk + o + c0 + kk) : make_float4(0.f, 0.f, 0.f, 0.f);
                 if (TC) {
@@ -309,11 +311,11 @@ __global__ void __launch_bounds__(NT, BLOCKS) shift_tile(Geo g, const float2* __
     if (rr >= g.R) return;
     const int p = (rr / g.G) % 4;
     const float invA = 1.f / g.A;
-    for (int j = 0; j < NJ; j++) {
-        const int s = s0 + tid / TM + 4 * j;
-        if (s >= g.S) continue;
-        out[outIdx(g, fr, bl, s, p, gr)] = make_float2(run[j].x * invA, run[j].y * invA);
-    }
+    const int sf = s0 + tid / TM;                      // the thread's first centre; then every 4th
+    size_t o = outIdx(g, fr, bl, sf, p, gr);
+    const size_t ostep = (size_t)16 * g.G;             // outIdx(.., s + 4, ..) - outIdx(.., s, ..)
+    for (int j = 0; j < NJ && sf + 4 * j < g.S; j++, o += ostep)
+        out[o] = make_float2(run[j].x * invA, run[j].y * invA);
 }
 
 // ---- the station spectra -----------------------------------------------------------------------
@@ -375,8 +377,8 @@ static void usage() {
 "                  check is exact only without it)\n"
 "  --only LIST     comma-separated versions to run: naive,simt,tensor (default all)\n"
 "  --tile-centres N  the tensor version's centres a block, 32 or 64 (default 32)\n"
-"  --blocks N      the tensor version's blocks an SM to fit its registers to, 3 or 4 (default 3;\n"
-"                  4 only with 32 centres a block)\n"
+"  --blocks N      the tensor version's blocks an SM to fit its registers to, 3 or 4 (default: 4\n"
+"                  if 4 fit on this GPU, else 3; 4 only with 32 centres a block)\n"
 "  --reps N        timed repetitions, default 20; --warmup N, default 3\n"
 "  --check N       outputs checked against the double-precision shift, default 256 (x 4 products)\n"
 "  --csv FILE      append one row per timing\n"
@@ -390,7 +392,7 @@ int main(int argc, char** argv) {
     int src = 1, reps = 20, warmup = 3, ncheck = 256, device = 0;
     unsigned long long seed = 1;
     std::string only = "naive,simt,tensor", csv;
-    int tileCentres = 0, blocks = 3;
+    int tileCentres = 0, blocks = 0;          // blocks 0: chosen for the GPU
     std::string sideband = "U";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -436,7 +438,7 @@ int main(int argc, char** argv) {
     if (u.nant < 2 || u.nfreq < 1 || u.nchan % 4 || u.nwin < 1 || u.K < 1 || u.K > u.nwin || u.S < 1 || u.A < 1 ||
         (u.A & (u.A - 1)) || u.nchan % u.A || src < 1 || src > u.S || reps < 1 || u.nfreq > MAXFREQ ||
         (sideband != "U" && sideband != "L" && sideband != "mixed") || (tileCentres != 0 && tileCentres != 32 &&
-        tileCentres != 64) || (blocks != 3 && blocks != 4) || (blocks == 4 && tileCentres == 64)) {
+        tileCentres != 64) || (blocks != 0 && blocks != 3 && blocks != 4) || (blocks == 4 && tileCentres == 64)) {
         usage(); return 2;
     }
     const bool tiles = u.A >= 8 && u.nfreq <= MAXF;
@@ -532,6 +534,12 @@ int main(int argc, char** argv) {
     };
     auto tgrid = [&](int tn) { return dim3((u.R() + TM - 1) / TM, (u.S + tn - 1) / tn, u.nbl); };
     const bool wide = tileCentres == 64;     // the tensor version's centres a block: 32 unless asked
+    if (blocks == 0) {                        // 4 blocks an SM where 4 fit (registers and shared memory)
+        int fit = 0;
+        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, shift_tile<true, 32, 4>, NT, 0));
+        blocks = !wide && fit >= 4 ? 4 : 3;
+    }
+    if (runTensor && tiles && !wide) printf("tensor shift: %d blocks an SM\n", blocks);
     struct Variant { std::string name; double tol; std::function<void()> run; };
     std::vector<Variant> variants;
     if (runNaive) variants.push_back({"naive (a thread per output, sincos per channel)", 1e-4, [&] {

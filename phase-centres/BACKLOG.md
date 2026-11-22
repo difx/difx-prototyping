@@ -13,6 +13,10 @@ shift / XMAC ≈ 2 × centres / windows per piece.
     by recurrence (2-3x at 100+ centres);
   - the staged XMAC skips zeroing when every visibility is stored (5-20%).
 - The A100 after the optimisation round (job 21370182): the tensor shift 1.1-2.1x faster.
+- Nsight Compute on the A100 (job 21370872): issue-bound (tensor pipe 9-10%); 4 blocks an SM 6-8%
+  faster there; the loads' index by shifts and the final store's index stepped (2.7-7% on the 2070).
+- Blocks an SM chosen for the GPU: 4 where 4 fit (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`:
+  the A100), else 3 (the 2070); `--blocks` overrides.
 - Lower sideband (`--sideband`).
 - The lag-window term of the decorrelation estimate checked by simulation (`lagwindow.py`).
 
@@ -28,12 +32,8 @@ shift / XMAC ≈ 2 × centres / windows per piece.
 
 ## Next
 
-- **The A100's occupancy** (only if the shift matters there: it is +45% over the XMAC at 100
-  centres).  The A100 run after the optimisation round (docs/results.md) gained 1.1-2.1x, not the
-  2070's 1.4-3.0x: 80 registers allow 3 blocks an SM, 24 of its 64 warps.  Set up: `--blocks 4`
-  (64 registers, a 32-byte spill; 3-12% slower on the 2070, where shared memory allows only 3
-  blocks anyway), and the pc-* cases in `common/scripts/ncu-ozstar.sbatch`: ncu and a timing run
-  at 3 and 4 blocks, for the occupancy and how much the FP32 work (phasors, outer phasor) costs.
+- **The A100 again** (the pc-* cases of `common/scripts/ncu-ozstar.sbatch`, a few minutes): the
+  index changes (2.7-7% on the 2070) on the issue-bound A100, at 3 and 4 blocks.
 - **Short pieces** (only if a user wants pieces of a few ms): windows per piece not a multiple of
   16 pay for the whole MMA tile; pieces rounded to multiples of 16 windows would avoid it.
 

@@ -15,7 +15,9 @@ its `FINDINGS.md`.
 - Done: the optimisation round on the 2070 (shift 2-3x at 100+ centres, XMAC zeroing skipped); lower sideband; lag-window term checked.
 - Dropped: the XMAC's pieces in one launch (0-1%); the shift in the XMAC's epilogue (atomics 2-260x the shift).
 - Done: the A100 after the optimisation round (shift 1.1-2.1x; +45% over the XMAC at 100 centres).
-- Next (optional): the A100's occupancy (3 blocks an SM by registers: 24 of 64 warps).
+- Done: Nsight Compute on the A100: issue-bound (tensor pipe 9-10%); 4 blocks an SM 6-8% faster there; index fixes 2.7-7% (2070).
+- Done: blocks an SM chosen for the GPU (4 where 4 fit, else 3; `--blocks` overrides).
+- Next: the index fixes on the A100 (pc-* ncu cases).
 - Later: pieces in multiples of 16 windows (only for very short pieces); a NUFFT shift for centres ≫ channels averaged.
 
 ## [pulsar-binning](pulsar-binning/BACKLOG.md)

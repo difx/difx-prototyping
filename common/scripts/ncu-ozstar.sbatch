@@ -193,6 +193,8 @@ for b in 3 4; do
     profilep pc-pieces10-b$b   shift_tile --only tensor --blocks $b --pieces 10
     profilep pc-avg8-b$b       shift_tile --only tensor --blocks $b --avg 8
 done
+# the blocks an SM phasecentrebench chooses itself (4 where 4 fit): its run.log says which
+profilep pc-default-auto       shift_tile --only tensor
 
 packs=()
 for o in "${outs[@]}"; do
