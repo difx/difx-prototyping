@@ -122,10 +122,12 @@ loads) from the channel-major spectra in time order.
 
 **5b. Gathered from the window-major spectra** (`gatherwm`): the same, reading the station kernel's
 usual output (the only change a stride), so neither the station kernel nor a transpose changes
-anything.  As fast as from channel-major at 1024 channels and low DM (3.8x, 4.2x on the 2070); up to
-2x slower at 128 channels (6.1x, 15.2x) and at high DM (neighbouring channels then read different
-windows and share no sectors).  With a transpose of its own the binning gets channel-major's speed
-for about the XMAC's time more.
+anything.  As fast as from channel-major at 1024 channels and low DM (3.8x / 3.9x for 16 bins, 4.2x
+/ 4.7x for 128 at 500 ms); slower at 128 channels (6.1x / 4.0x for 16 bins, 15.2x / 10.9x for 128
+at 1.5 ms) and at high DM, where neighbouring channels read different windows and share no sectors.
+A transpose of its own gives the binning channel-major's speed for about the XMAC's time more
+(0.39-0.41 ms on the A100); on the A100 gatherwm beats that in 19 of the 24 separate-bin runs, the
+exceptions at 128 channels (worst 8.7x against 5.4x, 500 ms, 128 bins, DM 1000).
 
 **Dispersion does not change the sorted approaches**: each channel is sorted on its own, so the bin
 changing at every channel (1.5 ms, 1024 channels, DM 300) costs them nothing (14.1x either way).
@@ -156,16 +158,16 @@ smaller output saves.
 | output | regime | approach | 2070 | A100 |
 |---|---|---|---|---|
 | gate, scrunched (any weights) | any | 2, weights in the stage | 0.33-1.37x | 0.77-1.80x |
-| separate bins | long runs: few bins, slow pulsars | 5, sorted, gathered | 2.3-4.5x | 3.0-4.8x |
-| separate bins | short runs: many bins of a millisecond pulsar | 4 on the 2070, 5 on the A100 | 6-7x | 6.6x |
+| separate bins | long runs: few bins, slow pulsars | 5b, gathered from window-major | 2.7-7.1x (to 10x at high DM) | 3.1-4.7x (to 8.7x) |
+| separate bins | short runs: many bins of a millisecond pulsar | 5b | 15x (the permuted copy 6.1-6.5x) | 10.4-11.2x (5 with a transpose 7.8x) |
 | separate bins | bins narrower than a window | warn: such bins sample the pulse rather than resolve it | 14x | 18x |
 
-So one sorted approach, gathered, covers separate bins on the A100, and costs the 2070 2x only for
-the shortest runs.  It can read the station kernel's usual window-major output (5b) at some cost
-(up to 2x at 128 channels or high DM), or a channel-major copy the binning makes itself: either
-way the station kernel stays as it is.
+So one sorted approach, gathered from the station kernel's usual window-major output (5b), covers
+separate bins on the A100: the best, counting the transpose the others need, in 19 of 24 runs, and
+at most 1.6x the best in the rest (128 channels with short runs or high DM).  The station kernel
+stays as it is.  On the 2070 the transpose and the permuted copy win more often (its L2 is 4 MB).
 
-The sorted approaches need channel-major spectra from the station kernel in pulsar mode.  32
+32
 stations (where the XMAC is 4x larger) give the same picture or better: the gate 0.33x, 16 scrunched
 1.22x, 16 separate 2.45x, 128 separate 6.7x (1.5 ms) and 2.3x (500 ms).
 
@@ -176,7 +178,7 @@ Slowest index first; the last is contiguous.
 | layout | where | index order | element |
 |---|---|---|---|
 | FP16 spectra, window-major | DRAM: the station kernel's output now; read by the stage and passes | `[station][window][band][channel]` | `__half2` (re, im) |
-| FP16 spectra, channel-major | DRAM: the sorted approaches' input (here a transpose) | `[station][band][channel][window]` | `__half2` |
+| FP16 spectra, channel-major | DRAM: sorted and gather's input (here a transpose; gatherwm does without) | `[station][band][channel][window]` | `__half2` |
 | slots | DRAM: the permuted copy (approach 4) | `[station][band][channel][slot]`, a channel's windows in bin order, each bin padded to 16 slots, the same slots across a channel group | `__half2` |
 | bins | DRAM | `[window][frequency][channel]` | `uint8` |
 | slot table | DRAM | `[frequency][channel][slot]`: the window, or -1 for padding | `int` |
@@ -188,6 +190,8 @@ Slowest index first; the last is contiguous.
 
 `results-local/ar313-adeller-bins-20261122-140307/table.txt` (the 2070) and
 `results-local/gina8-bins-20261122-142203/table.txt` (the A100, job 21374617), both `run-bins.sh` at
-commit fafcd29 (`results-local/` is not in the repository), with the 32-station figures from single runs (in
+commit fafcd29, and `results-local/gina5-bins-20261122-160540/table.txt` (the A100 at bc93212, job
+21375824: gatherwm and high DM; the 2070's for those is `ar313-adeller-bins-20261122-144706`)
+(`results-local/` is not in the repository), with the 32-station figures from single runs (in
 [results.md](results.md), "Step 6").  The diagram is drawn by `plot_binning.py` (`python3
 plot_binning.py` from `pulsar-binning/`), its ratios typed in from that table.

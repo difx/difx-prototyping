@@ -21,6 +21,9 @@ to keep arbitrary breakpoints.
 - The per-bin weights (count + a correction over flagged windows, exact against mpifxcorr's sum);
   high DM in the sweep; gathering from window-major spectra (`gatherwm`): the station kernel need
   not change (docs/results.md, "Per-bin weights, high DM ...").
+- The A100 again (job 21375824): gathering from window-major spectra beats a transpose to
+  channel-major in 19 of 24 separate-bin runs, so window-major is the layout; high DM as on the
+  2070; the per-bin weights 18-31% of the A100's XMAC (docs/results.md, "The A100 again").
 - Step 6 (part): channel averaging in the binned XMAC (a shared-memory sum over a block's channels)
   and accumulating over an integration; `run-bins.sh`, the whole matrix on the 2070: the gate
   0.45-1.13x, scrunched 1.04-1.37x, 16 separate 2.6-4.5x, 128 separate 2.7-6.5x (14x for bins
@@ -28,9 +31,10 @@ to keep arbitrary breakpoints.
 
 ## Next
 
-- **One sorted approach**: gather wins every separate-bin case on the A100 (job 21374617), the
-  permuted copy only the shortest runs on the 2070 (6.5x against 12x): drop the copy, or keep it
-  for the 2070 only.
+- **One sorted approach: gather from window-major spectra** (gatherwm): on the A100 the fastest,
+  counting the transpose the others need, in 19 of 24 separate-bin runs, and at most 1.6x the
+  fastest in the rest (128 channels, short runs or high DM); the permuted copy never wins there.  Kept (2026-11-22): drop the
+  permuted copy and the channel-major path in DiFX; the 128-channel millisecond pulsar below.
 - **Slimming the weighted copy** (the gate and scrunched output: 1.26-1.80x the XMAC on the A100
   when nothing is skipped, 1.04-1.37x on the 2070):
   1. the weight on the A operand in registers instead of on every value in the copy: the copy
@@ -43,18 +47,23 @@ to keep arbitrary breakpoints.
   3. the KS 2 kernel's spills rechecked; on both GPUs, against the plain XMAC (aim: about 1.1x with
      nothing to skip).
 - **The per-bin weights' cost**: the count into the bins kernel (six small kernels now: 0.09-0.17 ms
-  with every weight 1); the correction (a matrix product over the flagged windows) on the tensor
+  with every weight 1 on the 2070, 0.06-0.12 ms on the A100, where that is 18-31% of the XMAC); the correction (a matrix product over the flagged windows) on the tensor
   cores if heavily flagged data matter (5.8 ms at 32 stations with half the windows flagged).
-- **Window-major or channel-major** for the sorted XMAC (both kept in binbench): window-major needs
-  nothing from the station kernel (up to 2x slower at 128 channels or high DM); a transpose in the
-  binning gives channel-major's speed for about the XMAC's time.  The A100 to decide.
+- **The millisecond pulsar at fewer channels, from window-major spectra** (kept: window-major; 128
+  channels, 1.5 ms: 10.9x the XMAC for 128 bins, 5.7x for 16 at DM 300, against 7.8x and 4.4x with a
+  transpose to channel-major).  To try: 16-byte loads of 4 channels where a quad's channels share a
+  slot's window (most slots at low DM), 4-byte gathers only where they differ; cp.async for the
+  gathers; ordering the blocks so those reading the same windows run together (L2); slots shared
+  across a wider channel group; a transpose of just the windows a subint's short-run bins touch;
+  or the transpose kept as a fallback chosen per job (fewer than ~256 channels with short runs or
+  high DM).
 - **The bins kernel**: a lookup table on the phase's top bits instead of the binary search.
 - **Sorting over several subints** (or a longer XMAC interval in pulsar mode) where bins get few
   windows a subint (1024 channels, 128 bins at 1.5 ms: 11.5x at 102.4 ms against 14x).
 - **The weighted kernel's spills** (KS 2: 40-320 bytes; the gate and scrunched output's 4-37% over
   the XMAC when nothing is skipped).
-- **In DiFX**: the station kernel writing channel-major spectra in pulsar mode, which the sorted
-  XMAC needs; the bins per subint without the device-to-host sync the prototype's permute uses.
+- **In DiFX**: the sorted XMAC gathering from the station kernel's usual window-major output (no
+  change there); the bins per subint without the device-to-host sync the prototype's permute uses.
 
 ## The test cases
 

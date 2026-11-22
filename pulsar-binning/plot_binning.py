@@ -229,7 +229,7 @@ box(PX, y + 8, PW_, ROWH - 16, "kernel", "sort → the XMAC gathering the slots"
      "4 slots, then 4-byte loads) from the channel-major spectra in time order.",
      "Saves the permute's pass; with long runs the loads are nearly contiguous, with runs",
      "of 1-3 windows scattered.  Also from the usual window-major spectra (gatherwm, no",
-     "copy at all): as fast at 1024 channels, up to 2x slower at 128 or at high DM."])
+     "copy at all): on the A100 it beats a transpose in 19 of 24 runs; not at 128 ch."])
 grid(GX, gy(y), 128, CW2 * 0.28, CH2, lambda w, c: slots(w, c))
 for k, (sl, src) in enumerate([(3, 1), (21, 25), (40, 49)]):    # a few index arrows, illustrative
     xs = GX + (sl + 0.5) * CW2 * 0.28
@@ -263,10 +263,10 @@ y += 6
 text(16, y, "Which", size=15, weight="bold")
 text(16, y + 20, ["The gate and scrunched output (any weights, negative too): weights in the stage, one pass: 0.33-1.37x the "
                   "unbinned XMAC on the 2070, 0.77-1.80x on the A100.",
-                  "Separate bins: sorted per channel and gathered, from channel-major spectra (the binning's own transpose) "
-                  "or the usual window-major ones: 3-5x on the A100 in every case but one",
-                  "(on the 2070 the permuted copy wins for short runs, 6.5x against 12x; on the A100 gather wins there too, "
-                  "6.6x against 7.1x).  Bins narrower than a window (1.5 ms,",
+                  "Separate bins: sorted per channel and gathered straight from the station kernel's usual window-major "
+                  "spectra (gatherwm): 3.1-4.7x on the A100 for long runs, 10-11x",
+                  "for the shortest (where a transpose to channel-major does better, 7.8x, and on the 2070 the permuted "
+                  "copy, 6.5x).  Bins narrower than a window (1.5 ms,",
                   "1024 channels, 128 bins: 14x / 18x) sample rather than resolve the pulse: warn, do not optimise.  "
                   "A pass per bin and the naive port: not for many bins."], size=12, color="#333", lh=16)
 y += 106
@@ -296,7 +296,7 @@ text(16, y, "Ratios: run-bins.sh, commit fafcd29: results-local/ar313-adeller-bi
      "gina8-bins-20261122-142203 (A100, job 21374617); each version's ms per 25.6 ms subint over the unbinned staged "
      "XMAC's (2070 1.19-1.50 ms, A100 0.32-0.40);", size=10.5, color="#555")
 text(16, y + 15, "sorted counts the sort, permute and XMAC, not the channel-major spectra (as a transpose here: 1.4-1.5 ms "
-     "on the 2070).", size=10.5, color="#555")
+     "on the 2070); gatherwm on the A100: gina5-bins-20261122-160540 (commit bc93212, job 21375824).", size=10.5, color="#555")
 H2 = y + 40
 out[0] = f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H2}' viewBox='0 0 {W} {H2}'>"
 out[2] = f"<rect width='{W}' height='{H2}' fill='#ffffff'/>"

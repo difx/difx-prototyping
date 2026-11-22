@@ -293,3 +293,53 @@ At 1024 channels and low DM it is as fast as gathering from channel-major spectr
 version in five rows of the sweep); at 128 channels and at high DM it costs up to 2x more.  So the station kernel
 need not change: the binning can read its usual output (gatherwm), or keep its own transpose to
 channel-major (1.4-1.5 ms on the 2070, about the XMAC's time).
+
+## The A100 again: high DM, gathering from window-major spectra, per-bin weights (OzSTAR gina5, job 21375824, 2026-11-22)
+
+`run-bins.sh` at commit bc93212 (`results-local/gina5-bins-20261122-160540`), 48 runs, every one
+passing.  The DM 30 rows repeat job 21374617 within a few % (the XMAC's own time again 0.32-0.40
+ms).  Ratios to the unbinned XMAC; "+ T" adds the transpose to channel-major spectra (0.39-0.41 ms,
+about the XMAC's time, as on the 2070) to the versions that start from them:
+
+| P | ch | bins | DM | stage | sorted + T | gather | gather + T | gatherwm | naive | passes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1.5 ms | 128 | gate | 30 / 300 | 0.77 / 1.70 | | | | | 8.0 / 8.3 | |
+| | | 16 scrunched | 30 / 300 | 1.78 / 1.78 | | | | | 8.0 / 8.3 | |
+| | | 16 | 30 / 300 | | 5.3 / 5.3 | 3.24 / 3.21 | 4.41 / 4.40 | **3.99 / 5.65** | 11.4 / 11.0 | 10.9 / 15.7 |
+| | | 128 | 30 / 300 | | 8.4 / 8.4 | 6.58 / 6.58 | 7.80 / 7.80 | **10.9 / 11.2** | 52 / 104 | 83 / 122 |
+| | 1024 | gate | 30 / 300 | 0.95 / 1.08 | | | | | 4.9 / 4.9 | |
+| | | 16 scrunched | 30 / 300 | 1.65 / 1.64 | | | | | 5.0 / 5.0 | |
+| | | 16 | 30 / 300 | | 6.1 / 6.0 | 4.28 / 4.18 | 5.33 / 5.20 | **3.88 / 4.21** | 9.7 / 11.2 | 13.0 / 14.6 |
+| | | 128 | 30 / 300 | | 21.2 / 21.2 | 17.5 / 17.6 | 18.6 / 18.6 | **16.6 / 18.4** | 55 / 197 | 105 / 123 |
+| 500 ms | 128 | gate | 30 / 1000 | 1.31 / 0.69 | | | | | 8.3 / 8.3 | |
+| | | 16 scrunched | 30 / 1000 | 1.31 / 1.73 | | | | | 8.3 / 8.3 | |
+| | | 16 | 30 / 1000 | | 5.4 / 5.8 | 3.22 / 3.13 | 4.39 / 4.35 | **3.50 / 3.72** | 10.7 / 11.0 | 8.3 / 9.5 |
+| | | 128 | 30 / 1000 | | 6.2 / 6.8 | 3.90 / 4.13 | 5.12 / 5.35 | **4.54 / 8.72** | 11.2 / 11.2 | 59 / 69 |
+| | 1024 | gate | 30 / 1000 | 1.26 / 0.57 | | | | | 4.9 / 4.9 | |
+| | | 16 scrunched | 30 / 1000 | 1.26 / 1.59 | | | | | 5.0 / 4.9 | |
+| | | 16 | 30 / 1000 | | 5.1 / 4.4 | 3.17 / 2.34 | 4.21 / 3.36 | **3.09 / 2.51** | 7.1 / 6.8 | 8.3 / 8.3 |
+| | | 128 | 30 / 1000 | | 6.6 / 6.8 | 4.73 / 4.74 | 5.78 / 5.79 | **4.70 / 5.08** | 7.9 / 8.0 | 59 / 60 |
+
+(avg 8 with accumulation: within a few % of these, as before.)
+
+- **Window-major is the layout on the A100**: gathering straight from the station kernel's usual
+  output (`gatherwm`) beats a transpose followed by the channel-major gather in 19 of the 24
+  separate-bin runs (0.73-0.99x its time).  At 1024 channels and DM 30 it is as fast as or faster
+  than gathering from channel-major spectra even with the transpose not counted (3.9x against 4.3x,
+  16.6x against 17.5x), and within 7% of it at high DM.  It loses at 128 channels with many short
+  runs (1.5 ms, 128 bins: 10.9x against 7.8x) and at high DM at 128 channels (1.5 ms, 16 bins, DM
+  300: 5.7x against 4.4x; 500 ms, 128 bins, DM 1000: 8.7x against 5.4x).  There neighbouring
+  channels, 8x wider than at 1024 channels and so 8x further apart in dispersion delay, read
+  different windows, and the 4-byte loads stop sharing sectors.  The worst case, 11.2x, is 3.6 ms
+  a 25.6 ms subint (0.14 ms per ms of data).  On the 2070 (4 MB of L2 against 40 MB) gatherwm beats
+  gather + T only at 1024 channels, and not at high DM there.
+- **The permuted copy (sorted) never wins on the A100**, with or without its transpose.
+- **High DM, the same as on the 2070**: the sorted approaches do not care; the gate loses its skipping
+  at 1.5 ms (0.77 to 1.70x at 128 channels, 0.95 to 1.08x at 1024; the 500 ms gate at DM 1000 is
+  cheaper, 0.57-0.69x, the subint's phase putting most channels off-pulse); 16 scrunched at 500 ms
+  goes from 1.26-1.31x to 1.59-1.73x (presumably more blocks now straddle a bin edge and leave the
+  plain path); gatherwm, a pass per bin and the naive port get worse (the naive port to 197x).
+- **The per-bin weights cost relatively more on the A100**: 0.06-0.12 ms with every weight 1, 18-31%
+  of the XMAC (7-14% on the 2070): six small kernels, 0.06 ms at 128 channels and 0.11 at 1024.
+  Folding the count into the bins kernel (in the backlog) matters more here.
+- **The bins kernel**: 0.018-0.054 ms, 5-17% of the XMAC (the most at 1.5 ms, DM 300, 128 bins).

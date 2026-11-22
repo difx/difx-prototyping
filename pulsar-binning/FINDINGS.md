@@ -32,7 +32,8 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   usual window-major spectra cost 17-28 ms against 3-6 ms from channel-major ones.  But gathering
   straight from window-major spectra in the XMAC (`gatherwm`) is as fast as from channel-major at
   1024 channels and low DM, and up to 2x slower at 128 channels or high DM; or the binning can keep
-  its own transpose (about the XMAC's time on the 2070).
+  its own transpose (about the XMAC's time).  On the A100 gatherwm beats the transpose in most
+  cases (below), so window-major it is: the station kernel stays as it is.
 - **One pass per bin** (one-hot weights): 3.3-70x; **the naive port** (a thread per output): 3.8-188x.
   Neither is the way for many bins.
 - **The output** (nbins x the visibilities per subint) is a large part for many bins: averaging
@@ -47,7 +48,7 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   (1.17-1.31x instead of 0.46-0.70x); gathering from window-major spectra, a pass per bin and the
   naive port get worse.
 
-## The A100 (2026-11-22, OzSTAR job 21374617)
+## The A100 (2026-11-22, OzSTAR jobs 21374617 and 21375824)
 
 - **The same picture, with gather winning every separate-bin case**: 3.0-4.8x the unbinned XMAC
   (6.6x for 128 bins of the 1.5 ms pulsar at 128 channels, where the permuted copy is 7.1x; on the
@@ -57,5 +58,14 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   as the phase-centre shift is.
 - In real time every case but bins narrower than a window (0.27) is at most 0.08 ms per ms of data.
   ([docs/results.md](docs/results.md), "The A100")
+- **Window-major spectra** (job 21375824): gathering from the station kernel's usual output beats a
+  transpose plus the channel-major gather in 19 of 24 separate-bin runs, and at 1024 channels (DM 30)
+  even the channel-major gather without its transpose.  It loses at 128 channels for the 1.5 ms
+  pulsar's 128 bins (10.9x against 7.8x) and at high DM at 128 channels (up to 8.7x against 5.4x);
+  worst case 0.14 ms per ms of data.  The permuted copy never wins on the A100.
+- **High DM as on the 2070**: the sorted approaches unchanged; the 1.5 ms gate loses its skipping
+  (0.77 to 1.70x at 128 channels).
+- **The per-bin weights**: 0.06-0.12 ms a subint, 18-31% of the A100's XMAC (7-14% on the 2070): the
+  count into the bins kernel matters more here.  ([docs/results.md](docs/results.md), "The A100 again")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

@@ -29,7 +29,8 @@ its `FINDINGS.md`.
 - Done: channel averaging and accumulation in the binned XMAC; run-bins.sh, the whole matrix on the 2070 (FINDINGS.md).
 - Done: the A100 (gather wins every separate-bin case; the weighted stage relatively dearer); docs/approaches.md, the approaches with a diagram.
 - Done: per-bin weights (exact); high DM in the sweep; gathering from window-major spectra (the station kernel need not change).
-- Next: the A100 again (gatherwm, high DM); slimming the weighted copy; one sorted approach.
+- Done: the A100 again: window-major spectra (gatherwm) beat a transpose in 19 of 24 runs, so the station kernel stays as it is.
+- Next: slimming the weighted copy; one sorted approach (gather from window-major); the per-bin weights' count into the bins kernel.
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 
