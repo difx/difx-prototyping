@@ -135,6 +135,10 @@ struct XmacWeights {
     int cstride = 0;                    // sorted: __half2 from one channel to the next (channel-major)
     const int* slotWin = nullptr;       // sorted, gathered: [frequency][channel][cap] each slot's window or -1
     int cap = 0;
+    // the output (weighted and sorted): avg channels (a power of 2) summed into each output channel,
+    // vis [freq][baseline][product][nchan / avg] (a bin's); accumulate: added to vis, not zeroed first
+    int avg = 1;
+    bool accumulate = false;
 };
 void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                               const XmacWeights& w, int multiprocessors, cudaStream_t st);
@@ -151,7 +155,7 @@ void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half
 // gathers each slot's window (4-byte loads).
 void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                             const int4* segs, int maxSeg, int nbins, int cstride, int multiprocessors, cudaStream_t st,
-                            const int* slotWin = nullptr);
+                            const int* slotWin = nullptr, int avg = 1, bool accumulate = false);
 int xmacTensorStagedChannels(const XmacShape& s);
 int xmacTensorStagedTile(const XmacShape& s);
 int xmacTensorStagedStages(const XmacShape& s);

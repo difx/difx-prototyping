@@ -138,3 +138,54 @@ the host (and the sum of its bins against the unbinned sums).
   put a second copy of the store code in the loop: 0.5-1.9 KB of spills at KS 2.  The segment
   grid (one bin a block, one store at the end) has none; step 5 was not built further: for long
   runs `gather` already does its job, and for short runs it is the passes' cost again.
+
+## Step 6: the output, and the whole matrix (2026-11-22, RTX 2070 SUPER)
+
+The binned XMAC modes (weighted, sorted, gather) can sum `--avg` adjacent channels into each output
+channel and `--accumulate` into the output (an integration's sum, no zeroing each subint); when the
+averaging covers a block's channels (8 here), the block's warps add their sums in shared memory
+first and one warp writes them.  (A first layout of that buffer put a warp's 32 lanes in one bank:
+40x slower.)
+
+`run-bins.sh` (results-local/ar313-adeller-bins-20261122-140307, every run passing), ms per 25.6 ms
+subint, the fastest binned version against the unbinned staged XMAC; `sorted` counts the sort, the
+permute and its XMAC but not the channel-major spectra it starts from (1.4-1.5 ms here as a
+transpose, nothing if the station kernel writes them):
+
+| P | ch | bins | avg / acc | XMAC | bins kernel | naive | stage | passes | sorted | gather | best / XMAC |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.5 ms | 128 | gate | 1 / no | 1.207 | 0.039 | 6.20 | 0.56 | | | | 0.46 |
+| | | 16 scrunched | 1 / no | 1.194 | 0.062 | 6.17 | 1.63 | | | | 1.37 |
+| | | 16 | 1 / no | 1.211 | 0.063 | 8.38 | | 7.36 | 5.54 | 3.98 | 3.28 (gather) |
+| | | 128 | 1 / no | 1.195 | 0.104 | 225.6 | | 52.1 | 7.77 | 14.4 | 6.50 (sorted) |
+| | | 128 | 8 / yes | 1.194 | 0.104 | 118.8 | | 50.7 | 7.25 | 13.7 | 6.07 (sorted) |
+| | 1024 | gate | 1 / no | 1.474 | 0.037 | 8.57 | 1.04 | | | | 0.70 |
+| | | 16 scrunched | 1 / no | 1.497 | 0.049 | 8.62 | 1.89 | | | | 1.26 |
+| | | 16 | 1 / no | 1.479 | 0.049 | 23.4 | | 14.1 | 6.78 | 6.38 | 4.31 (gather) |
+| | | 128 | 1 / no | 1.471 | 0.084 | 141.9 | | 105.6 | 21.0 | 36.6 | 14.3 (sorted) |
+| 500 ms | 128 | gate | 1 / no | 1.207 | 0.039 | 6.08 | 1.37 | | | | 1.13 |
+| | | 16 scrunched | 1 / no | 1.214 | 0.067 | 6.19 | 1.39 | | | | 1.14 |
+| | | 16 | 1 / no | 1.213 | 0.067 | 6.53 | | 4.12 | 5.47 | 3.20 | 2.64 (gather) |
+| | | 128 | 1 / no | 1.204 | 0.087 | 6.74 | | 21.1 | 5.79 | 3.53 | 2.93 (gather) |
+| | 1024 | gate | 1 / no | 1.465 | 0.038 | 8.34 | 1.61 | | | | 1.10 |
+| | | 16 scrunched | 1 / no | 1.486 | 0.064 | 8.44 | 1.61 | | | | 1.08 |
+| | | 16 | 1 / no | 1.479 | 0.064 | 10.8 | | 5.69 | 6.05 | 4.16 | 2.81 (gather) |
+| | | 128 | 1 / no | 1.471 | 0.084 | 11.9 | | 33.2 | 8.25 | 6.12 | 4.16 (gather) |
+| | | 128 | 8 / yes | 1.465 | 0.084 | 11.2 | | 31.1 | 6.20 | 4.46 | 3.05 (gather) |
+
+(The other avg 8 rows: within a few % of the avg 1 ones; table.txt has them all.)
+
+- **Averaging and accumulating** matter where the output is most of the work: the 500 ms pulsar's
+  128 bins at 1024 channels (4.16x to 3.05x: its 118 empty bins no longer zeroed each subint), and
+  the naive port.  Elsewhere they change little: the atomic adds they need cost about what the
+  smaller output saves.
+- **The worst case, 128 bins of a 1.5 ms pulsar at 1024 channels (32 µs windows), is 14x**: a bin
+  (12 µs) is narrower than a window, so a channel has ~6 windows a bin a subint and the XMAC runs
+  65,000 one-slot-block segments, each a block's set-up and a full store.  A 102.4 ms subint: 11.5x
+  (padding 156% to 28%).  Bins narrower than a window sample rather than resolve the pulse; a
+  configuration to warn about rather than optimise.
+- **32 stations** (1.5 ms, 128 channels unless said): gate 0.33x, 16 scrunched 1.22x, 16 separate
+  2.45x (gather), 128 separate 6.7x (sorted); 500 ms, 128 bins 2.32x (gather).  The XMAC is 4.8 ms
+  there, so the binning's fixed costs weigh less.
+- In real time (10 stations): the binned XMAC at 0.02-0.3 ms per ms of data in every case but the
+  worst (0.8).

@@ -16,6 +16,23 @@ to keep arbitrary breakpoints.
   runs; the copy for short).  The output (nbins x the visibilities, zeroed and written each subint)
   is a large part.  Step 5 (splitting 16-window blocks at bin changes) not built: its in-loop store
   spilled, and gather covers long runs.
+- Step 6 (part): channel averaging in the binned XMAC (a shared-memory sum over a block's channels)
+  and accumulating over an integration; `run-bins.sh`, the whole matrix on the 2070: the gate
+  0.45-1.13x, scrunched 1.04-1.37x, 16 separate 2.6-4.5x, 128 separate 2.7-6.5x (14x for bins
+  narrower than a window).  [FINDINGS.md](FINDINGS.md).
+
+## Next
+
+- **The A100** (`run-bins.sh` on OzSTAR).
+- **The rest of the output side**: the per-bin weights (mpifxcorr's baseline weight per bin: a
+  histogram of the bins, with the windows' validity); phase centres per bin (the shift x nbins).
+- **The bins kernel**: a lookup table on the phase's top bits instead of the binary search.
+- **Sorting over several subints** (or a longer XMAC interval in pulsar mode) where bins get few
+  windows a subint (1024 channels, 128 bins at 1.5 ms: 11.5x at 102.4 ms against 14x).
+- **The weighted kernel's spills** (KS 2: 40-320 bytes; the gate and scrunched output's 4-37% over
+  the XMAC when nothing is skipped).
+- **In DiFX**: the station kernel writing channel-major spectra in pulsar mode, which the sorted
+  XMAC needs; the bins per subint without the device-to-host sync the prototype's permute uses.
 
 ## The test cases
 
@@ -80,6 +97,9 @@ Every parameter variable; these are the defaults and the sweep.
 - Which approach per regime (few bins / many; short runs / long), and whether one covers all.
 - Whether the station kernel should write a bin-friendly order in pulsar mode.
 - Window start or middle (mpifxcorr compatibility against accuracy).
+- From the 2070 (above): the stage for the gate and scrunched output; sorting for separate bins,
+  gathering for long runs (16 bins, slow pulsars), a permuted copy for short ones (many bins of a
+  millisecond pulsar); channel-major spectra from the station kernel in pulsar mode.
 
 ## To investigate in mpifxcorr
 

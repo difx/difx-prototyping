@@ -18,8 +18,11 @@ per output), the staged XMAC weighted in its stage (`stage`: one pass, the gate 
 output; `passes`: one a bin), bins sorted per channel (`sorted`: a permuted copy of channel-major
 spectra; `gather`: the XMAC gathering them), timed against the unbinned staged XMAC and checked
 against the host in double.  Bins: `gate` (2, scrunched with weights 0 / 1), `16` (unequal, the narrowest 1/1024; on - off
-when `--scrunch`ed), `128`, `even:N`.  `--help` lists the rest (stations, channels, subint, period,
-DM, the phase convention).  Results: [docs/results.md](docs/results.md).
+when `--scrunch`ed), `128`, `even:N`.  `--avg A` sums A channels into each output channel,
+`--accumulate` adds into the output instead of zeroing it each subint.  `--help` lists the rest
+(stations, channels, subint, period, DM, the phase convention).  `run-bins.sh` runs the whole test
+matrix (results-local/<host>-bins-<stamp>/).  Results: [docs/results.md](docs/results.md); in short,
+[FINDINGS.md](FINDINGS.md).
 
 ## The problem
 

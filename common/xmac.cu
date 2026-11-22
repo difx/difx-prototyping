@@ -231,10 +231,11 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     if constexpr (MODE >= 2) {
         const int4 sg = W.segs[((size_t)f * ncg + blockIdx.x % ncg) * W.maxSeg + blockIdx.z];
         if (sg.x < 0) return;                                           // past the group's segments
-        segBin = sg.x; tb0 = sg.y; tb1 = sg.z; atomicOut = sg.w > 1;
+        segBin = sg.x; tb0 = sg.y; tb1 = sg.z; atomicOut = sg.w > 1 || W.avg > 1 || W.accumulate;
     } else {
         const int per = (ntb + nchunk - 1) / nchunk;
         tb0 = blockIdx.z * per; tb1 = min(ntb, tb0 + per);
+        if constexpr (MODE == 1) atomicOut |= W.avg > 1 || W.accumulate;
     }
     auto recvOf = [&](int row) {                                        // stage row -> receiver, or -1
         const int r = row < 16 * KS ? AB.x * 16 * KS + row : AB.y * 16 * KS + row - 16 * KS;
@@ -510,8 +511,13 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
                     const int r1 = I * 16 + g + 8 * (e >> 1), r2 = J * 16 + 8 * h + 2 * t + (e & 1);
                     if (r1 >= R || r2 >= R || (r1 >> 1) >= (r2 >> 1)) continue;
                     const int bl = baselineIndex(mst[r1 >> 1], mst[r2 >> 1], s.nant);
-                    addVis((cuFloatComplex*)dst, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), acc[i][jj][0][h][e],
-                           acc[i][jj][1][h][e], atomicOut);
+                    if constexpr (MODE == 0)
+                        addVis((cuFloatComplex*)dst, s.visIndex(f, bl, productIndex(r1 & 1, r2 & 1), c), acc[i][jj][0][h][e],
+                               acc[i][jj][1][h][e], atomicOut);
+                    else                                // binned: W.avg channels summed into each output channel
+                        addVis((cuFloatComplex*)dst, (((size_t)f * s.nbaseline() + bl) * 4 + productIndex(r1 & 1, r2 & 1)) *
+                                                     (s.nchan / W.avg) + c / W.avg,
+                               acc[i][jj][0][h][e], acc[i][jj][1][h][e], atomicOut);
                 }
         }
     };
@@ -567,7 +573,38 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
     }
     }
 
-    if constexpr (MODE >= 2) store(vis + (size_t)segBin * s.visCount());
+    // binned, averaging at least the block's channels: the warps' sums (one channel each) added in shared
+    // memory first (the stages, done with), and only each J's first warp stores them, so a block writes
+    // one channel's worth instead of CH (when it fits; else every warp adds its own)
+    bool storeHere = true;
+    if constexpr (MODE >= 1) {
+        constexpr int NE = KS * NJ * 16;                                // accumulators a lane
+        if (W.avg >= CH && C::WPC * 32 * NE * 4 <= nbuf * BUFb) {
+            float* red = reinterpret_cast<float*>(smraw);              // [sub][NE][lane]: lanes in different banks
+            __syncthreads();
+            for (int u = threadIdx.x; u < C::WPC * 32 * NE; u += blockDim.x) red[u] = 0.f;
+            __syncthreads();
+            float* mine = red + (size_t)sub * NE * 32 + lane;
+#pragma unroll
+            for (int i = 0; i < KS; i++)
+#pragma unroll
+                for (int jj = 0; jj < NJ; jj++)
+                    if (on[i][jj])
+#pragma unroll
+                        for (int u = 0; u < 16; u++) atomicAdd(mine + ((i * NJ + jj) * 16 + u) * 32, (&acc[i][jj][0][0][0])[u]);
+            __syncthreads();
+            storeHere = cw == 0;
+            if (storeHere)
+#pragma unroll
+                for (int i = 0; i < KS; i++)
+#pragma unroll
+                    for (int jj = 0; jj < NJ; jj++)
+#pragma unroll
+                        for (int u = 0; u < 16; u++) (&acc[i][jj][0][0][0])[u] = mine[((i * NJ + jj) * 16 + u) * 32];
+        }
+    }
+    if (!storeHere) return;
+    if constexpr (MODE >= 2) store(vis + (size_t)segBin * (s.visCount() / W.avg));
     else store(vis);
 }
 
@@ -652,10 +689,12 @@ static void launchStaged(const XmacShape& s, const XmacMap& m, const StagedPlan&
     const unsigned nx = (unsigned)((s.nchan + CH - 1) / CH * nsp);
     const int ntb = (s.nwin + 15) / 16;
     const int nchunk = MODE >= 2 ? W.maxSeg : windowChunks((long long)nx * s.nfreq * threads, ntb, 4, sms);
-    if (MODE >= 2)                        // sorted: every bin's (a channel may lack some bins)
-        CHECK_CUDA(cudaMemsetAsync(vis, 0, (size_t)W.nbins * s.visCount() * sizeof(cuFloatComplex), st));
-    else if (nchunk > 1 || !m.complete)   // else every block stores its sums, and every visibility has one
-        CHECK_CUDA(cudaMemsetAsync(vis, 0, s.visCount() * sizeof(cuFloatComplex), st));
+    const size_t vc = MODE >= 1 ? s.visCount() / W.avg : s.visCount();     // binned: averaged channels
+    if (MODE >= 1 && W.accumulate) {}     // binned, accumulating: added to what is there
+    else if (MODE >= 2)                   // sorted: every bin's (a channel may lack some bins)
+        CHECK_CUDA(cudaMemsetAsync(vis, 0, (size_t)W.nbins * vc * sizeof(cuFloatComplex), st));
+    else if (nchunk > 1 || !m.complete || (MODE == 1 && W.avg > 1))   // else every block stores its sums, one each
+        CHECK_CUDA(cudaMemsetAsync(vis, 0, vc * sizeof(cuFloatComplex), st));
     kernel<<<dim3(nx, s.nfreq, nchunk), threads, smem, st>>>(s, m, spec, (float2*)vis, superPairs, nsp, P.srows,
                                                               P.nbuf, nchunk, W);
     CHECK_CUDA(cudaGetLastError());
@@ -727,17 +766,25 @@ void xmacTensorStagedMapped(const XmacShape& s, const XmacMap& m, const __half2*
                             cudaStream_t st) {
     stagedDispatch<0>(s, m, spec, vis, sms, st, XmacWeights{});
 }
+static void checkAvg(const XmacShape& s, int avg) {
+    if (avg < 1 || (avg & (avg - 1)) || s.nchan % avg) {
+        fprintf(stderr, "staged tensor XMAC, binned: the channels averaged a power of 2 dividing the channels\n");
+        exit(2);
+    }
+}
 void xmacTensorStagedWeighted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                               const XmacWeights& w, int sms, cudaStream_t st) {
     if (w.nbins < 1 || w.nbins > MAXWBINS || !w.bins || !w.weights) {
         fprintf(stderr, "staged tensor XMAC, weighted: 1 to %d bins, with their bins and weights\n", MAXWBINS);
         exit(2);
     }
+    checkAvg(s, w.avg);
     stagedDispatch<1>(s, m, spec, vis, sms, st, w);
 }
 void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2* spec, cuFloatComplex* vis,
                             const int4* segs, int maxSeg, int nbins, int cstride, int sms, cudaStream_t st,
-                            const int* slotWin) {
+                            const int* slotWin, int avg, bool accumulate) {
+    checkAvg(s, avg);
     if (nbins < 1 || !segs || maxSeg < 1 || (!slotWin && (cstride % 4 || cstride < s.nwin)) || s.nwin % 4 ||
         m.maxOff + (long long)s.nchan * cstride > 0xfffffffeLL) {
         fprintf(stderr, "staged tensor XMAC, sorted: bins and segments needed; the channel stride a multiple of 4, at "
@@ -746,6 +793,8 @@ void xmacTensorStagedSorted(const XmacShape& s, const XmacMap& m, const __half2*
     }
     XmacWeights w;
     w.cstride = cstride;
+    w.avg = avg;
+    w.accumulate = accumulate;
     if (slotWin) { w.slotWin = slotWin; w.cap = s.nwin; }
     w.segs = segs;
     w.maxSeg = maxSeg;

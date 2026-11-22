@@ -26,7 +26,8 @@ its `FINDINGS.md`.
 - Done: binbench's bins (exact against mpifxcorr's rule) and naive port (3.8-188x the unbinned XMAC), on the 2070.
 - Done: weights in the XMAC's stage: the gate and scrunched output in one pass, 0.46-1.35x the unbinned XMAC; a pass per bin 3-70x.
 - Done: bins sorted per channel (channel-major spectra): 2.5-6.5x the unbinned XMAC (18x at 1024 channels x 128 bins, the output).
-- Next: the output side (channel averaging in the XMAC, accumulating across subints).
+- Done: channel averaging and accumulation in the binned XMAC; run-bins.sh, the whole matrix on the 2070 (FINDINGS.md).
+- Next: the A100; per-bin weights; phase centres per bin; sorting over several subints.
 - Investigate in mpifxcorr: the phase at the window's start; LSB dispersion offsets; the normalisation of binned and gated output.
 - Later: coherent dedispersion.
 

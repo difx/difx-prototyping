@@ -207,12 +207,18 @@ __global__ void sort_permute(XmacShape s, int cap, int nslot, const int* __restr
 // ---- the naive port -----------------------------------------------------------------------------
 // A thread per output (frequency, baseline, product, channel), visIndex order; out is [bin][visCount]
 // (zeroed first) or, scrunched, [visCount].
+// avg > 1: avg channels into each output channel (atomically)
+__device__ inline void addOut(float2* o, float2 v, bool atomic) {
+    if (atomic) { atomicAdd(&o->x, v.x); atomicAdd(&o->y, v.y); }
+    else { o->x += v.x; o->y += v.y; }
+}
 template<bool SCRUNCH>
 __global__ void bin_naive(XmacShape s, const int2* __restrict__ bls, const __half2* __restrict__ spec,
-                          const uint8_t* __restrict__ bins, const float* __restrict__ wts, float2* out) {
-    const size_t n = s.visCount();
+                          const uint8_t* __restrict__ bins, const float* __restrict__ wts, float2* out, int avg) {
+    const size_t n = s.visCount(), nOutBin = n / avg;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         const int c = (int)(i % s.nchan);
+        const size_t io = i / s.nchan * (s.nchan / avg) + c / avg;      // the output's index (averaged channels)
         const int p = (int)(i / s.nchan % 4);
         const int bl = (int)(i / ((size_t)s.nchan * 4) % s.nbaseline());
         const int f = (int)(i / ((size_t)s.nchan * 4 * s.nbaseline()));
@@ -235,9 +241,7 @@ __global__ void bin_naive(XmacShape s, const int2* __restrict__ bls, const __hal
                 acc.y += wt * im;
             } else {
                 if (bin != cur) {
-                    float2* o = out + (size_t)cur * n + i;
-                    o->x += acc.x;
-                    o->y += acc.y;
+                    addOut(out + (size_t)cur * nOutBin + io, acc, avg > 1);
                     acc = make_float2(0.f, 0.f);
                     cur = bin;
                 }
@@ -245,12 +249,7 @@ __global__ void bin_naive(XmacShape s, const int2* __restrict__ bls, const __hal
                 acc.y += im;
             }
         }
-        if (SCRUNCH) out[i] = acc;
-        else {
-            float2* o = out + (size_t)cur * n + i;
-            o->x += acc.x;
-            o->y += acc.y;
-        }
+        addOut(out + (SCRUNCH ? 0 : (size_t)cur * nOutBin) + io, acc, avg > 1);
     }
 }
 
@@ -323,6 +322,8 @@ static void usage() {
 "                  bins) (default all that apply)\n"
 "  --noskip        the weighted XMAC runs every 16-window block (no skipping of all-zero weights)\n"
 "  --seg-len L     sorted: a bin's slot blocks (16 slots) a segment (an XMAC block), at most; default 32\n"
+"  --avg A         channels averaged (summed) into each output channel, a power of 2, default 1\n"
+"  --accumulate    add into the output (an integration's) instead of zeroing it every subint\n"
 "  --reps N        timed repetitions, default 20; --warmup N, default 3\n"
 "  --check N       outputs checked against the host, default 128 (each with all its bins)\n"
 "  --csv FILE      append one row per timing\n"
@@ -366,7 +367,8 @@ int main(int argc, char** argv) {
     int nwinArg = 0, reps = 20, warmup = 3, ncheck = 128, device = 0;
     unsigned long long seed = 1;
     std::string only = "naive,stage,passes,sorted,gather", csv, bins = "128", phase = "start";
-    int segLen = 32;
+    int segLen = 32, avg = 1;
+    bool accumulate = false;
     bool scrunchArg = false, noskip = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -391,6 +393,8 @@ int main(int argc, char** argv) {
         else if (a == "--scrunch") scrunchArg = true;
         else if (a == "--noskip") noskip = true;
         else if (a == "--seg-len") segLen = std::stoi(next());
+        else if (a == "--avg") avg = std::stoi(next());
+        else if (a == "--accumulate") accumulate = true;
         else if (a == "--fwhm") u.fwhm = std::stod(next());
         else if (a == "--noise") noise = std::stod(next());
         else if (a == "--only") only = next();
@@ -414,7 +418,7 @@ int main(int argc, char** argv) {
     binLayout(u, bins);
     u.nbl = u.nant * (u.nant - 1) / 2;
     if (u.nant < 2 || u.nfreq < 1 || u.nchan % 4 || u.nwin < 1 || u.nbins < 2 || u.nbins > MAXBINS || reps < 1 ||
-        (phase != "start" && phase != "mid") || u.period <= 0) {
+        (phase != "start" && phase != "mid") || u.period <= 0 || avg < 1 || (avg & (avg - 1)) || u.nchan % avg) {
         usage(); return 2;
     }
     for (int k = 1; k < u.nbins; k++)
@@ -443,8 +447,11 @@ int main(int argc, char** argv) {
            "1/%.0f of the period, %.3g windows), %s\n", u.period * 1e3, u.period / u.twin, u.dm, u.frefMHz,
            u.mid ? "middle" : "start (mpifxcorr)", u.nbins, 1 / minW, minW * u.period / u.twin,
            u.scrunch ? "scrunched (weighted sum)" : "each written");
+    printf("output: %d channels averaged into each of %d%s\n", avg, u.nchan / avg,
+           accumulate ? "; accumulated (no zeroing each subint)" : "");
     const double gib = 1.0 / 1073741824.0;
-    const size_t nOut = u.scrunch ? s.visCount() : (size_t)u.nbins * s.visCount();
+    const size_t visOut = s.visCount() / avg;                         // a bin's output (averaged channels)
+    const size_t nOut = u.scrunch ? visOut : (size_t)u.nbins * visOut;
     const size_t nBin = (size_t)u.nwin * u.nfreq * u.nchan;
     printf("GPU memory: station spectra (FP16) %.2f GiB, bins %.3f GiB, output %.3f GiB\n", s.halfCount() * 4.0 * gib,
            nBin * gib, nOut * 8.0 * gib);
@@ -507,22 +514,21 @@ int main(int argc, char** argv) {
     struct Variant { std::string key, name; std::function<void()> run; };
     std::vector<Variant> variants;
     if (runNaive) variants.push_back({"naive", "naive (a thread per output, over the windows)", [&] {
-        if (u.scrunch) bin_naive<true><<<sms * 16, 256, 0, st>>>(s, dBls, spec, dBins, dWts, out);
-        else {
-            CHECK_CUDA(cudaMemsetAsync(out, 0, nOut * sizeof(float2), st));
-            bin_naive<false><<<sms * 16, 256, 0, st>>>(s, dBls, spec, dBins, dWts, out);
-        }
+        if (!accumulate) CHECK_CUDA(cudaMemsetAsync(out, 0, nOut * sizeof(float2), st));
+        if (u.scrunch) bin_naive<true><<<sms * 16, 256, 0, st>>>(s, dBls, spec, dBins, dWts, out, avg);
+        else bin_naive<false><<<sms * 16, 256, 0, st>>>(s, dBls, spec, dBins, dWts, out, avg);
         CHECK_CUDA(cudaGetLastError()); }});
     if (runStage) variants.push_back({"stage", "stage (the staged XMAC, weighted in its stage)", [&] {
         XmacWeights w;
         w.bins = dBins; w.weights = dWts; w.nbins = u.nbins; w.skip = !noskip; w.negative = anyNeg;
+        w.avg = avg; w.accumulate = accumulate;
         xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)out, w, sms, st); }});
     if (runPasses) variants.push_back({"passes", "passes (the weighted staged XMAC, a pass a bin)", [&] {
         XmacWeights w;
-        w.bins = dBins; w.nbins = u.nbins; w.skip = !noskip;
+        w.bins = dBins; w.nbins = u.nbins; w.skip = !noskip; w.avg = avg; w.accumulate = accumulate;
         for (int b = 0; b < u.nbins; b++) {
             w.weights = dOneHot + (size_t)b * u.nbins;
-            xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)(out + (size_t)b * s.visCount()), w, sms, st);
+            xmacTensorStagedWeighted(s, map, spec, (cuFloatComplex*)(out + (size_t)b * visOut), w, sms, st);
         } }});
 
     // the sorted path: the slots' capacity (each channel's windows plus each bin's padding, generously),
@@ -581,12 +587,14 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaGetLastError());
     };
     auto runSortedXmac = [&] {
-        xmacTensorStagedSorted(ss, mapS, specS, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, cap, sms, st);
+        xmacTensorStagedSorted(ss, mapS, specS, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, cap, sms, st, nullptr, avg,
+                               accumulate);
     };
     if (runSorted) variants.push_back({"sorted", "sorted (sort, permute, the XMAC over the slots)", [&] {
         runSort(); runPermute(); runSortedXmac(); }});
     auto runGatherXmac = [&] {
-        xmacTensorStagedSorted(ss, mapT, specT, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, u.nwin, sms, st, dSlotWin);
+        xmacTensorStagedSorted(ss, mapT, specT, (cuFloatComplex*)out, dSegs, maxSeg, u.nbins, u.nwin, sms, st, dSlotWin, avg,
+                               accumulate);
     };
     if (runGather) variants.push_back({"gather", "gather (sort, the XMAC gathering the slots)", [&] {
         runSort(); runGatherXmac(); }});
@@ -630,17 +638,20 @@ int main(int argc, char** argv) {
     std::vector<Pick> picks;
     Rng rng{seed * 77 + 3};
     auto rnd = [&](int n) { return std::min(n - 1, (int)(rng.uniform() * n)); };
-    for (int i = 0; i < ncheck; i++) picks.push_back({rnd(u.nfreq), rnd(u.nbl), rnd(4), rnd(u.nchan)});
+    const int G = u.nchan / avg;                                       // output channels; picks' c is one
+    for (int i = 0; i < ncheck; i++) picks.push_back({rnd(u.nfreq), rnd(u.nbl), rnd(4), rnd(G)});
+    auto outIdx = [&](int f, int bl, int p, int g) { return (((size_t)f * u.nbl + bl) * 4 + p) * G + g; };
     const int nb = u.scrunch ? 1 : u.nbins;
     std::vector<std::complex<double>> ref(picks.size() * nb), refAll(picks.size()), refStage(picks.size());
     for (size_t q = 0; q < picks.size(); q++) {
         const Pick& k = picks[q];
         const int pol1 = k.p == 1 || k.p == 3, pol2 = k.p == 1 || k.p == 2;
+        for (int cc = k.c * avg; cc < (k.c + 1) * avg; cc++)
         for (int w = 0; w < u.nwin; w++) {
-            const float2 a = __half22float2(hSpec[s.halfIndex(bls[k.bl].x, w, 2 * k.f + pol1, k.c)]);
-            const float2 b = __half22float2(hSpec[s.halfIndex(bls[k.bl].y, w, 2 * k.f + pol2, k.c)]);
+            const float2 a = __half22float2(hSpec[s.halfIndex(bls[k.bl].x, w, 2 * k.f + pol1, cc)]);
+            const float2 b = __half22float2(hSpec[s.halfIndex(bls[k.bl].y, w, 2 * k.f + pol2, cc)]);
             const std::complex<double> v = std::complex<double>(a.x, a.y) * std::conj(std::complex<double>(b.x, b.y));
-            const int bin = hBins[((size_t)w * u.nfreq + k.f) * u.nchan + k.c];
+            const int bin = hBins[((size_t)w * u.nfreq + k.f) * u.nchan + cc];
             if (u.scrunch) {
                 ref[q] += u.weights[bin] * v;
                 // the weighted XMAC: each value times sqrt|w| rounded to FP16, the product rounded to FP16
@@ -659,8 +670,12 @@ int main(int argc, char** argv) {
         double e2 = 0, r2 = 0;
         for (size_t q = 0; q < picks.size(); q++) {
             const Pick& k = picks[q];
-            const float2 g = hVis[s.visIndex(k.f, k.bl, k.p, k.c)];
-            e2 += std::norm(std::complex<double>(g.x, g.y) - refAll[q]);
+            std::complex<double> gv = 0;
+            for (int cc = k.c * avg; cc < (k.c + 1) * avg; cc++) {
+                const float2 g = hVis[s.visIndex(k.f, k.bl, k.p, cc)];
+                gv += std::complex<double>(g.x, g.y);
+            }
+            e2 += std::norm(gv - refAll[q]);
             r2 += std::norm(refAll[q]);
         }
         const double rel = std::sqrt(e2 / std::max(r2, 1e-300));
@@ -669,6 +684,7 @@ int main(int argc, char** argv) {
     }
     std::vector<float2> hOut(nOut);
     for (auto& v : variants) {
+        CHECK_CUDA(cudaMemset(out, 0, nOut * sizeof(float2)));          // (accumulating versions add to it)
         v.run();
         CHECK_CUDA(cudaStreamSynchronize(st));
         CHECK_CUDA(cudaMemcpy(hOut.data(), out, nOut * sizeof(float2), cudaMemcpyDeviceToHost));
@@ -678,7 +694,7 @@ int main(int argc, char** argv) {
             const Pick& k = picks[q];
             std::complex<double> sum = 0;
             for (int b = 0; b < nb; b++) {
-                const float2 g = hOut[(size_t)b * s.visCount() + s.visIndex(k.f, k.bl, k.p, k.c)];
+                const float2 g = hOut[(size_t)b * visOut + outIdx(k.f, k.bl, k.p, k.c)];
                 const std::complex<double> gv(g.x, g.y);
                 const std::complex<double> rf = emu ? refStage[q] : ref[q * nb + b];
                 if (emu) x2 += std::norm(gv - ref[q]);
@@ -708,6 +724,7 @@ int main(int argc, char** argv) {
         // measured: mean Re V over (frequency, baseline, p in {AA, BB}, channel), per sample in the bin;
         // expected: the mean of amp^2 over the bin's samples
         std::vector<double> meas(u.nbins, 0), expect(u.nbins, 0), cnt(u.nbins, 0);
+        CHECK_CUDA(cudaMemset(out, 0, nOut * sizeof(float2)));
         variants[0].run();
         CHECK_CUDA(cudaStreamSynchronize(st));
         CHECK_CUDA(cudaMemcpy(hOut.data(), out, nOut * sizeof(float2), cudaMemcpyDeviceToHost));
@@ -715,7 +732,7 @@ int main(int argc, char** argv) {
             for (int f = 0; f < u.nfreq; f++)
                 for (int bl = 0; bl < u.nbl; bl++)
                     for (int p = 0; p < 2; p++)
-                        for (int c = 0; c < u.nchan; c++) meas[b] += hOut[(size_t)b * s.visCount() + s.visIndex(f, bl, p, c)].x;
+                        for (int g = 0; g < G; g++) meas[b] += hOut[(size_t)b * visOut + outIdx(f, bl, p, g)].x;
         for (int w = 0; w < u.nwin; w++)
             for (int f = 0; f < u.nfreq; f++)
                 for (int c = 0; c < u.nchan; c++) {
@@ -752,12 +769,13 @@ int main(int argc, char** argv) {
         const bool header = !t;
         if (t) fclose(t);
         fc = fopen(csv.c_str(), "a");
-        if (header) fprintf(fc, "gpu,nant,nfreq,nchan,nwin,period_ms,dm,bins,nbins,scrunch,what,ms,ms_per_ms\n");
+        if (header) fprintf(fc, "gpu,nant,nfreq,nchan,nwin,period_ms,dm,bins,nbins,scrunch,avg,accumulate,what,ms,ms_per_ms\n");
     }
     auto line = [&](const std::string& key, const std::string& name, Timing t) {
         printf("  %-52s %8.3f [%8.3f]  %8.4f\n", name.c_str(), t.median, t.min, t.median / subMs);
-        if (fc) fprintf(fc, "\"%s\",%d,%d,%d,%d,%.6g,%g,%s,%d,%d,%s,%.5f,%.6f\n", prop.name, u.nant, u.nfreq, u.nchan, u.nwin,
-                        u.period * 1e3, u.dm, bins.c_str(), u.nbins, (int)u.scrunch, key.c_str(), t.median, t.median / subMs);
+        if (fc) fprintf(fc, "\"%s\",%d,%d,%d,%d,%.6g,%g,%s,%d,%d,%d,%d,%s,%.5f,%.6f\n", prop.name, u.nant, u.nfreq, u.nchan,
+                        u.nwin, u.period * 1e3, u.dm, bins.c_str(), u.nbins, (int)u.scrunch, avg, (int)accumulate, key.c_str(),
+                        t.median, t.median / subMs);
     };
     const Timing tx = timeIt(runXmac, warmup, reps, st);
     line("xmac", "xmac (staged tensor, unbinned)", tx);
