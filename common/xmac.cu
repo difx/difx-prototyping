@@ -263,9 +263,19 @@ xmac_staged_kernel(XmacShape s, XmacMap m, const __half2* __restrict__ spec, flo
         __syncthreads();
         if (W.skip && tb1 - tb0 <= MAXTL) {
             useList = true;
-            // flags per 16-window block: 1 some weight non-zero, 2 some weight not 1.
-            // A half-warp a block's 16 windows, each lane its window's CH channels
+            // flags per 16-window block: 1 some weight non-zero, 2 some weight not 1.  Made with the
+            // bins (W.blockFlags: OR this block's quads), or here: a half-warp a block's 16 windows, each
+            // lane its window's CH channels
             const int nwi = (tb1 - tb0) * 16;
+            if (W.blockFlags) {
+                const int nq = s.nchan / 4, q0 = c0 / 4, q1 = min(nq, (c0 + CH) / 4);
+                for (int t = threadIdx.x; t < tb1 - tb0; t += blockDim.x) {
+                    const uint8_t* b = W.blockFlags + ((size_t)f * ntb + tb0 + t) * nq;
+                    unsigned fl = 0;
+                    for (int qq = q0; qq < q1; qq++) fl |= __ldg(b + qq);
+                    tflag[t] = (unsigned char)fl;
+                }
+            } else
             for (int base = 0; base < nwi; base += blockDim.x) {
                 const int i = base + threadIdx.x, wg = tb0 * 16 + i;
                 unsigned fl = 0;

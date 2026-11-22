@@ -38,6 +38,8 @@
 # TARGETS builds only those programs (as ozstar.sbatch); cases whose program is not built are
 # skipped.  The phase-centre cases alone, without fusebench's long build:
 #     sbatch --time=0:30:00 --export=ALL,CASES='^pc',TARGETS="xmacbench phasecentrebench" common/scripts/ncu-ozstar.sbatch
+# binbench's weighted XMAC against the plain one (pulsar-binning/BACKLOG.md):
+#     sbatch --time=0:30:00 --export=ALL,CASES='^pb',TARGETS="xmacbench binbench" common/scripts/ncu-ozstar.sbatch
 # NCU_OPTS: more ncu options, e.g. "--clock-control none" where nothing may override a clock lock.
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
@@ -112,11 +114,12 @@ run_profile() {
     [ -x "build-sm$SM/$prog" ] || { echo "== $name: skipped ($prog not built)"; return; }
     local OUT=fft-fusion/results-local/$STAMP
     [ "$prog" = phasecentrebench ] && OUT=phase-centres/results-local/$STAMP
+    [ "$prog" = binbench ] && OUT=pulsar-binning/results-local/$STAMP
     mkdir -p "$OUT"
     [[ " ${outs[*]} " == *" $OUT "* ]] || outs+=("$OUT")
     echo "== $name: $kernel in $prog $*"
     local t0=$(date +%s)
-    "$NCU" --set full --import-source yes "${ncuopts[@]}" -k "regex:$kernel" -c 1 -f -o "$OUT/$name" \
+    "$NCU" --set full --import-source yes "${ncuopts[@]}" "${case_ncu[@]}" -k "regex:$kernel" -c 1 -f -o "$OUT/$name" \
         "build-sm$SM/$prog" "$@" "${QUICK[@]}" > "$OUT/$name.run.log" 2>&1
     local rc=$?
     if grep -q ERR_NVGPUCTRPERM "$OUT/$name.run.log"; then
@@ -142,6 +145,15 @@ run_profile() {
 profile() { run_profile fusebench "$@"; }     # profile <case> <kernel regex> <fusebench options...>
 profilex() { run_profile xmacbench "$@"; }    # profilex <case> <kernel regex> <xmacbench options...>
 profilep() { run_profile phasecentrebench "$@"; }   # profilep <case> <kernel regex> <phasecentrebench options...>
+case_ncu=()
+# profileb <case> <launches to skip> <kernel regex, on the demangled name> <binbench options...>
+profileb() {
+    local name=$1 skip=$2
+    shift 2
+    case_ncu=(--kernel-name-base demangled --launch-skip "$skip")
+    run_profile binbench "$name" "$@"
+    case_ncu=()
+}
 
 # the fused kernel with an FP32 and an FP16 buffer as input; a plain streaming kernel (the
 # fixed-point rotation, post_kernel) for comparison
@@ -195,6 +207,17 @@ for b in 3 4; do
 done
 # the blocks an SM phasecentrebench chooses itself (4 where 4 fit): its run.log says which
 profilep pc-default-auto       shift_tile --only tensor
+
+# binbench's weighted staged XMAC (pulsar gating / scrunched binning, 10 stations: KS 2, 8 channels a
+# block) against the plain one, 128 channels: the 500 ms gate (every block on-pulse, weights all 1:
+# no multiplies), with the block flags made with the bins and with each block classifying its own
+# windows (binbench runs the plain XMAC, then stage, then stage-self: the second weighted launch);
+# and 16 bins scrunched at 1.5 ms (weights other than 0 and 1: the multiplies)
+B500=(--period-ms 500 --nchan 128 --bins gate --only stage)
+profileb pb-plain-c128         0 'xmac_staged_kernel<.int.2, .int.8, .int.0>' "${B500[@]}"
+profileb pb-gate500-flags-c128 0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' "${B500[@]}"
+profileb pb-gate500-self-c128  1 'xmac_staged_kernel<.int.2, .int.8, .int.1>' "${B500[@]}"
+profileb pb-16s-1.5ms-flags-c128 0 'xmac_staged_kernel<.int.2, .int.8, .int.1>' --period-ms 1.5 --nchan 128 --bins 16 --scrunch --only stage
 
 packs=()
 for o in "${outs[@]}"; do

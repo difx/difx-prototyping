@@ -42,10 +42,12 @@ to keep arbitrary breakpoints.
   fastest in the rest (128 channels, short runs or high DM); the permuted copy never wins there.  Kept (2026-11-22): drop the
   permuted copy and the channel-major path in DiFX; the 128-channel millisecond pulsar below.
 - **The weighted kernel's rest** (the A100, job 21376562: 1.15-1.25x the XMAC for an all-ones gate,
-  no multiplies; 2-11% on the 2070): the per-16-window-block classification once per subint in the
-  bins kernel (per frequency, 4-channel quad and block) instead of in every XMAC block; Nsight
-  Compute on the A100, the weighted kernel (all-ones gate) against the plain one, to split the
-  classification from the kernel's structure.
+  no multiplies; 2-11% on the 2070): the classification is now made with the bins (`block_flags`,
+  flag bytes per frequency, 16-window block and 4-channel quad; on the 2070 net -0.4% to +1.6%,
+  docs/results.md, "The classification with the bins"): the A100 to measure it, and Nsight Compute
+  there (the pb-* cases of ncu-ozstar.sbatch) to split what is left.  If the flags stay, fold
+  `block_flags` into another kernel (0.014 ms alone on the 2070, mostly its launch and 16 dependent
+  loads).
 - **The per-bin weights' correction** on the tensor cores, if heavily flagged data matter (0.26 ms at
   1161 flagged windows, 128 bins, 10 stations; it grows with flagged windows x bins x baselines).
 - **The millisecond pulsar at fewer channels, from window-major spectra** (kept: window-major; 128

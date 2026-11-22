@@ -442,3 +442,22 @@ weighted kernel itself.  Moving the classification into the bins kernel would sa
   the list while the others wait) and the weighted kernel's structure; on the 2070 those were 4-11%.
   Moving the classification into the bins kernel is worth more here; an Nsight Compute comparison
   of the weighted kernel (all-ones gate) with the plain one would split the two.
+
+### The classification with the bins (2026-11-22, RTX 2070 SUPER)
+
+Each XMAC block classified its 16-window blocks itself, reading the bins of every (window, channel)
+in its range: per block 16 x CH bytes a 16-window block, a half-warp's shuffles, then one warp making
+the list while the others wait.  Now a small kernel after the bins kernel (`block_flags`, a thread
+a (frequency, 16-window block, 4-channel quad): 16 4-byte loads of the bins) writes one flag byte
+each, bit 0 some weight non-zero, bit 1 some weight not 1, and the XMAC block ORs its channel
+group's quads from them (`XmacWeights::blockFlags`; without it, the XMAC classifies as before).  A
+separate kernel because the bins kernel's chunks of windows are not 16-window aligned (they are
+sized to fill the GPU).
+
+`run-bins.sh` (`results-local/ar313-adeller-bins-20261122-173757`, every run passing): `stage` with the flags, `stage-self` classifying in the
+XMAC.  On the 2070 the weighted XMAC is 0.3-2.8% of the unbinned XMAC faster with the flags (the
+1.5 ms gate at 128 channels 0.378x against 0.395x; 16 scrunched 1.122x against 1.144x; the 500 ms
+gate 1.085x against 1.093x), and the flags kernel costs 0.014-0.015 ms (1.0-1.2%), so the net is
+-0.4% to +1.6%: as expected where the classification was 2-4%.  The A100, where 15-25% is left with
+no multiplies, is the test; with Nsight Compute (`ncu-ozstar.sbatch`, the pb-* cases) the weighted
+kernel on the all-ones 500 ms gate, with the flags and classifying itself, against the plain one.

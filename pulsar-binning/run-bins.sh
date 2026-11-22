@@ -66,7 +66,7 @@ for r in rows:
         flagged.setdefault(k + (r['dropout'], r['partial']), {})[r['what']] = float(r['ms'])
     else:
         runs.setdefault(k, {})[r['what']] = float(r['ms'])
-vers = ['naive', 'stage', 'passes', 'sorted', 'gather', 'gatherwm']
+vers = ['naive', 'stage', 'stage-self', 'passes', 'sorted', 'gather', 'gatherwm']
 print("ms per subint (25.6 ms); best / xmac: the fastest binned version against the unbinned staged XMAC (gatherwm: gather")
 print("from the window-major spectra; sorted and gather start from channel-major ones, not counted)")
 print("bins: the bins kernel with each bin's count and the flagged windows' histograms; weights: the per-bin weights after it;")

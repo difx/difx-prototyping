@@ -131,6 +131,10 @@ struct XmacWeights {
     int nbins = 0;
     bool skip = false;
     bool negative = false;              // some weight is negative (no longer needed: the sign is in w)
+    // weighted, skip: each 16-window block's flags per 4-channel quad, made with the bins, [frequency]
+    // [block][nchan / 4], bit 0 some weight non-zero, bit 1 some weight not 1; null: each XMAC block
+    // classifies its windows from the bins itself
+    const uint8_t* blockFlags = nullptr;
     const int4* segs = nullptr;         // sorted (below)
     int maxSeg = 0;
     int cstride = 0;                    // sorted: __half2 from one channel to the next (channel-major)
