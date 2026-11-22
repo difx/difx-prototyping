@@ -55,7 +55,12 @@ Detail: [docs/mpifxcorr.md](docs/mpifxcorr.md) (how mpifxcorr does it),
     slower on the 2070, where shared memory allows only 3).  ([results.md](docs/results.md),
     "A100 Nsight Compute")
   - Shifts instead of a run-time division in the loads' index, and a stepped index in the final
-    store: 2.7-7% on the 2070; the A100 not yet measured.
+    store: 2.7-7% on the 2070, 6-9% on the A100 (15% at 10 pieces with 4 blocks).
+  - phasecentrebench picks 4 blocks an SM where 4 fit (the A100), else 3 (the 2070).  With both,
+    the A100's shift is 1.16x faster than after the optimisation round at the default and at
+    1000 centres, 1.27x at 10 pieces: 2.7-4.2 Tcmac/s, 0.0085 ms per ms at 100 centres (about
+    +40% over the XMAC).  At 8 averaged 4 blocks is 3% slower than 3 (unexplained; few centres
+    there).  ([results.md](docs/results.md), "A100 Nsight Compute")
   - XMAC 4-9% faster, within its 9% run-to-run spread.  ([results.md](docs/results.md), "A100 ...
     after the optimisation round")
 - **Lower sideband** works through a base frequency per band, as mpifxcorr's rotator.

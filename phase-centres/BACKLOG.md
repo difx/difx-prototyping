@@ -17,6 +17,8 @@ shift / XMAC ≈ 2 × centres / windows per piece.
   faster there; the loads' index by shifts and the final store's index stepped (2.7-7% on the 2070).
 - Blocks an SM chosen for the GPU: 4 where 4 fit (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`:
   the A100), else 3 (the 2070); `--blocks` overrides.
+- The index fixes on the A100 (job 21371274): 6-9% (15% at 10 pieces, 4 blocks); with 4 blocks
+  1.16-1.27x over the optimisation round's A100 shift.
 - Lower sideband (`--sideband`).
 - The lag-window term of the decorrelation estimate checked by simulation (`lagwindow.py`).
 
@@ -32,14 +34,15 @@ shift / XMAC ≈ 2 × centres / windows per piece.
 
 ## Next
 
-- **The A100 again** (the pc-* cases of `common/scripts/ncu-ozstar.sbatch`, a few minutes): the
-  index changes (2.7-7% on the 2070) on the issue-bound A100, at 3 and 4 blocks.
 - **Short pieces** (only if a user wants pieces of a few ms): windows per piece not a multiple of
   16 pay for the whole MMA tile; pieces rounded to multiples of 16 windows would avoid it.
 
 ## Later
 
 - A NUFFT shift for centres far more than the channels averaged.
+- More work per block (only if the shift becomes the bottleneck): a block is 64 rows x 32 centres x
+  A channels, so its fixed costs (per-piece setup 16%, the final store 13% of the instructions on
+  the A100) are paid often; more rows or centres a block would spread them, a larger restructuring.
 - In DiFX: the shift kernel after gpudifx's XMAC; `maxNSBetweenUVShifts` to pieces as here.  How
   its tunables (centres per block, blocks per SM) are chosen: see "Carry to DiFX" in
   [../BACKLOG.md](../BACKLOG.md).

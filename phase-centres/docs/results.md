@@ -277,11 +277,32 @@ profiler on the same node (`results-local/ncu-gina5-20261122-122043`, every timi
   mask do it; and the final store now steps its index (+16 G a centre's step) instead of
   computing it per output.  On the 2070: 2.7-7% faster (default 0.657 -> 0.639 ms, 1000 centres
   5.04 -> 4.88, 8 averaged 2.72 -> 2.53, 65536 channels 3.79 -> 3.61), every check passing
-  (also at 37 centres, 7 stations, mixed sidebands).  On the A100, issue-bound, probably more:
-  not yet measured.
+  (also at 37 centres, 7 stations, mixed sidebands).  On the A100: below.
 - **phasecentrebench now chooses the blocks an SM itself**: 4 where 4 fit
   (`cudaOccupancyMaxActiveBlocksPerMultiprocessor` for the 4-block kernel: registers and shared
   memory), else 3.  It picks 3 on the 2070; `--blocks 3|4` overrides.
+- **The index fixes on the A100** (job 21371274, the same node gina5, commit 5656637,
+  `results-local/ncu-gina5-20261122-123356`, every timing run passing), ms a subint:
+
+  | shape | 3 blocks: before -> after | 4 blocks: before -> after | 4 blocks now against 3 before |
+  |---|---|---|---|
+  | default | 0.251 -> 0.237 (6%) | 0.231 -> 0.217 (6%) | 1.16x |
+  | 1000 centres | 1.640 -> 1.518 (7%) | 1.547 -> 1.413 (9%) | 1.16x |
+  | 10 pieces | 2.017 -> 1.895 (6%) | 1.875 -> 1.589 (15%) | 1.27x |
+  | 8 averaged | 0.949 -> 0.885 (7%) | 0.892 -> 0.910 (-2%) | 1.04x |
+
+  - 6-9% from the index fixes, 15% at 10 pieces with 4 blocks.  The shift now runs at 2.7 Tcmac/s
+    at the default, 3.7 at 10 pieces, 4.2 at 1000 centres (7-11% of the tensor rate);
+    0.0085 ms per ms at the default (0.0096 in the sweep after the optimisation round).  With
+    that sweep's XMAC (0.0224, another node), the chain at 100 centres is about +40% over the
+    XMAC alone.
+  - Without `--blocks` phasecentrebench chose 4 on the A100 (pc-default-auto: 0.217 ms, the
+    same as `--blocks 4`).
+  - At 8 averaged, 4 blocks is now 3% slower than 3 in the timing run (0.910 against 0.885 ms),
+    though 7% faster under the profiler at its fixed base clock (907 against 973 us).  The
+    4-block kernel spills 20 bytes on sm_80 (local loads and stores 1% of its instructions),
+    as before the fixes.  Not explained; short averages come with few centres, where the shift
+    is cheap anyway.
 - What is left is mostly inherent to this layout: a sincos per output per piece, and fixed costs
   per block (a block is 64 rows x 32 centres x A channels: at the default 2 chunks of 32 channels)
   that more work per block would amortise, at the price of a larger restructuring.
