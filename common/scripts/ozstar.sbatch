@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #SBATCH --job-name=difx-proto
-#SBATCH --output=ozstar.%j.log
+#SBATCH --output=logfiles/ozstar.%j.log    # from the directory you submit in: the root
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8         # for the parallel build (the fused kernel is compiled per FFT length)
@@ -27,11 +27,12 @@
 #     cd difx-prototyping
 #     make mathdx           # fetches MathDx (cuFFTDx) from PyPI; the GPU nodes may have no network
 #     sbatch common/scripts/ozstar.sbatch
-# Submit from anywhere in the checkout (or set BENCHDIR to its root).  The SLURM log ozstar.<jobid>.log
-# is written where you submit (the root, as above) and holds the summary.  Each script's results go
+# Submit from the checkout's root: the SLURM log, logfiles/ozstar.<jobid>.log, holds the summary, and
+# SLURM writes it relative to where you submit (it does not create logfiles/; the checkout has it).
+# The build log is logfiles/build-sm<SM>.<jobid>.log.  Each script's results go
 # to its sub-project's results-local/<host>-...-<stamp>/, packed into a .tgz next to it at the end.
-# The job then writes copy-results.<jobid>.sh in the root (make-copy-script.sh): run it once the
-# job has finished to copy the SLURM log and the .tgz files to the same places in RESULTS_DEST
+# The job then writes logfiles/copy-results.<jobid>.sh (make-copy-script.sh): run it once the job
+# has finished to copy the SLURM log, the build log and the .tgz files to the same places in RESULTS_DEST
 # (default ar313's checkout; --export=ALL,RESULTS_DEST=<host>:<checkout>/).
 #
 # Other settings, through the environment:
@@ -81,11 +82,12 @@ tmpfree=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR==2 {print int($4/1048576)}')
 echo "Temporary files in ${TMPDIR:-/tmp} (${tmpfree:-?} GB free)"
 [ "${tmpfree:-0}" -ge 3 ] || echo "WARNING: the build may need ~3 GB of temporary space: set TMPDIR, or build on a login node first"
 # Jobs started together (ozstar.sbatch and ncu-ozstar.sbatch) build in the same
-# build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
+# build-sm<SM> directory, so they take turns (flock); each keeps its own build log (logfiles/).  Where the
 # filesystem does not support locks, warn and build without one.
-blog="build-sm$SM.${SLURM_JOB_ID:-manual}.log"
-lock=(flock "build-sm$SM.lock")
-flock -n -E 200 "build-sm$SM.lock" true 2>/dev/null
+mkdir -p logfiles
+blog="logfiles/build-sm$SM.${SLURM_JOB_ID:-manual}.log"
+lock=(flock "logfiles/build-sm$SM.lock")
+flock -n -E 200 "logfiles/build-sm$SM.lock" true 2>/dev/null
 rc=$?
 if [ $rc != 0 ] && [ $rc != 200 ]; then
     echo "WARNING: file locks do not work in $BENCHDIR; building without one, so do not start two of these jobs at once"
@@ -122,5 +124,5 @@ for script in ${SCRIPTS:-fft-fusion/run-bench.sh fft-fusion/run-nchan.sh xmac/ru
     run "$script"
 done
 submit=$(realpath --relative-to="$BENCHDIR" "${SLURM_SUBMIT_DIR:-$BENCHDIR}")
-SLURM_LOG="${SLURM_JOB_ID:+$submit/ozstar.$SLURM_JOB_ID.log}" common/scripts/make-copy-script.sh "${packed[@]}"
+SLURM_LOG="${SLURM_JOB_ID:+$submit/logfiles/ozstar.$SLURM_JOB_ID.log}" common/scripts/make-copy-script.sh "$blog" "${packed[@]}"
 exit $rc

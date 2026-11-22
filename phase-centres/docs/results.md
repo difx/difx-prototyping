@@ -231,10 +231,13 @@ Columns as above, ms per ms of data:
 **Why the A100 gains less: occupancy, by registers.**  Built for sm_80 the kernel is the same 80
 registers and 21 KB, so 3 blocks of 256 threads an SM: 24 warps of the A100's 64 (37.5%),
 against 24 of the 2070's 32 (75%).  Shared memory would allow 7 blocks; registers allow 3.
-- Four blocks (`__launch_bounds__(256, 4)`) compiles to 64 registers with a 32-byte spill (sm_75
-  and sm_80).  On the 2070 that is 3-12% slower (default 899 -> 842 Gcmac/s, 1000 centres
-  1159 -> 1125, 8 averaged 218 -> 192), as three blocks there already fill 75%.  On the A100 it
-  would be 50%: untested.  Five blocks spills 164 bytes.
+- Four blocks (`--blocks 4`: `__launch_bounds__(256, 4)`) compiles to 64 registers with a 32-byte
+  spill (sm_75 and sm_80).  On the 2070 that is 3-12% slower (default 899 -> 842 Gcmac/s, 1000
+  centres 1159 -> 1125, 8 averaged 218 -> 192): shared memory (64 KB an SM on Turing) still
+  allows only 3 blocks there (ncu: occupancy limit 3 by shared memory, 4 by registers; 73%
+  achieved either way), so it is the registers' cost without the occupancy.  On the A100 it would
+  be 32 of 64 warps: to be measured (`common/scripts/ncu-ozstar.sbatch`, the pc-* cases).  Five
+  blocks spills 164 bytes.
 - The A100 also has 16x the tensor rate of its FP32 cores (the 2070 about 4x), so the kernel's
   FP32 work (phasors, conversion to FP16, the outer phasor: about a quarter of the instructions
   on the 2070) weighs more there.  Not profiled on the A100.

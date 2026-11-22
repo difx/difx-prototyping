@@ -1,0 +1,4 @@
+# OzSTAR job logs, build logs and copy scripts (common/scripts/*.sbatch): kept out of git; this
+# file keeps the directory in every clone, as SLURM does not create it for --output
+*
+!.gitignore

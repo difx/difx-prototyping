@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #SBATCH --job-name=difx-proto-ncu
-#SBATCH --output=ncu.%j.log
+#SBATCH --output=logfiles/ncu.%j.log       # from the directory you submit in: the root
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8         # for the parallel build
@@ -15,16 +15,19 @@
 # Nsight Compute profiles of the fusebench kernels on one OzSTAR GPU node (an A100 on the gina
 # nodes): the full set of sections for one launch of each kernel below, to find out why the fused
 # kernel stays well below the memory bandwidth (fft-fusion/docs/station-kernel.md, "What changes on
-# the A100"), and of the xmacbench kernels.
+# the A100"), of the xmacbench kernels, and of phasecentrebench's tensor shift at 3 and 4 blocks an
+# SM (the pc-* cases: phase-centres/BACKLOG.md, the A100's occupancy), each with a timing run
+# without the profiler (<case>.time.log) for the two to be compared on the same node.
 #
 # Set up and submit as ozstar.sbatch (its header): the same DIFX_SETUP, from the checkout after
 # "make mathdx" on a login node (sbatch common/scripts/ncu-ozstar.sbatch).  ncu comes from the CUDA
 # toolkit DIFX_SETUP selects (NCU=<path to ncu> overrides).  The job writes
-# fft-fusion/results-local/ncu-<host>-<stamp>/:
+# fft-fusion/results-local/ncu-<host>-<stamp>/ (phase-centres/results-local/ for the pc-* cases):
 #   <case>.ncu-rep   the reports (open in the Nsight Compute GUI: ncu-ui), with the source
 #   <case>.txt       the same as text (ncu --import ... --page details)
 #   <case>.run.log   fusebench's own output under the profiler
-# and packs it into a .tgz next to it, and writes copy-results.<jobid>.sh (as ozstar.sbatch).  If the GPU's
+# and packs it into a .tgz next to it, and writes logfiles/copy-results.<jobid>.sh (as ozstar.sbatch;
+# its SLURM log is logfiles/ncu.<jobid>.log, so submit from the root).  If the GPU's
 # performance counters are restricted to administrators, ncu fails with ERR_NVGPUCTRPERM; the job
 # then stops and says so.  ncu locks the GPU to its base clock while it profiles (the A100's
 # 1095 MHz rather than 1410), so its durations are longer than fusebench's.
@@ -32,6 +35,10 @@
 # CASES=<extended regex> profiles only the cases whose names match, e.g. the xmacbench ones alone
 # (a few minutes once built):
 #     sbatch --export=ALL,CASES='^x' common/scripts/ncu-ozstar.sbatch
+# TARGETS builds only those programs (as ozstar.sbatch); cases whose program is not built are
+# skipped.  The phase-centre cases alone, without fusebench's long build:
+#     sbatch --time=0:30:00 --export=ALL,CASES='^pc',TARGETS="xmacbench phasecentrebench" common/scripts/ncu-ozstar.sbatch
+# NCU_OPTS: more ncu options, e.g. "--clock-control none" where nothing may override a clock lock.
 
 DIFX_SETUP="${DIFX_SETUP:-$HOME/setup_difx.claude}"
 BENCHDIR="${BENCHDIR:-$(git -C "${SLURM_SUBMIT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null)}"
@@ -71,22 +78,25 @@ tmpfree=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR==2 {print int($4/1048576)}')
 echo "Temporary files in ${TMPDIR:-/tmp} (${tmpfree:-?} GB free)"
 [ "${tmpfree:-0}" -ge 3 ] || echo "WARNING: the build may need ~3 GB of temporary space: set TMPDIR, or build on a login node first"
 # Jobs started together (ozstar.sbatch and ncu-ozstar.sbatch) build in the same
-# build-sm<SM> directory, so they take turns (flock); each keeps its own build log.  Where the
+# build-sm<SM> directory, so they take turns (flock); each keeps its own build log (logfiles/).  Where the
 # filesystem does not support locks, warn and build without one.
-blog="build-sm$SM.${SLURM_JOB_ID:-manual}.log"
-lock=(flock "build-sm$SM.lock")
-flock -n -E 200 "build-sm$SM.lock" true 2>/dev/null
+mkdir -p logfiles
+blog="logfiles/build-sm$SM.${SLURM_JOB_ID:-manual}.log"
+lock=(flock "logfiles/build-sm$SM.lock")
+flock -n -E 200 "logfiles/build-sm$SM.lock" true 2>/dev/null
 rc=$?
 if [ $rc != 0 ] && [ $rc != 200 ]; then
     echo "WARNING: file locks do not work in $BENCHDIR; building without one, so do not start two of these jobs at once"
     lock=()
 fi
-"${lock[@]}" make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" > "$blog" 2>&1 \
+read -r -a targets <<< "${TARGETS:-all}"
+read -r -a ncuopts <<< "${NCU_OPTS:-}"
+"${lock[@]}" make -j"${SLURM_CPUS_PER_TASK:-8}" SM="$SM" "${mathdx[@]}" "${targets[@]}" > "$blog" 2>&1 \
     || { echo "ERROR: build failed, see $BENCHDIR/$blog" >&2; tail -20 "$blog" >&2; exit 1; }
 head -1 "$blog"
 
-OUT=fft-fusion/results-local/ncu-$(hostname -s)-$(date +%Y%m%d-%H%M%S)
-mkdir -p "$OUT"
+STAMP=ncu-$(hostname -s)-$(date +%Y%m%d-%H%M%S)
+outs=()                           # the results directories written (fft-fusion's, phase-centres')
 QUICK=(--reps 1 --warmup 0 --check 0)
 # big enough not to fit in the A100's 40 MB L2 cache (128 channels: 164 MB of FP32 input per antenna)
 C128=(--nchan 128 --nwin 10000)
@@ -99,9 +109,14 @@ run_profile() {
     local prog=$1 name=$2 kernel=$3
     shift 3
     [ -n "${CASES:-}" ] && ! [[ $name =~ $CASES ]] && return
+    [ -x "build-sm$SM/$prog" ] || { echo "== $name: skipped ($prog not built)"; return; }
+    local OUT=fft-fusion/results-local/$STAMP
+    [ "$prog" = phasecentrebench ] && OUT=phase-centres/results-local/$STAMP
+    mkdir -p "$OUT"
+    [[ " ${outs[*]} " == *" $OUT "* ]] || outs+=("$OUT")
     echo "== $name: $kernel in $prog $*"
     local t0=$(date +%s)
-    "$NCU" --set full --import-source yes -k "regex:$kernel" -c 1 -f -o "$OUT/$name" \
+    "$NCU" --set full --import-source yes "${ncuopts[@]}" -k "regex:$kernel" -c 1 -f -o "$OUT/$name" \
         "build-sm$SM/$prog" "$@" "${QUICK[@]}" > "$OUT/$name.run.log" 2>&1
     local rc=$?
     if grep -q ERR_NVGPUCTRPERM "$OUT/$name.run.log"; then
@@ -117,10 +132,16 @@ run_profile() {
     "$NCU" --import "$OUT/$name.ncu-rep" --page details > "$OUT/$name.txt" 2>&1
     grep -E "^  [a-zA-Z_].*\(|Duration|DRAM Throughput|Memory Throughput|Compute \(SM\) Throughput|Achieved Occupancy|Registers Per Thread" \
         "$OUT/$name.txt" | head -8 | cut -c1-150
+    if [ "$prog" = phasecentrebench ]; then      # and its timing without the profiler, checked
+        "build-sm$SM/$prog" "$@" --reps 20 --check 128 > "$OUT/$name.time.log" 2>&1
+        { [ $? = 0 ] && grep -q '^check: PASS$' "$OUT/$name.time.log"; } || { echo "   timing run FAILED"; fail=1; }
+        grep -E '^  shift: ' "$OUT/$name.time.log" | sed 's/^ */   timing: /'
+    fi
     echo "   ($(( $(date +%s) - t0 )) s)"
 }
 profile() { run_profile fusebench "$@"; }     # profile <case> <kernel regex> <fusebench options...>
 profilex() { run_profile xmacbench "$@"; }    # profilex <case> <kernel regex> <xmacbench options...>
+profilep() { run_profile phasecentrebench "$@"; }   # profilep <case> <kernel regex> <phasecentrebench options...>
 
 # the fused kernel with an FP32 and an FP16 buffer as input; a plain streaming kernel (the
 # fixed-point rotation, post_kernel) for comparison
@@ -163,8 +184,22 @@ profilex xstaged-c128-n64-ks2      xmac_staged_kernel --nchan 128 --nwin 10000 -
 profilex xstaged-c128-n100         xmac_staged_kernel --nchan 128 --nwin 10000 --nant 100 --only staged
 profilex xstaged-c1024-n32         xmac_staged_kernel --nchan 1024 --nwin 1000 --nant 32 --only staged
 
-tar czf "$OUT.tgz" -C fft-fusion/results-local "$(basename "$OUT")"
-echo "Packed: $BENCHDIR/$OUT.tgz"
+# phasecentrebench's tensor shift (the XMAC and the delays run first, unprofiled), at 3 blocks an
+# SM (80 registers, the default) and 4 (64): the default shape, 1000 centres, 10 pieces (the matrix
+# product's share largest), 8 channels averaged (the per-output work's largest)
+for b in 3 4; do
+    profilep pc-default-b$b    shift_tile --only tensor --blocks $b
+    profilep pc-c1000-b$b      shift_tile --only tensor --blocks $b --centres 1000
+    profilep pc-pieces10-b$b   shift_tile --only tensor --blocks $b --pieces 10
+    profilep pc-avg8-b$b       shift_tile --only tensor --blocks $b --avg 8
+done
+
+packs=()
+for o in "${outs[@]}"; do
+    tar czf "$o.tgz" -C "$(dirname "$o")" "$(basename "$o")"
+    echo "Packed: $BENCHDIR/$o.tgz"
+    packs+=("$o.tgz")
+done
 submit=$(realpath --relative-to="$BENCHDIR" "${SLURM_SUBMIT_DIR:-$BENCHDIR}")
-SLURM_LOG="${SLURM_JOB_ID:+$submit/ncu.$SLURM_JOB_ID.log}" common/scripts/make-copy-script.sh "$OUT.tgz"
+SLURM_LOG="${SLURM_JOB_ID:+$submit/logfiles/ncu.$SLURM_JOB_ID.log}" common/scripts/make-copy-script.sh "$blog" "${packs[@]}"
 [ $fail = 0 ] || { echo "SOME PROFILES FAILED: see the .run.log files" >&2; exit 1; }

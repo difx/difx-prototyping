@@ -47,7 +47,8 @@ Detail: [docs/mpifxcorr.md](docs/mpifxcorr.md) (how mpifxcorr does it),
     centres / windows per piece.  100 centres: +45% over the XMAC (was +65%); 1000: 4.1x (was 5.8x).
   - The gain is mostly storing each output once; the matrix product barely moved (1.08x at 10
     pieces).  The same 80 registers fit only 3 blocks an SM: 37.5% of the A100's warps (75% on
-    the 2070).  Four blocks (64 registers) is 3-12% slower on the 2070, untested on the A100.
+    the 2070).  Four blocks (64 registers) is 3-12% slower on the 2070, where shared memory still
+    allows only 3; untested on the A100.
   - XMAC 4-9% faster, within its 9% run-to-run spread.  ([results.md](docs/results.md), "A100 ...
     after the optimisation round")
 - **Lower sideband** works through a base frequency per band, as mpifxcorr's rotator.

@@ -68,7 +68,8 @@ phase-centres/run-centres.sh           # the sweeps of docs/results.md
 
 `--help` lists the options: stations, frequencies, channels, bandwidth, sideband, windows, pieces,
 averaging, centres, the field's delay spread, the source's centre, noise, the tensor shift's
-centres a block.
+centres a block and blocks an SM (`--blocks 3|4`).  Nsight Compute profiles of the tensor shift on
+OzSTAR: the pc-* cases of `common/scripts/ncu-ozstar.sbatch` (its header).
 
 `lagwindow.py` checks the lag-window term of mpifxcorr's decorrelation estimate by a time-domain
 simulation (numpy).

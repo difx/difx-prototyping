@@ -30,9 +30,10 @@ shift / XMAC ≈ 2 × centres / windows per piece.
 
 - **The A100's occupancy** (only if the shift matters there: it is +45% over the XMAC at 100
   centres).  The A100 run after the optimisation round (docs/results.md) gained 1.1-2.1x, not the
-  2070's 1.4-3.0x: 80 registers allow 3 blocks an SM, 24 of its 64 warps.  To try: 4 blocks
-  (`__launch_bounds__(256, 4)`, 64 registers, a 32-byte spill; 3-12% slower on the 2070) as a
-  build option, then ncu on the A100 for how much its FP32 work (phasors, outer phasor) costs.
+  2070's 1.4-3.0x: 80 registers allow 3 blocks an SM, 24 of its 64 warps.  Set up: `--blocks 4`
+  (64 registers, a 32-byte spill; 3-12% slower on the 2070, where shared memory allows only 3
+  blocks anyway), and the pc-* cases in `common/scripts/ncu-ozstar.sbatch`: ncu and a timing run
+  at 3 and 4 blocks, for the occupancy and how much the FP32 work (phasors, outer phasor) costs.
 - **Short pieces** (only if a user wants pieces of a few ms): windows per piece not a multiple of
   16 pay for the whole MMA tile; pieces rounded to multiples of 16 windows would avoid it.
 

@@ -77,15 +77,18 @@ sbatch common/scripts/ozstar.sbatch                    # the default set (below)
 sbatch --export=ALL,SCRIPTS="xmac/run-xmac.sh" common/scripts/ozstar.sbatch
 sbatch --time=0:45:00 --export=ALL,SCRIPTS=two-stage/run-twostage.sh,NCHAN=8192,NWIN=128 common/scripts/ozstar.sbatch
 sbatch common/scripts/ncu-ozstar.sbatch                # Nsight Compute profiles (--set full)
+sbatch --time=0:30:00 --export=ALL,CASES='^pc',TARGETS="xmacbench phasecentrebench" common/scripts/ncu-ozstar.sbatch
 ```
 
 The job sources your gpudifx setup (`DIFX_SETUP`, default `$HOME/setup_difx.claude`: module
 loads, then `setup.bash`), builds for the GPU it gets (`TARGETS` to build only some binaries),
 and runs the scripts in `SCRIPTS` (paths from the root; default `fft-fusion/run-bench.sh
 fft-fusion/run-nchan.sh xmac/run-xmac.sh xmac/run-staged.sh`), each in its own sub-project.  Each
-script's results are packed into a `.tgz` next to them.  At the end the job writes
-`copy-results.<jobid>.sh` in the root: run it once the job has finished, and it copies the SLURM
-log (`ozstar.<jobid>.log`) and the `.tgz` files with one `rsync` to the same places in
+script's results are packed into a `.tgz` next to them.  The job's logs go to `logfiles/`
+(git ignores its contents): the SLURM log `logfiles/ozstar.<jobid>.log` (so submit from the root,
+as above: SLURM writes it relative to where you submit) and the build log.  At the end the job
+writes `logfiles/copy-results.<jobid>.sh`: run it once the job has finished, and it copies the
+SLURM log, the build log and the `.tgz` files with one `rsync` to the same places in
 `RESULTS_DEST` (default ar313's checkout).  The headers of the two `.sbatch` files have the
 details.
 

@@ -153,7 +153,8 @@ __global__ void shift_naive(Geo g, const float2* __restrict__ vis, const double*
 // tensor: V in FP16 (scaled by 1 / the piece's windows), the complex product as a real one,
 //   [Vre Vim interleaved] x [[cos sin], [-sin cos] per (k, s)] -> [re im interleaved], 16x16x16 WMMA,
 //   8 warps each 16 rows x TN real columns; TN = 32, at most 80 registers for 3 blocks an SM (64
-//   with --tile-centres 64: one block an SM, slower; docs/results.md).
+//   with --tile-centres 64: one block an SM, slower; docs/results.md).  --blocks 4: 64 registers
+//   for 4 (a small spill; slower on the 2070, for the A100's occupancy).
 // simt: FP32, TN = 32, a thread 2 rows x 4 centres.
 // The outer phase in FP32 without losing the bits a double would keep: Δτ fLO_f mod 1 per (frequency,
 // centre), and y = Δτ A df mod 1 as yh + yl (two floats), g y mod 1 = frac(g yh) + (the fma's
@@ -167,8 +168,8 @@ template<bool TC, int TN> struct TileSizes {
 };
 
 
-template<bool TC, int TN>
-__global__ void __launch_bounds__(NT, TC ? 3 : 1) shift_tile(Geo g, const float2* __restrict__ vis, const double* __restrict__ dtau,
+template<bool TC, int TN, int BLOCKS>   // BLOCKS: the blocks an SM to fit (__launch_bounds__)
+__global__ void __launch_bounds__(NT, BLOCKS) shift_tile(Geo g, const float2* __restrict__ vis, const double* __restrict__ dtau,
                                                  const float* __restrict__ wk, float2* out) {
     using Z = TileSizes<TC, TN>;
     constexpr int LDV = Z::LDV, LDU = Z::LDU, LDC = Z::LDC, LDVF = Z::LDVF, NJ = TN / 4;
@@ -374,6 +375,8 @@ static void usage() {
 "                  check is exact only without it)\n"
 "  --only LIST     comma-separated versions to run: naive,simt,tensor (default all)\n"
 "  --tile-centres N  the tensor version's centres a block, 32 or 64 (default 32)\n"
+"  --blocks N      the tensor version's blocks an SM to fit its registers to, 3 or 4 (default 3;\n"
+"                  4 only with 32 centres a block)\n"
 "  --reps N        timed repetitions, default 20; --warmup N, default 3\n"
 "  --check N       outputs checked against the double-precision shift, default 256 (x 4 products)\n"
 "  --csv FILE      append one row per timing\n"
@@ -387,7 +390,7 @@ int main(int argc, char** argv) {
     int src = 1, reps = 20, warmup = 3, ncheck = 256, device = 0;
     unsigned long long seed = 1;
     std::string only = "naive,simt,tensor", csv;
-    int tileCentres = 0;
+    int tileCentres = 0, blocks = 3;
     std::string sideband = "U";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -410,6 +413,7 @@ int main(int argc, char** argv) {
         else if (a == "--noise") noise = std::stod(next());
         else if (a == "--only") only = next();
         else if (a == "--tile-centres") tileCentres = std::stoi(next());
+        else if (a == "--blocks") blocks = std::stoi(next());
         else if (a == "--sideband") sideband = next();
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--warmup") warmup = std::stoi(next());
@@ -431,7 +435,8 @@ int main(int argc, char** argv) {
                runTensor = only.find("tensor") != std::string::npos;
     if (u.nant < 2 || u.nfreq < 1 || u.nchan % 4 || u.nwin < 1 || u.K < 1 || u.K > u.nwin || u.S < 1 || u.A < 1 ||
         (u.A & (u.A - 1)) || u.nchan % u.A || src < 1 || src > u.S || reps < 1 || u.nfreq > MAXFREQ ||
-        (sideband != "U" && sideband != "L" && sideband != "mixed")) {
+        (sideband != "U" && sideband != "L" && sideband != "mixed") || (tileCentres != 0 && tileCentres != 32 &&
+        tileCentres != 64) || (blocks != 3 && blocks != 4) || (blocks == 4 && tileCentres == 64)) {
         usage(); return 2;
     }
     const bool tiles = u.A >= 8 && u.nfreq <= MAXF;
@@ -532,10 +537,12 @@ int main(int argc, char** argv) {
     if (runNaive) variants.push_back({"naive (a thread per output, sincos per channel)", 1e-4, [&] {
         shift_naive<<<sms * 16, 256, 0, st>>>(G, fine, dTau, out); CHECK_CUDA(cudaGetLastError()); }});
     if (runSimt && tiles) variants.push_back({"simt (matrix product, FP32)", 1e-4, [&] {
-        shift_tile<false, 32><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out); CHECK_CUDA(cudaGetLastError()); }});
-    if (runTensor && tiles) variants.push_back({"tensor (matrix product, FP16 WMMA)", 3e-3, [&] {
-        if (wide) shift_tile<true, 64><<<tgrid(64), NT, 0, st>>>(G, fine, dTau, dWk, out);
-        else shift_tile<true, 32><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out);
+        shift_tile<false, 32, 1><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out); CHECK_CUDA(cudaGetLastError()); }});
+    if (runTensor && tiles) variants.push_back({blocks == 4 ? "tensor (FP16 WMMA, 4 blocks an SM)"
+                                                            : "tensor (matrix product, FP16 WMMA)", 3e-3, [&] {
+        if (wide) shift_tile<true, 64, 3><<<tgrid(64), NT, 0, st>>>(G, fine, dTau, dWk, out);
+        else if (blocks == 4) shift_tile<true, 32, 4><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out);
+        else shift_tile<true, 32, 3><<<tgrid(32), NT, 0, st>>>(G, fine, dTau, dWk, out);
         CHECK_CUDA(cudaGetLastError()); }});
 
     bool pass = true;
