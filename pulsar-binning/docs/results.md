@@ -410,3 +410,35 @@ kept) 1.07x / 1.02x, so the classification is 2-4%; with it off and every block 
 (`--noskip`), 1.13x at 128 channels, so the multiplies are about 5%.  The rest, 2-7%, is the
 weighted kernel itself.  Moving the classification into the bins kernel would save at most the
 2-4%.
+
+### The same on the A100 (OzSTAR gina5, job 21376562, commit c633b2e)
+
+`results-local/gina5-bins-20261122-164858`, 52 runs, every one passing; compared with job 21375824
+(the same node, before the change).  The DM 30 separate-bin rows repeat that job within a few %.
+
+- **The per-bin weights**: bins + weights 0.029-0.072 ms a subint with no window flagged, 8-22% of
+  the XMAC, from 0.078-0.155 ms (24-40%); the bins kernel 0.003-0.013 ms more than the bins alone,
+  the weights kernel 0.005-0.007 ms.  With flagged windows 0.13-0.25 ms, from 0.22-0.81 (the four
+  cases as on the 2070: 0.188 / 0.133 / 0.164 / 0.251 against 0.224 / 0.227 / 0.579 / 0.809).
+- **The slimmed weighted copy** (ratios to the unbinned XMAC, before in brackets):
+
+| P | ch | DM | gate | 16 scrunched |
+|---|---|---|---|---|
+| 1.5 ms | 128 | 30 | 0.67 (0.77) | 1.32 (1.78) |
+| | | 300 | 1.28 (1.70) | 1.32 (1.78) |
+| | 1024 | 30 | 0.80 (0.95) | 1.22 (1.65) |
+| | | 300 | 0.89 (1.08) | 1.22 (1.64) |
+| 500 ms | 128 | 30 | 1.22 (1.31) | 1.24 (1.31) |
+| | | 1000 | 0.63 (0.69) | 1.30 (1.73) |
+| | 1024 | 30 | 1.15 (1.26) | 1.16 (1.26) |
+| | | 1000 | 0.56 (0.57) | 1.22 (1.59) |
+
+  (8 channels averaged with accumulation: within 0.04.)  With nothing to skip 1.15-1.34x, from
+  1.26-1.81x: the biggest gains where blocks needed weights other than 0 and 1 (16 scrunched, the
+  high-DM gate), as the per-value scaling in the copy is what went.
+- **What is left is not the multiplies**: the 500 ms gate at DM 30 (every block on-pulse, weights all
+  1: no multiplies) is still 1.15-1.25x, about what 16 scrunched with multiplies costs.  So on the
+  A100 the rest, 15-25%, is the classification (each block reading its windows' bins, a warp making
+  the list while the others wait) and the weighted kernel's structure; on the 2070 those were 4-11%.
+  Moving the classification into the bins kernel is worth more here; an Nsight Compute comparison
+  of the weighted kernel (all-ones gate) with the plain one would split the two.

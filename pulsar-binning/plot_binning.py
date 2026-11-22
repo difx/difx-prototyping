@@ -121,7 +121,8 @@ def ratios(yy, vals, hl=None):
         if v is None: continue
         bold = "bold" if hl == k else "normal"
         text(RX, yy + 22 + k * 30, case, size=10.5, color="#555")
-        text(W - 20, yy + 22 + k * 30, v, size=12.5, anchor="end", weight=bold,
+        dy = -15 if len(v) > 14 else 0             # a long value above its case (that row is empty)
+        text(W - 20, yy + 22 + k * 30 + dy, v, size=12.5, anchor="end", weight=bold,
              color="#2e8540" if hl == k else "#24508a")
 
 def row_frame(yy, name, outputs, hl=False):
@@ -158,7 +159,7 @@ box(PX, y + 8, PW_, ROWH - 16, "kernel", "the staged XMAC, weighted (xmacTensorS
      "(FP16, a thread each); each lane multiplies its A registers by its two windows'",
      "weights (4 HMUL2, the sign included).  Each 16-window block is classified first:",
      "skipped (all weights 0), as is (all 1), or weighted.  Sum over bins = one weighted",
-     "sum: one pass.  Costs: the classification, the multiplies (0.99-1.16x on the 2070)."])
+     "sum: one pass.  Costs: mostly the classification (0.99-1.16x / 1.15-1.34x)."])
 gate = lambda w, c: BIN[3] if 0.40 <= ((w - 8 + 0.5 + c * 1.0) / 40) % 1.0 < 0.60 else OFF
 skip = []
 for b0 in range(0, 48, 16):
@@ -167,7 +168,7 @@ for b0 in range(0, 48, 16):
 grid(GX, gy(y), 48, CW2 * 2 / 3, CH2, gate, hatch=skip)
 text(GX, gy(y) + 8 * CH2 + 16, "the gate: hatched blocks (no on-pulse window in any channel) are skipped", size=10,
      color="#555", italic=True)
-ratios(y, [None, None, None, "0.40; 1.15x / 0.77; 1.79x*"], hl=3)
+ratios(y, [None, None, None, "0.40; 1.15x / 0.67; 1.32x"], hl=3)
 text(RX, y + 22 + 3 * 30 + 18, ["the gate does less than the unbinned XMAC:", "it skips the off-pulse blocks"],
      size=10, color="#2e8540", italic=True)
 y += ROWH + GAP
@@ -262,7 +263,7 @@ y += ROWH + GAP
 y += 6
 text(16, y, "Which", size=15, weight="bold")
 text(16, y + 20, ["The gate and scrunched output (any weights, negative too): weights in the stage, one pass: 0.31-1.16x the "
-                  "unbinned XMAC on the 2070 (slimmed), 0.77-1.80x on the A100 (the first version).",
+                  "unbinned XMAC on the 2070, 0.56-1.34x on the A100.",
                   "Separate bins: sorted per channel and gathered straight from the station kernel's usual window-major "
                   "spectra (gatherwm): 3.1-4.7x on the A100 for long runs, 10-11x",
                   "for the shortest (where a transpose to channel-major does better, 7.8x, and on the 2070 the permuted "
@@ -296,8 +297,9 @@ text(16, y, "Ratios: run-bins.sh, commit fafcd29: results-local/ar313-adeller-bi
      "gina8-bins-20261122-142203 (A100, job 21374617); each version's ms per 25.6 ms subint over the unbinned staged "
      "XMAC's (2070 1.19-1.50 ms, A100 0.32-0.40);", size=10.5, color="#555")
 text(16, y + 15, "sorted counts the sort, permute and XMAC, not the channel-major spectra (as a transpose here: 1.4-1.5 ms "
-     "on the 2070); * approach 2 on the A100: the first version's; gatherwm on the A100: gina5-bins-20261122-160540 (commit bc93212, job 21375824).", size=10.5, color="#555")
-H2 = y + 40
+     "on the 2070);", size=10.5, color="#555")
+text(16, y + 30, "approach 2: c633b2e (2070 ar313-adeller-bins-20261122-164224, A100 job 21376562); gatherwm on the A100: gina5-bins-20261122-160540 (commit bc93212, job 21375824).", size=10.5, color="#555")
+H2 = y + 55
 out[0] = f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H2}' viewBox='0 0 {W} {H2}'>"
 out[2] = f"<rect width='{W}' height='{H2}' fill='#ffffff'/>"
 add("</svg>")

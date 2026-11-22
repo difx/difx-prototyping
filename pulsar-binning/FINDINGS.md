@@ -71,5 +71,9 @@ The approaches side by side, with a diagram: [docs/approaches.md](docs/approache
   (0.77 to 1.70x at 128 channels).
 - **The per-bin weights**: 0.06-0.12 ms a subint, 18-31% of the A100's XMAC (7-14% on the 2070): the
   count into the bins kernel matters more here.  ([docs/results.md](docs/results.md), "The A100 again")
+- **The weights reworked** (job 21376562): the slimmed weighted copy 0.67-0.89x for the 1.5 ms gate
+  (from 0.77-1.08x), 1.15-1.34x with nothing to skip (from 1.26-1.81x); bins + per-bin weights 8-22%
+  of the XMAC, from 24-40%.  What is left in the weighted kernel (15-25%) is the classification and
+  the kernel's structure, not the multiplies.  ([docs/results.md](docs/results.md), "The weights")
 - **Kept out of the unweighted XMAC**: every binned mode is a template mode of the staged kernel;
   the plain kernel's registers and speed are unchanged (xmacbench, 4-64 stations).

@@ -65,9 +65,10 @@ on the 2070, 1.26-1.80x on the A100.)
   skip that is 0.99-1.16x the unbinned XMAC on the 2070.
 - *Measured (the 2070, slimmed):* the gate 0.40x (1.5 ms, 128 channels) to 0.64x (1024); 1.03-1.09x
   for the 500 ms pulsar's all-on-pulse subint; 16 bins on - off (negative weights) 1.11-1.15x at
-  1.5 ms, 1.04-1.10x at 500 ms.  The A100 has not run the slimmed version yet: the first version was
-  0.77-0.96x for the gate there and 1.26-1.80x with nothing to skip (its tensor cores are 16x its FP32
-  rate, the 2070's about 4x, so the copy's extra instructions weighed more).
+  1.5 ms, 1.04-1.10x at 500 ms.  On the A100 the gate 0.67x (128 channels) to 0.80x (1024), 1.15-1.34x
+  with nothing to skip (the first version 0.77-0.96x and 1.26-1.80x: its tensor cores are 16x its
+  FP32 rate, the 2070's about 4x, so instructions besides the MMAs weigh more).  What is left there,
+  15-25% even with no multiplies, is the classification and the weighted kernel's structure.
 - **Why the gate is "faster" than the unbinned XMAC:** it does less.  It skips every 16-window
   block in which all 8 channels' windows have weight 0, which the unbinned XMAC sums anyway.  The
   1.5 ms gate keeps 10% of the period, but dispersion spreads it across a block's channels and the
@@ -161,7 +162,7 @@ smaller output saves.
 
 | output | regime | approach | 2070 | A100 |
 |---|---|---|---|---|
-| gate, scrunched (any weights) | any | 2, weights in the stage | 0.31-1.16x | 0.77-1.80x (the first version) |
+| gate, scrunched (any weights) | any | 2, weights in the stage | 0.31-1.16x | 0.56-1.34x |
 | separate bins | long runs: few bins, slow pulsars | 5b, gathered from window-major | 2.7-7.1x (to 10x at high DM) | 3.1-4.7x (to 8.7x) |
 | separate bins | short runs: many bins of a millisecond pulsar | 5b | 15x (the permuted copy 6.1-6.5x) | 10.4-11.2x (5 with a transpose 7.8x) |
 | separate bins | bins narrower than a window | warn: such bins sample the pulse rather than resolve it | 14x | 18x |
