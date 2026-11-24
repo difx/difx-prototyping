@@ -8,6 +8,9 @@ them. It is not built or installed with DiFX, and nothing in difx depends on it.
 works, it is reimplemented in difx and the prototype stays here as the record of how it was
 evaluated.
 
+**[DiFX-implications.md](DiFX-implications.md)** is the quick-glance summary: what each change is
+expected to give in DiFX, and how many GPUs some real arrays would need.
+
 ## Layout
 
 | directory | what |
@@ -17,7 +20,7 @@ evaluated.
 | [`xmac/`](xmac/README.md) | the cross-multiply-accumulate: gpudifx's XMAC against the staged tensor-core XMAC, alone and after the station stage; stations with different band layouts |
 | [`two-stage/`](two-stage/README.md) | two-stage channelisation (PFB, then an FFT per coarse channel) for resolutions one cuFFTDx FFT cannot reach |
 | [`phase-centres/`](phase-centres/README.md) | GPU correlation to many phase centres at once: the shift after the XMAC as a matrix product (`phasecentrebench`) |
-| [`pulsar-binning/`](pulsar-binning/README.md) | GPU pulsar gating and binning in the XMAC (not started) |
+| [`pulsar-binning/`](pulsar-binning/README.md) | GPU pulsar gating and binning in the XMAC |
 
 Each sub-project has:
 - `README.md`: what it is, how to build and run it, its code, its checks.  The current state.
@@ -57,7 +60,7 @@ touch each other.  `fft-fusion/fusebench`, `xmac/xmacbench`, `two-stage/twostage
 `phase-centres/phasecentrebench` are links to the last build's binaries, for running by hand; the `run-*.sh` scripts take the
 binaries built for the GPU they find (`common/scripts/bench-bin.sh`).  `fusebench`'s fused
 kernel is compiled once per FFT length (`SIZES`, default 64 to 16384), in all its variants:
-about 4 minutes with `-j8` on a desktop, 25 on an OzSTAR node.  Every benchmark exits non-zero
+about 4 minutes with `-j8` on a desktop, about 6 on an OzSTAR node.  Every benchmark exits non-zero
 if a check fails.
 
 ## Results
