@@ -128,6 +128,55 @@ data rate:
     outside this work.
 - gpudifx today's counts use 256-point FFTs. Longer FFTs would raise them too.
 
+## BIGCAT comparison
+
+This is for the upgraded ATCA (BIGCAT):
+- 6 antennas;
+- 128 MHz subbands, 32/27 oversampled, so each is about 152 MHz complex-sampled;
+- dual polarisation;
+- 8-bit complex samples, which is what BIGCAT sends its GPUs.
+
+At 8 bits a subband is 3.6 GB/s of input to the GPU, 29 Gbps. BIGCAT's design puts 4 subbands
+(116 Gbps) on each NVIDIA L40.
+
+How many subbands one GPU could take, continuum only:
+
+| GPU | GPU load per subband, 128 / 1024 ch per 64 MHz | subbands by compute (load ≤ 0.7) | subbands by PCIe input, 8-bit / 16-bit | **subbands per GPU, 8-bit** |
+|---|---|---|---|---|
+| RTX 2070 SUPER (PCIe 3, about 12 GB/s; capped at 150 W, clock locked at 1500 MHz) | 0.109 / 0.126 | 5-6 | 3 / 1 | **3** (PCIe) |
+| A100-SXM4-80GB (PCIe 4, about 24 GB/s) | 0.033 / 0.041 | 17-20 | 6 / 3 | **6** (PCIe) |
+| RTX PRO 6000 Blackwell (PCIe 5, about 48 GB/s) | 0.015 / 0.018 | 39-47 | 13 / 6 | **13** (PCIe) |
+| *BIGCAT's design: L40 (PCIe 4)* | | | | *4* |
+
+- **Taking the data in limits every GPU long before compute does.** The new chain would use only
+  15-50% of each GPU at its PCIe limit.
+  - At 8 bits one RTX PRO 6000 takes about 13 subbands, three times BIGCAT's 4 an L40.
+  - For the full 4 x 2 GHz (60-64 subbands) that is 5 RTX PRO 6000s, against 16 L40s.
+  - The spare compute would pay for pulsar binning or phase centres at no extra GPU count. It
+    could also go to finer channels.
+- **16-bit samples halve the subbands per GPU**, since input is the limit.
+- **How the estimate is made:**
+  - Measured real 2-bit 64 MHz bands are scaled to bandwidth. A subband costs the station stage
+    2 x 152 / 64 = 4.7 bands' worth per antenna, and the XMAC 2 x 128 / 64 = 4, since the
+    oversampled overlap is dropped before it.
+  - Wider samples are memory traffic. The station stage is taken as the slower of two measured
+    kernels:
+    - the 2-bit end-to-end kernel;
+    - the FP16-input FFT kernel, scaled by its bytes moved: 8-bit complex in and FP16 out move
+      half as many bytes.
+  - The XMAC is interpolated between 4 and 10 stations by baseline count.
+  - The PCIe rates are practical figures for an x16 link, not measured.
+- **Caveat: every timing here was measured on 2-bit data, not ATCA's 8- or 16-bit
+  complex-sampled channelised data.**
+  - Our timings are of 2-bit, real-sampled VDIF. 1 and 4 bits cost about the same.
+  - At 8 or 16 bits there is far less bit unpacking per sample, but 4-8x the bytes to read.
+    Wider samples mean little work for the decode and a bigger memory read.
+  - So the unpack time will change, and the station stage's share with it. The scaling above is
+    an estimate of that, not a measurement.
+  - Complex input and 8- or 16-bit decode are not yet in the code (fft-fusion backlog). Measuring
+    them is the first step before relying on these numbers.
+  - The input-bound subband counts do not depend on this. They follow from the data rate alone.
+
 ## Caveats
 
 - **Kernel time only.** Not included:
@@ -141,6 +190,8 @@ data rate:
   measured S/X, not measurements. The two-stage and binning runs are still to do on it.
 - **The 2070 is power-capped and clock-locked.** It shows the trend; its absolute times are not
   comparable with other eras.
+- **Bit depth.** Every timing is for real-sampled 1-, 2- or 4-bit VDIF; most of the tables use
+  2 bits. 8- and 16-bit and complex-sampled data are untested (see "BIGCAT comparison").
 - **Known limits:**
   - The lean decode's window may span at most 32 VDIF frames (2- and 4-bit, 128 bands, 4096
     channels).
